@@ -56,6 +56,13 @@ impl TabList {
         id
     }
 
+    /// Update a tab's path (used when an absorbed window's folder resolves).
+    pub fn set_path(&mut self, i: usize, path: impl Into<String>) {
+        if let Some(t) = self.tabs.get_mut(i) {
+            t.path = path.into();
+        }
+    }
+
     /// Remove a tab; adjust active index. Returns removed tab.
     pub fn remove(&mut self, i: usize) -> Option<Tab> {
         if i >= self.tabs.len() {

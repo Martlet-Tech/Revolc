@@ -1,3 +1,6 @@
+[workspace]
+members = ["bho"]
+
 [package]
 name = "revolc"
 version = "0.1.0"

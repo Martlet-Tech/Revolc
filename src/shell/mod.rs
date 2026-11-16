@@ -1,6 +1,6 @@
 //! COM apartment setup. All shell COM objects live on the main STA thread.
 
-pub mod explorer;
+pub mod host;
 
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 

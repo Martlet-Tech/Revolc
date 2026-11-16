@@ -28,7 +28,7 @@ pub fn run(initial_path: Option<String>) -> i32 {
     };
 
     let watcher = spawn_config_watcher(cfg.clone(), window.hwnd_raw());
-    takeover::spawn(cfg.clone());
+    takeover::ensure_bho_registered();
 
     let code = window.run_message_loop();
 

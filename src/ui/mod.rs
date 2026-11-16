@@ -5,22 +5,20 @@ use std::sync::Arc;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    DestroyWindow, GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow,
-    PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, ShowWindow, TranslateAcceleratorW,
-    TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    HACCEL, IDC_ARROW, MSG, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE,
-    WM_DESTROY,
-    WM_KEYDOWN, WM_SIZE, WS_OVERLAPPEDWINDOW,
+    DestroyWindow, GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, LoadCursorW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, ShowWindow,
+    TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, HACCEL, IDC_ARROW, MSG, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SIZE, WM_USER, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::ConfigHandle;
-use crate::shell::explorer::ExplorerView as View;
+use crate::shell::host::{self, Absorbed};
 use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
 
@@ -29,6 +27,9 @@ pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001; // lParam = tab index
 pub const WM_APP_TAB_CLOSE: u32 = 0x8002; // lParam = tab index
 pub const WM_APP_TAB_NEW: u32 = 0x8003; // lParam unused
 pub(crate) use tray::WM_APP_TRAY;
+/// wParam = Explorer top-level HWND. Sent by the BHO (registered message
+/// "RevolcAbsorbExplorer" resolves to this id in both processes).
+pub const WM_APP_ABSORB: u32 = WM_USER + 0x643;
 
 const TABBAR_HEIGHT: i32 = 28;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
@@ -38,11 +39,11 @@ struct WindowArgs {
     initial_path: Option<String>,
 }
 
-pub(crate) struct App {
+struct App {
     cfg: Arc<ConfigHandle>,
     keymap: Vec<(Binding, Action)>,
     tabs: TabList,
-    views: Vec<Option<View>>,
+    views: Vec<Option<Absorbed>>,
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -82,14 +83,14 @@ impl MainWindow {
                 CW_USEDEFAULT,
                 1000,
                 700,
-                HWND::default(), // no parent
+                HWND::default(),
                 windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
                 hinstance,
                 Some(args as _),
             )?;
 
-            // Accelerator table built from the event-driven keymap
-            // (design review ①: event-driven, no GetAsyncKeyState polling).
+            // Accelerator table from the event-driven keymap
+            // (event-driven, no GetAsyncKeyState polling).
             let mut accels: Vec<ACCEL> = Vec::new();
             for (i, (b, _)) in events::default_keymap().iter().enumerate() {
                 accels.push(ACCEL {
@@ -100,8 +101,6 @@ impl MainWindow {
             }
             let accel = CreateAcceleratorTableW(&accels)?;
 
-            // The window must be shown explicitly; CreateWindowExW without
-            // WS_VISIBLE leaves it hidden (this is why no window appeared).
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
 
             Ok(Self { hwnd, accel })
@@ -119,7 +118,6 @@ impl MainWindow {
                 if GetMessageW(&mut msg, None, 0, 0).as_bool() == false {
                     return msg.wParam.0 as i32;
                 }
-                // Event-driven accelerator dispatch; nonzero = key consumed.
                 if TranslateAcceleratorW(self.hwnd, self.accel, &msg) != 0 {
                     continue;
                 }
@@ -148,7 +146,6 @@ impl App {
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
-        // Resident tray in redirect mode (takeover needs a living process).
         if app.cfg.get().takeover.mode == "redirect" {
             tray::add(hwnd);
         }
@@ -158,7 +155,7 @@ impl App {
     /// Show window; if no tabs remain (was hidden in tray), open a home tab.
     pub(crate) fn open_main(&mut self) {
         unsafe {
-            let _ = ShowWindow(self.main_hwnd, SW_SHOW);
+            let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
         }
         if self.tabs.is_empty() {
             self.new_tab(home_dir());
@@ -178,29 +175,67 @@ impl App {
         tabbar::update(self.tabbar_hwnd, &labels, self.tabs.active_index(), &self.cfg.get());
     }
 
+    /// Open a folder: push a reserved tab, spawn Explorer, absorb on BHO notify.
     fn new_tab(&mut self, path: String) {
-        match View::new(self.main_hwnd, &self.view_rect(), &path) {
-            Ok(view) => {
-                self.tabs.push(path);
-                self.views.push(Some(view));
-                self.sync_tabbar();
-                self.activate(self.tabs.active_index());
-            }
-            Err(e) => tracing::error!(error = %e, path = %path, "failed to create view"),
+        self.tabs.push(path.clone());
+        self.views.push(None);
+        self.sync_tabbar();
+        self.activate(self.tabs.active_index());
+        host::spawn_explorer(&path);
+    }
+
+    /// Attach an Explorer window to the first reserved (view-less) tab,
+    /// or a brand-new tab if none is reserved.
+    fn absorb_window(&mut self, top: HWND) {
+        if host::is_absorbed(top, self.main_hwnd) {
+            return;
         }
+        let path = host::read_folder_path(top).unwrap_or_default();
+        let label = if path.is_empty() { "Explorer".to_string() } else { short_label(&path) };
+
+        let idx = match self.views.iter().position(|v| v.is_none()) {
+            Some(i) => {
+                self.tabs.set_path(i, label);
+                i
+            }
+            None => {
+                self.tabs.push(label);
+                self.views.push(None);
+                self.views.len() - 1
+            }
+        };
+
+        match unsafe { Absorbed::absorb(top, self.main_hwnd) } {
+            Ok(view) => {
+                self.views[idx] = Some(view);
+                tracing::info!(?top, idx, "absorbed into tab");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, ?top, "absorb failed");
+                return;
+            }
+        }
+        self.sync_tabbar();
+        self.activate(idx);
+        self.layout();
     }
 
     fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
-        // Destroy the COM view first (it owns a child window).
-        self.views[i] = None;
+        // Restore the Explorer window first, then let it close itself.
+        if let Some(v) = self.views[i].take() {
+            unsafe {
+                v.restore();
+                let _ = PostMessageW(v.top, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
         self.tabs.remove(i);
         self.views.remove(i);
         if self.tabs.is_empty() {
             // spec §7: in redirect mode stay resident in the tray so takeover
-            // keeps working; otherwise exit (M0 skeleton behavior).
+            // keeps working; otherwise exit.
             if self.cfg.get().takeover.mode == "redirect" {
                 tracing::info!("last tab closed, hiding to tray (redirect mode)");
                 unsafe {
@@ -224,12 +259,10 @@ impl App {
         }
         for (j, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot {
-                if let Ok(h) = v.hwnd() {
+                v.set_visible(j == i);
+                if j == i {
                     unsafe {
-                        let _ = ShowWindow(h, if j == i { SW_SHOW } else { SW_HIDE });
-                        if j == i {
-                            let _ = SetFocus(h);
-                        }
+                        let _ = SetFocus(v.top);
                     }
                 }
             }
@@ -262,13 +295,21 @@ impl App {
             let _ = MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
         }
         if let Some(Some(v)) = self.views.get(self.tabs.active_index()) {
-            let _ = v.set_rect(rc);
+            v.resize(rc);
+        }
+    }
+
+    /// Release every absorbed window back to the desktop.
+    fn release_all(&mut self) {
+        for v in self.views.iter_mut() {
+            if let Some(v) = v.take() {
+                unsafe { v.restore() };
+            }
         }
     }
 }
 
 fn home_dir() -> String {
-    // Win7-compatible: USERPROFILE env (M0 design §5).
     std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())
 }
 
@@ -290,6 +331,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
+            app_from(hwnd).release_all();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -343,6 +385,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let path = app.tabs.active().map(|t| t.path.clone()).unwrap_or_else(home_dir);
             app.new_tab(path);
+            LRESULT(0)
+        }
+        m if m == WM_APP_ABSORB => {
+            let top = HWND(wp.0 as *mut core::ffi::c_void);
+            let app = app_from(hwnd);
+            if app.cfg.get().takeover.mode == "redirect" {
+                app.absorb_window(top);
+            }
             LRESULT(0)
         }
         m if m == WM_APP_TRAY => {
