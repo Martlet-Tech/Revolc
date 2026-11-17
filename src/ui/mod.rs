@@ -214,6 +214,11 @@ impl App {
         match unsafe { Absorbed::absorb(top, self.main_hwnd) } {
             Ok(view) => {
                 self.views[idx] = Some(view);
+                // Absorbing into a hidden/minimized Revolc looks like "nothing
+                // happened" - surface the window so the user sees the result.
+                unsafe {
+                    let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
+                }
                 tracing::info!(?top, idx, "absorbed into tab");
             }
             Err(e) => {

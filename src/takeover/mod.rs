@@ -24,8 +24,13 @@ const BHO_CLSID_PATH: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Browser Helper Objects\\{9F1C4E8B-6A2D-4E7B-8C13-5D04F7A2B916}";
 
 /// Ensure the BHO DLL is registered (idempotent). The DLL ships next to
-/// revolc.exe as revolc_bho.dll.
-pub fn ensure_bho_registered() {
+/// revolc.exe as revolc_bho.dll. With mode != "redirect" the BHO is fully
+/// unregistered (HKLM + HKCU) so system Explorer is 100% pristine.
+pub fn ensure_bho_registered(mode: &str) {
+    if mode != "redirect" {
+        unregister_bho();
+        return;
+    }
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -66,7 +71,7 @@ pub fn ensure_bho_registered() {
     // 2) Explorer only reads the machine BHO list — if HKLM is missing,
     //    re-register elevated once (UAC prompt).
     if !hklm_bho_present() {
-        tracing::warn!("HKLM BHO key missing, requesting elevation via regsvr32");
+        tracing::warn!("HKLM BHO key missing, requesting elevation for registration");
         elevate_register(&dll);
         // regsvr32 runs async after UAC consent; wait for it to finish.
         for _ in 0..10 {
@@ -83,6 +88,27 @@ pub fn ensure_bho_registered() {
     } else {
         tracing::info!("HKLM BHO key present");
     }
+}
+
+fn unregister_bho() {
+    let exe = std::env::current_exe().ok();
+    let dll = exe.and_then(|e| e.parent().map(|d| d.join("revolc_bho.dll")));
+    let Some(dll) = dll.filter(|p| p.exists()) else { return };
+    unsafe {
+        let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
+        let Ok(module) = LoadLibraryW(PCWSTR::from_raw(wide.as_ptr())) else { return };
+        if let Some(proc) = GetProcAddress(module, windows::core::s!("DllUnregisterServer")) {
+            let unreg: extern "system" fn() -> i32 = std::mem::transmute(proc);
+            let hr = unreg();
+            tracing::info!(hr, "bho unregistered (per-user)");
+        }
+        let _ = FreeLibrary(module);
+    }
+    if hklm_bho_present() {
+        tracing::warn!("HKLM BHO key present, requesting elevation for unregister");
+        elevate(&dll, "/u /s");
+    }
+    tracing::info!("takeover fully disabled, system Explorer pristine");
 }
 
 fn hklm_bho_present() -> bool {
@@ -113,9 +139,13 @@ fn hklm_key(path: String) -> bool {
 }
 
 fn elevate_register(dll: &std::path::Path) {
+    elevate(dll, "/s");
+}
+
+fn elevate(dll: &std::path::Path, flags: &str) {
     unsafe {
         let file = HSTRING::from("regsvr32.exe");
-        let params = HSTRING::from(format!("/s \"{}\"", dll.display()));
+        let params = HSTRING::from(format!("{} \"{}\"", flags, dll.display()));
         let mut sei = SHELLEXECUTEINFOW::default();
         sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
         sei.fMask = SEE_MASK_NOASYNC;
