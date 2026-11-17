@@ -12,7 +12,7 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
@@ -65,6 +65,26 @@ impl Absorbed {
         );
         tracing::info!(?top, "explorer window absorbed");
         Ok(Self { top, orig_style, orig_exstyle })
+    }
+
+    /// Explorer re-applies its own frame styles on some navigations, which
+    /// brings the caption row back — seen as a band of Explorer chrome
+    /// between the tab bar and the ribbon. Re-strip when it happens.
+    pub unsafe fn ensure_stripped(&self) -> bool {
+        let style = GetWindowLongPtrW(self.top, GWL_STYLE) as u32;
+        if style & STRIP_STYLE == 0 {
+            return false;
+        }
+        let want = (style & !STRIP_STYLE) | WS_CHILD.0;
+        SetWindowLongPtrW(self.top, GWL_STYLE, want as isize);
+        let _ = SetWindowPos(
+            self.top,
+            HWND_TOP,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        tracing::info!(top = ?self.top, "re-stripped Explorer frame styles");
+        true
     }
 
     /// Put the window back as a normal desktop window.
@@ -186,6 +206,53 @@ unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
     ctx.out.push(hwnd);
     BOOL(1)
+}
+
+/// Direct children of `parent`, z-order top first.
+pub fn child_windows(parent: HWND) -> Vec<HWND> {
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<HWND>);
+        out.push(hwnd);
+        BOOL(1)
+    }
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            parent,
+            Some(proc),
+            LPARAM(&mut out as *mut Vec<HWND> as isize),
+        );
+    }
+    // EnumChildWindows is recursive; keep only direct children.
+    out.retain(|h| unsafe { GetAncestor(*h, GA_PARENT).0 == parent.0 });
+    out
+}
+
+pub fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// Window rect in parent-client coordinates, for layout diagnostics.
+pub fn rect_in_parent(top: HWND) -> (i32, i32, i32, i32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let mut rc = RECT::default();
+        if GetWindowRect(top, &mut rc).is_err() {
+            return (0, 0, 0, 0);
+        }
+        let parent = GetAncestor(top, GA_PARENT);
+        let mut tl = POINT { x: rc.left, y: rc.top };
+        let mut br = POINT { x: rc.right, y: rc.bottom };
+        if !parent.0.is_null() {
+            let _ = ScreenToClient(parent, &mut tl);
+            let _ = ScreenToClient(parent, &mut br);
+        }
+        (tl.x, tl.y, br.x, br.y)
+    }
 }
 
 /// An absorbed Explorer window's HWND is still alive. Explorer can destroy it

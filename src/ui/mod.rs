@@ -634,6 +634,11 @@ impl App {
         let active = self.tabs.active_index();
         for (i, slot) in self.views.iter().enumerate() {
             let Some(v) = slot else { continue };
+            // Explorer can restore its caption on navigation; that is the band
+            // of foreign chrome that shows up between tab bar and ribbon.
+            if unsafe { v.ensure_stripped() } {
+                self.laid_out = None;
+            }
             let want = i == active;
             if host::is_visible(v.top) != want {
                 host::force_visible(v.top, want);
@@ -642,6 +647,36 @@ impl App {
                 }
             }
         }
+
+        // Anything else parented to us is a leftover from an earlier lifetime
+        // (a window explored after its tab was dropped, a restored window that
+        // came back). It paints over the active view as a band of foreign
+        // Explorer chrome between the tab bar and the content.
+        let active_top = self
+            .views
+            .get(active)
+            .and_then(|v| v.as_ref())
+            .map(|v| v.top.0 as isize)
+            .unwrap_or(0);
+        for child in host::child_windows(self.main_hwnd) {
+            let raw = child.0 as isize;
+            if raw == self.tabbar_hwnd.0 as isize {
+                continue;
+            }
+            if self.views.iter().flatten().any(|v| v.top.0 as isize == raw) {
+                continue; // tracked; visibility already handled above
+            }
+            if raw != active_top && host::is_visible(child) {
+                tracing::warn!(
+                    ?child,
+                    class = %host::class_name(child),
+                    rect = ?host::rect_in_parent(child),
+                    "hiding untracked child window"
+                );
+                host::force_visible(child, false);
+            }
+        }
+
         self.place_active();
         unsafe {
             let _ = SetWindowPos(
@@ -649,6 +684,32 @@ impl App {
                 HWND_TOP,
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Layout ground truth in the log: main client, tab bar and every child
+    /// window with its rect. Called on resize, where the offsets went wrong.
+    fn dump_layout(&self, why: &str) {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.main_hwnd, &mut rc);
+        }
+        tracing::info!(
+            why,
+            client = ?(rc.left, rc.top, rc.right, rc.bottom),
+            tabbar = ?host::rect_in_parent(self.tabbar_hwnd),
+            views = self.views.len(),
+            "layout"
+        );
+        for child in host::child_windows(self.main_hwnd) {
+            tracing::info!(
+                why,
+                ?child,
+                class = %host::class_name(child),
+                rect = ?host::rect_in_parent(child),
+                visible = host::is_visible(child),
+                "layout child"
             );
         }
     }
@@ -700,6 +761,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             let app = app_from(hwnd);
             app.layout();
+            app.dump_layout("WM_SIZE");
             // The main window has no background brush, so anything the tab
             // area does not cover keeps the *previous* frame's pixels: after
             // maximize/restore that shows up as a duplicate tab bar and black
