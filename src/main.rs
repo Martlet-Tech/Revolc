@@ -11,12 +11,39 @@ mod ui;
 
 use std::time::Instant;
 
+use windows::core::w;
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, PostMessageW, WM_CLOSE,
+};
+
+/// `revolc.exe --shutdown`: ask the running instance to quit the polite way.
+/// Never kill the process — absorbed Explorer windows are its children and
+/// die with it (2026-11-17 crash loop).
+fn shutdown_running() -> i32 {
+    unsafe {
+        match FindWindowW(w!("RevolcMain"), None) {
+            Ok(h) if !h.0.is_null() => {
+                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+                0
+            }
+            _ => {
+                eprintln!("Revolc is not running");
+                1
+            }
+        }
+    }
+}
+
 fn main() {
     let started = Instant::now();
     logging::init();
 
-    // Command line: revolc.exe [path]
+    // Command line: revolc.exe [path] | --shutdown
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--shutdown") {
+        std::process::exit(shutdown_running());
+    }
     let initial_path = args.first().cloned();
     tracing::info!(?initial_path, "starting");
 

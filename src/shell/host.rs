@@ -10,12 +10,12 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetWindowTextW, GetWindowLongPtrW, IsWindowVisible, MoveWindow,
-    SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, GA_PARENT, GA_ROOT,
-    GWL_EXSTYLE, GWL_STYLE, HWND_TOP, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-    WS_THICKFRAME,
+    EnumWindows, GetAncestor, GetClassNameW, GetWindowTextW, GetWindowLongPtrW, IsWindow,
+    IsWindowVisible, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_HIDE, SW_SHOW,
+    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows::Win32::Foundation::{BOOL, LPARAM};
 
@@ -50,11 +50,12 @@ impl Absorbed {
         let stripped = ((orig_style as u32) & !STRIP_STYLE) | WS_CHILD.0;
         SetWindowLongPtrW(top, GWL_STYLE, stripped as isize);
         SetWindowLongPtrW(top, GWL_EXSTYLE, ((orig_exstyle as u32) & !STRIP_EXSTYLE) as isize);
-        SetWindowPos(
+        let _ = SetWindowPos(
             top,
             HWND_TOP,
             0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+                | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
         );
         tracing::info!(?top, "explorer window absorbed");
         Ok(Self { top, orig_style, orig_exstyle })
@@ -67,18 +68,30 @@ impl Absorbed {
         }
         SetWindowLongPtrW(self.top, GWL_STYLE, self.orig_style);
         SetWindowLongPtrW(self.top, GWL_EXSTYLE, self.orig_exstyle);
-        SetWindowPos(
+        let _ = SetWindowPos(
             self.top,
             HWND_TOP,
             0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+                | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
         );
         tracing::info!(?self.top, "explorer window restored");
     }
 
     pub fn resize(&self, rect: RECT) {
         unsafe {
-            let _ = MoveWindow(self.top, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true);
+            // Cross-process positioning must be async: a synchronous
+            // SetWindowPos/MoveWindow blocks on Explorer's input queue and
+            // deadlocks our UI thread whenever a tab's Explorer is busy.
+            let _ = SetWindowPos(
+                self.top,
+                HWND_TOP,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            );
         }
     }
 
@@ -122,38 +135,34 @@ pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
     }
 }
 
-/// Find a folder-window top-level HWND that Revolc hasn't absorbed yet.
-/// Called from the BHO notify handler. The BHO never touches the site object
-/// during SetSite (QI on it corrupted explorerframe — crash loop 2026-11-17).
-/// Fast path: plain EnumWindows (in-proc, sub-ms) — absorbed windows are
-/// WS_CHILD and invisible to EnumWindows, `known` covers strays. IShellWindows
-/// fallback was dropped: the out-of-proc enumeration (25 × 60ms retries) made
-/// every absorb flash a full Explorer window for seconds first.
-pub fn find_new_folder_window(known: &[isize], retries: usize) -> Option<HWND> {
+/// All top-level folder windows Revolc neither owns nor deliberately parked.
+/// Called from the BHO notify handler AND from the periodic sweep timer. The
+/// BHO never touches the site object during SetSite (QI on it corrupted
+/// explorerframe — crash loop 2026-11-17).
+///
+/// Why a sweep and not just the notify: SetSite fires when the frame is
+/// created, but the window becomes visible only after Explorer finishes
+/// navigating — sometimes seconds later, and sometimes with no notification
+/// at all (BHO absent from that window/process). A notify-only design drops
+/// those windows on the desktop as plain Explorer windows (observed
+/// 2026-11-17: "no new folder window found after notify").
+pub fn stray_folder_windows(known: &[isize], excluded: &[isize]) -> Vec<HWND> {
+    let mut out: Vec<HWND> = Vec::new();
+    let ctx = FindCtx { known, excluded, out: &mut out };
     unsafe {
-        for _ in 0..retries {
-            let mut found: Option<HWND> = None;
-            let ctx = FindCtx { known, found: &mut found };
-            EnumWindows(
-                Some(enum_find_proc),
-                LPARAM(&ctx as *const FindCtx as isize),
-            );
-            if let Some(top) = found {
-                return Some(top);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        None
+        let _ = EnumWindows(Some(enum_find_proc), LPARAM(&ctx as *const FindCtx as isize));
     }
+    out
 }
 
 struct FindCtx<'a> {
     known: &'a [isize],
-    found: *mut Option<HWND>,
+    excluded: &'a [isize],
+    out: &'a mut Vec<HWND>,
 }
 
 unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &*(lparam.0 as *const FindCtx);
+    let ctx = &mut *(lparam.0 as *mut FindCtx);
     let mut buf = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut buf);
     let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
@@ -163,11 +172,20 @@ unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
     }
-    if ctx.known.contains(&(hwnd.0 as isize)) {
+    let raw = hwnd.0 as isize;
+    if ctx.known.contains(&raw) || ctx.excluded.contains(&raw) {
         return BOOL(1);
     }
-    *ctx.found = Some(hwnd);
-    BOOL(0)
+    ctx.out.push(hwnd);
+    BOOL(1)
+}
+
+/// An absorbed Explorer window's HWND is still alive. Explorer can destroy it
+/// behind our back (its own X button, a crashed browser process, a navigation
+/// that spawns a replacement); the tab must then be dropped instead of left
+/// holding a dead handle.
+pub fn is_window_alive(top: HWND) -> bool {
+    unsafe { IsWindow(top).as_bool() }
 }
 
 /// "file:///D:/dir%20name" -> "D:\dir name"

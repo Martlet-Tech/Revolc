@@ -71,8 +71,11 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
         // crashes). BHO reports "a shell window was created"; Revolc
         // discovers the new window itself via IShellWindows (out-of-proc).
         if psite.is_some() {
-            bho_log("SetSite (notify only)");
+            // Notify FIRST: SetSite runs on Explorer's window-creation path,
+            // so anything slow here delays every folder window. Disk logging
+            // is opt-in (see bho_log).
             notify_revolc();
+            bho_log("SetSite (notify only)");
         }
         Ok(())
     }
@@ -93,8 +96,18 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
 
 /// Post the Explorer top-level HWND to the Revolc main window.
 /// Revolc not running → no-op (pure BHO, zero side effects).
-/// Debug log so we can tell "DLL not loaded" from "notify failed".
 fn bho_log(msg: &str) {
+    // Off by default: logging opens/writes a file on Explorer's
+    // window-creation thread, which stalls every folder window and made
+    // Explorer look hung. Create %APPDATA%\revolc\bho.debug to turn it on.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("APPDATA")
+            .map(|d| std::path::Path::new(&d).join("revolc").join("bho.debug").exists())
+            .unwrap_or(false)
+    }) {
+        return;
+    }
     let Some(dir) = std::env::var_os("APPDATA") else { return };
     let dir = std::path::Path::new(&dir).join("revolc");
     let _ = std::fs::create_dir_all(&dir);

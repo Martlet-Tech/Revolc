@@ -2,6 +2,7 @@ pub mod tabbar;
 pub mod tray;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -10,11 +11,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    DestroyWindow, GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, LoadCursorW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, ShowWindow,
-    TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HACCEL, IDC_ARROW, MSG, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW,
-    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SIZE, WM_USER, WS_OVERLAPPEDWINDOW,
+    DestroyWindow, GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, IDC_ARROW, MSG, SW_HIDE, SW_SHOWNORMAL,
+    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SIZE, WM_TIMER,
+    WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::ConfigHandle;
@@ -40,6 +42,18 @@ fn absorb_msg() -> u32 {
 const TABBAR_HEIGHT: i32 = 28;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 
+/// Periodic stray-window sweep. The BHO notify is a hint, not a guarantee:
+/// SetSite fires before the frame is shown, and some folder windows never
+/// notify at all. 250ms keeps the "absorb latency" below the FE-flash the
+/// user can notice while healing every missed window.
+const SWEEP_TIMER_ID: usize = 0x5EED;
+const SWEEP_INTERVAL_MS: u32 = 250;
+/// A window we just restored (tab closed) stays parked this long so the
+/// sweep does not grab it back while Explorer finishes destroying it.
+const EXCLUDE_TTL: Duration = Duration::from_secs(8);
+/// Hard cap: a runaway explorer.exe storm must not eat the desktop.
+const MAX_TABS: usize = 40;
+
 struct WindowArgs {
     cfg: Arc<ConfigHandle>,
     initial_path: Option<String>,
@@ -50,6 +64,12 @@ struct App {
     keymap: Vec<(Binding, Action)>,
     tabs: TabList,
     views: Vec<Option<Absorbed>>,
+    /// HWNDs we deliberately left on the desktop (closed tabs), with the
+    /// instant they were released. Sweep ignores them until EXCLUDE_TTL.
+    excluded: Vec<(isize, Instant)>,
+    /// Reentrancy guard: absorb moves windows around, which can re-enter
+    /// this app's message handlers.
+    sweeping: bool,
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -155,6 +175,8 @@ impl App {
             keymap: events::default_keymap(),
             tabs: TabList::new(),
             views: Vec::new(),
+            excluded: Vec::new(),
+            sweeping: false,
             tabbar_hwnd,
             main_hwnd: hwnd,
         });
@@ -162,6 +184,10 @@ impl App {
         app.new_tab(first);
         if app.cfg.get().takeover.mode == "redirect" {
             tray::add(hwnd);
+            unsafe {
+                // Arm the sweep before the first absorb can be missed.
+                SetTimer(hwnd, SWEEP_TIMER_ID, SWEEP_INTERVAL_MS, None);
+            }
         }
         app
     }
@@ -220,7 +246,10 @@ impl App {
         let view = match unsafe { Absorbed::absorb(top, self.main_hwnd) } {
             Ok(view) => view,
             Err(e) => {
-                tracing::error!(error = %e, ?top, "absorb failed");
+                // Park it too: a failed absorb (e.g. cross-integrity SetParent
+                // blocked by UIPI) must not be retried every sweep tick.
+                tracing::error!(error = %e, ?top, "absorb failed, parking window");
+                self.excluded.push((top.0 as isize, Instant::now()));
                 return;
             }
         };
@@ -232,37 +261,106 @@ impl App {
         }
         tracing::info!(?top, idx, "absorbed into tab");
 
-        // Best-effort path for Tab-New reuse (~0.3s); the label falls back to
-        // the window title, which Explorer sets as soon as it navigates.
-        let store = host::read_folder_path(top, 6)
-            .or_else(|| {
-                let t = host::window_title(top);
-                if t.is_empty() { None } else { Some(t) }
-            })
-            .unwrap_or_else(|| "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string());
-        self.tabs.set_path(idx, store);
+        // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
+        // When we spawned the window ourselves the tab already carries the
+        // path — never stall the UI thread on IShellWindows (out-of-proc COM,
+        // 50ms per retry) for information we already have.
+        let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
+        if need_path {
+            let store = host::read_folder_path(top, 2)
+                .or_else(|| {
+                    let t = host::window_title(top);
+                    if t.is_empty() { None } else { Some(t) }
+                })
+                .unwrap_or_else(|| "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string());
+            self.tabs.set_path(idx, store);
+        }
 
         self.sync_tabbar();
         self.activate(idx);
         self.layout();
     }
 
-    /// BHO notified "a shell window was created". Find it via IShellWindows
-    /// (the BHO never touches the site object — that crashed explorerframe)
-    /// and absorb the first folder window we don't already own.
-    fn absorb_new_window(&mut self) {
+    /// BHO said "a shell window was created". Treat it as a hint and run a
+    /// sweep right away (sub-ms EnumWindows); the sweep timer is the safety
+    /// net for windows that notify late, early, or not at all.
+    fn on_notify(&mut self) {
         tracing::info!("absorb notify received");
-        let known: Vec<isize> = self
+        self.sweep();
+    }
+
+    fn known_tops(&self) -> Vec<isize> {
+        self.views.iter().flatten().map(|v| v.top.0 as isize).collect()
+    }
+
+    fn prune_excluded(&mut self) {
+        let now = Instant::now();
+        self.excluded.retain(|(raw, at)| {
+            now.duration_since(*at) < EXCLUDE_TTL
+                && host::is_window_alive(HWND(*raw as *mut core::ffi::c_void))
+        });
+    }
+
+    /// Drop tabs whose Explorer window died on its own (its own X button, a
+    /// crashed browser process). Without this the tab keeps a dead HWND and
+    /// the layout/activate paths keep poking it.
+    fn drop_dead_views(&mut self) {
+        let dead: Vec<usize> = self
             .views
             .iter()
-            .flatten()
-            .map(|v| v.top.0 as isize)
+            .enumerate()
+            .filter_map(|(i, slot)| match slot {
+                Some(v) if !host::is_window_alive(v.top) => Some(i),
+                _ => None,
+            })
             .collect();
-        tracing::debug!(known = known.len(), "searching for new folder window");
-        match host::find_new_folder_window(&known, 25) {
-            Some(top) => self.absorb_window(top),
-            None => tracing::warn!("no new folder window found after notify"),
+        if dead.is_empty() {
+            return;
         }
+        for i in dead.into_iter().rev() {
+            tracing::warn!(idx = i, "absorbed window vanished, dropping tab");
+            self.views.remove(i);
+            self.tabs.remove(i);
+        }
+        if self.tabs.is_empty() {
+            if self.cfg.get().takeover.mode == "redirect" {
+                unsafe {
+                    let _ = ShowWindow(self.main_hwnd, SW_HIDE);
+                }
+                return;
+            }
+            unsafe {
+                let _ = DestroyWindow(self.main_hwnd);
+            }
+            return;
+        }
+        self.sync_tabbar();
+        self.activate(self.tabs.active_index());
+        self.layout();
+    }
+
+    /// Absorb every desktop folder window Revolc doesn't own yet.
+    fn sweep(&mut self) {
+        if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
+            return;
+        }
+        self.sweeping = true;
+        self.prune_excluded();
+        self.drop_dead_views();
+
+        let excluded: Vec<isize> = self.excluded.iter().map(|(h, _)| *h).collect();
+        let strays = host::stray_folder_windows(&self.known_tops(), &excluded);
+        if !strays.is_empty() {
+            tracing::info!(count = strays.len(), "sweep adopting stray folder windows");
+        }
+        for top in strays {
+            if self.tabs.len() >= MAX_TABS {
+                tracing::warn!(?top, "tab limit reached, leaving window on the desktop");
+                continue;
+            }
+            self.absorb_window(top);
+        }
+        self.sweeping = false;
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -271,6 +369,9 @@ impl App {
         }
         // Restore the Explorer window first, then let it close itself.
         if let Some(v) = self.views[i].take() {
+            // Park it: the sweep must not grab the window back while it is
+            // still alive during WM_CLOSE teardown.
+            self.excluded.push((v.top.0 as isize, Instant::now()));
             unsafe {
                 v.restore();
                 let _ = PostMessageW(v.top, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -451,13 +552,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.new_tab(path);
             LRESULT(0)
         }
+        m if m == WM_TIMER && wp.0 == SWEEP_TIMER_ID => {
+            app_from(hwnd).sweep();
+            LRESULT(0)
+        }
         m if m == absorb_msg() => {
             // wParam unused: BHO reports "window created" without touching
-            // the site object; we discover the HWND via IShellWindows.
+            // the site object; we discover the HWND by enumerating desktop
+            // folder windows and skip the ones we already own.
             let app = app_from(hwnd);
-            if app.cfg.get().takeover.mode == "redirect" {
-                app.absorb_new_window();
-            }
+            app.on_notify();
             LRESULT(0)
         }
         m if m == WM_APP_TRAY => {
