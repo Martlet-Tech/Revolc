@@ -5,18 +5,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, HBRUSH, HDC, HGDIOBJ,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
-    WM_SIZE, WM_TIMER, WS_OVERLAPPEDWINDOW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    WM_KEYDOWN, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::ConfigHandle;
@@ -130,7 +132,9 @@ impl MainWindow {
                 Default::default(),
                 CLASS_NAME,
                 w!("Revolc"),
-                WS_OVERLAPPEDWINDOW,
+                // WS_CLIPCHILDREN: our WM_ERASEBKGND sweep must not paint over
+                // the tab bar or the absorbed Explorer window.
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 1000,
@@ -591,6 +595,10 @@ impl App {
         let rc = self.view_rect();
         unsafe {
             MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
+            // Repaint the bar explicitly: after a maximize/restore its client
+            // may be unchanged in size, so MoveWindow's repaint is a no-op and
+            // stale pixels stay on screen.
+            let _ = InvalidateRect(self.tabbar_hwnd, None, true);
             // Keep the bar above the absorbed Explorer child: a new child is
             // created with HWND_TOP and would otherwise cover the tabs.
             let _ = SetWindowPos(
@@ -690,8 +698,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_SIZE => {
-            app_from(hwnd).layout();
+            let app = app_from(hwnd);
+            app.layout();
+            // The main window has no background brush, so anything the tab
+            // area does not cover keeps the *previous* frame's pixels: after
+            // maximize/restore that shows up as a duplicate tab bar and black
+            // bands. Erase + repaint on every resize.
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, true);
+            }
             LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
+            let app = app_from(hwnd);
+            let (r, g, b) = app.cfg.get().color(|t| &t.tabbar_background);
+            unsafe {
+                let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let _ = FillRect(HDC(wp.0 as *mut _), &rc, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
+            LRESULT(1)
         }
         WM_KEYDOWN => {
             let app = app_from(hwnd);

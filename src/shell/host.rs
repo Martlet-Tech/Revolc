@@ -86,9 +86,11 @@ impl Absorbed {
 
     pub fn resize(&self, rect: RECT) {
         unsafe {
-            // Cross-process positioning must be async: a synchronous
-            // SetWindowPos/MoveWindow blocks on Explorer's input queue and
-            // deadlocks our UI thread whenever a tab's Explorer is busy.
+            // Synchronous on purpose: during a WM_SIZE the host window has
+            // already changed size, and an async child resize leaves the
+            // absorbed Explorer one frame behind at its old geometry — that
+            // is what produced the "two chromes / stale tab bar" screenshots
+            // on maximize and restore (2026-11-17).
             let _ = SetWindowPos(
                 self.top,
                 HWND_TOP,
@@ -96,7 +98,7 @@ impl Absorbed {
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
     }
