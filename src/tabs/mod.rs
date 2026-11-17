@@ -6,7 +6,12 @@ pub mod events;
 #[derive(Debug, Clone)]
 pub struct Tab {
     pub id: u64,
+    /// Path used to open a new tab here (Ctrl+T). May be stale for a tab the
+    /// user navigated away in — ui resolves the live folder before reuse.
     pub path: String,
+    /// Display text. Filled from the Explorer window title, which follows
+    /// navigation ("此电脑", "下载"), unlike `path` which is fixed at absorb.
+    pub label: String,
 }
 
 /// Ordered tab list with an active index. Owned exclusively by the main thread.
@@ -51,7 +56,7 @@ impl TabList {
     pub fn push(&mut self, path: impl Into<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.tabs.push(Tab { id, path: path.into() });
+        self.tabs.push(Tab { id, path: path.into(), label: String::new() });
         self.active = self.tabs.len() - 1;
         id
     }
@@ -60,6 +65,19 @@ impl TabList {
     pub fn set_path(&mut self, i: usize, path: impl Into<String>) {
         if let Some(t) = self.tabs.get_mut(i) {
             t.path = path.into();
+        }
+    }
+
+    /// Update a tab's display text (Explorer window title; follows navigation).
+    /// Returns true when it actually changed, so callers can skip repainting.
+    pub fn set_label(&mut self, i: usize, label: impl Into<String>) -> bool {
+        let label = label.into();
+        match self.tabs.get_mut(i) {
+            Some(t) if t.label != label => {
+                t.label = label;
+                true
+            }
+            _ => false,
         }
     }
 

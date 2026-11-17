@@ -13,18 +13,17 @@ use std::time::Instant;
 
 use windows::core::w;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, PostMessageW, WM_CLOSE,
-};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
 
 /// `revolc.exe --shutdown`: ask the running instance to quit the polite way.
 /// Never kill the process — absorbed Explorer windows are its children and
-/// die with it (2026-11-17 crash loop).
+/// die with it (2026-11-17 crash loop). WM_APP_QUIT, not WM_CLOSE: WM_CLOSE
+/// only hides the window in redirect mode.
 fn shutdown_running() -> i32 {
     unsafe {
         match FindWindowW(w!("RevolcMain"), None) {
             Ok(h) if !h.0.is_null() => {
-                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(h, ui::WM_APP_QUIT, WPARAM(0), LPARAM(0));
                 0
             }
             _ => {

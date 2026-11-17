@@ -4,24 +4,28 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, HBRUSH, HFONT,     PAINTSTRUCT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, TRANSPARENT,
+    BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    FillRgn, GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
+    HBRUSH, HFONT, HGDIOBJ, PAINTSTRUCT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+    DEFAULT_GUI_FONT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetParent, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    RegisterClassExW, SetWindowLongPtrW, IDC_ARROW, WM_LBUTTONDOWN, WM_MBUTTONUP, WM_PAINT,
-    WNDCLASSEXW, GWLP_USERDATA, HMENU, WS_CHILD, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetParent, GetWindowLongPtrW, LoadCursorW,
+    PostMessageW, RegisterClassExW, SetWindowLongPtrW, IDC_ARROW, WM_LBUTTONDOWN, WM_MBUTTONUP,
+    WM_PAINT, WNDCLASSEXW, GWLP_USERDATA, HMENU, WS_CHILD, WS_VISIBLE,
 };
 
 use crate::config::Config;
 use crate::ui::{WM_APP_TAB_ACTIVATED, WM_APP_TAB_CLOSE, WM_APP_TAB_NEW};
 
-const TAB_WIDTH: i32 = 150;
+const TAB_MIN_W: i32 = 90;
+const TAB_MAX_W: i32 = 190;
 const TAB_HEIGHT: i32 = 22;
 const TAB_GAP: i32 = 4;
+const PAD_LEFT: i32 = 4;
 const CLOSE_BOX: i32 = 16; // per-tab close (X) button size
-const PLUS_SIZE: i32 = 20; // trailing "+" button size
+const PLUS_SIZE: i32 = 24; // trailing "+" button size
 const CLASS_NAME: PCWSTR = w!("RevolcTabBar");
 
 /// What a click landed on.
@@ -41,6 +45,10 @@ struct State {
     inactive_bg: COLORREF,
     text: COLORREF,
     text_active: COLORREF,
+    radius: i32,
+    /// Per-tab width, recomputed from the bar's client width so the tabs fill
+    /// the window instead of being stuck at one hard-coded size.
+    tab_w: i32,
 }
 
 impl State {
@@ -57,7 +65,24 @@ impl State {
             inactive_bg: c(&|t| &t.tab_inactive),
             text: c(&|t| &t.tab_text),
             text_active: c(&|t| &t.tab_text_active),
+            radius: cfg.theme.tab_radius.max(0),
+            tab_w: TAB_MAX_W,
         }
+    }
+
+    /// Fit n tabs + the trailing "+" into the bar, clamped to [MIN, MAX].
+    fn fit(&mut self, bar_width: i32) {
+        let n = self.labels.len().max(1) as i32;
+        let avail = bar_width - PAD_LEFT - PLUS_SIZE - 8 - n * TAB_GAP;
+        self.tab_w = (avail / n).clamp(TAB_MIN_W, TAB_MAX_W);
+    }
+
+    fn tab_x(&self, i: usize) -> i32 {
+        PAD_LEFT + i as i32 * (self.tab_w + TAB_GAP)
+    }
+
+    fn plus_x(&self) -> i32 {
+        self.tab_x(self.labels.len())
     }
 }
 
@@ -102,6 +127,10 @@ pub fn update(hwnd: HWND, labels: &[String], active: usize, cfg: &Config) {
         st.inactive_bg = colors.inactive_bg;
         st.text = colors.text;
         st.text_active = colors.text_active;
+        st.radius = colors.radius;
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        st.fit(rc.right);
         let _ = InvalidateRect(hwnd, None, false);
     }
 }
@@ -154,22 +183,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = FillRect(hdc, &rc, CreateSolidBrush(st.bg));
 
             let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
-            let old_font = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
             let _ = SetBkMode(hdc, TRANSPARENT);
 
             for (i, label) in st.labels.iter().enumerate() {
-                let x = i as i32 * (TAB_WIDTH + TAB_GAP);
-                if x + TAB_WIDTH < ps.rcPaint.left || x > ps.rcPaint.right {
+                let x = st.tab_x(i);
+                if x + st.tab_w < ps.rcPaint.left || x > ps.rcPaint.right {
                     continue; // clip
                 }
                 let tab_rc = RECT {
                     left: x,
                     top: 3,
-                    right: x + TAB_WIDTH,
+                    right: x + st.tab_w,
                     bottom: TAB_HEIGHT,
                 };
                 let bg = if i == st.active { st.active_bg } else { st.inactive_bg };
-                let _ = FillRect(hdc, &tab_rc, CreateSolidBrush(bg));
+                fill_round(hdc, &tab_rc, bg, st.radius);
 
                 // Close (X) button on the tab's right edge.
                 let close_rc = RECT {
@@ -178,6 +207,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     right: tab_rc.right - 4,
                     bottom: TAB_HEIGHT - 4,
                 };
+                let fg = if i == st.active { st.text_active } else { st.text };
+                let _ = SetTextColor(hdc, fg);
                 let _ = DrawTextW(
                     hdc,
                     &mut to_wide("\u{00D7}"), // ×
@@ -188,35 +219,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // Label text, clipped to leave room for the X button.
                 let mut wide = to_wide(label);
                 let mut text_rc = RECT {
-                    left: tab_rc.left + 6,
-                    right: close_rc.left,
+                    left: tab_rc.left + 8,
+                    right: close_rc.left - 2,
                     ..tab_rc
                 };
-                let fg = if i == st.active { st.text_active } else { st.text };
-                let _ = SetTextColor(hdc, fg);
-                let _ = DrawTextW(hdc, &mut wide, &mut text_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                let _ = DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut text_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
             }
 
-            // Trailing "+" (new tab) button after the last tab.
-            let n = st.labels.len() as i32;
-            let plus_x = n * (TAB_WIDTH + TAB_GAP);
+            // Trailing "+" (new tab): its own pill so it reads as a button.
+            let plus_x = st.plus_x();
             let plus_rc = RECT {
                 left: plus_x,
-                top: 4,
+                top: 3,
                 right: plus_x + PLUS_SIZE,
                 bottom: TAB_HEIGHT,
             };
+            fill_round(hdc, &plus_rc, st.inactive_bg, st.radius);
+            let _ = SetTextColor(hdc, st.text_active);
             let _ = DrawTextW(
                 hdc,
                 &mut to_wide("+"),
                 &mut { RECT { ..plus_rc } },
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
-            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);            let _ = EndPaint(hwnd, &ps);
+            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            match hit_test(lp, state_from(hwnd).labels.len()) {
+            match hit_test(lp, state_from(hwnd)) {
                 Some(Hit::Close(i)) => {
                     let parent = GetParent(hwnd).unwrap();
                     let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(i as _));
@@ -233,8 +269,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_SIZE => {
+            // Tabs fill the bar; recompute and repaint on every resize.
+            let st = state_from(hwnd);
+            st.fit(wp.0 as u16 as i32);
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
         WM_MBUTTONUP => {
-            if let Some(Hit::Tab(i)) = hit_test(lp, state_from(hwnd).labels.len()) {
+            if let Some(Hit::Tab(i)) = hit_test(lp, state_from(hwnd)) {
                 let parent = GetParent(hwnd).unwrap();
                 let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(i as _));
             }
@@ -245,33 +288,58 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// lParam of WM_*BUTTON*: x/y client coords -> hit region.
-fn hit_test(lp: LPARAM, tab_count: usize) -> Option<Hit> {
+fn hit_test(lp: LPARAM, st: &State) -> Option<Hit> {
     let x = (lp.0 as u16) as i32; // loword
     let y = ((lp.0 >> 16) as u16) as i32; // hiword
-    if x < 0 {
+    if x < 0 || y > TAB_HEIGHT + 4 {
         return None;
     }
-    let n = tab_count as i32;
+    let n = st.labels.len() as i32;
     // Trailing "+" button.
-    let plus_x = n * (TAB_WIDTH + TAB_GAP);
-    if x >= plus_x && x <= plus_x + PLUS_SIZE && y >= 0 && y <= TABBAR_Y + TAB_HEIGHT {
+    let plus_x = st.plus_x();
+    if x >= plus_x && x <= plus_x + PLUS_SIZE {
         return Some(Hit::Plus);
     }
-    let i = x / (TAB_WIDTH + TAB_GAP);
-    if i >= n {
+    if x < PAD_LEFT {
         return None;
     }
+    let i = (x - PAD_LEFT) / (st.tab_w + TAB_GAP);
+    if i < 0 || i >= n {
+        return None;
+    }
+    let tab_left = st.tab_x(i as usize);
+    if x > tab_left + st.tab_w {
+        return None; // in the gap between tabs
+    }
     // Close box occupies the tab's right edge.
-    let tab_left = i * (TAB_WIDTH + TAB_GAP);
-    let close_left = tab_left + TAB_WIDTH - CLOSE_BOX - 4;
-    if x >= close_left && y >= 4 && y <= TAB_HEIGHT - 2 {
+    let close_left = tab_left + st.tab_w - CLOSE_BOX - 4;
+    if x >= close_left && y >= 4 {
         Some(Hit::Close(i as usize))
     } else {
         Some(Hit::Tab(i as usize))
     }
 }
 
-const TABBAR_Y: i32 = 3;
+/// Rounded fill: the theme's `tab_radius` was silently ignored while the tab
+/// bar only had FillRect.
+unsafe fn fill_round(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT, color: COLORREF, radius: i32) {
+    let brush = CreateSolidBrush(color);
+    if radius <= 0 {
+        let _ = FillRect(hdc, rc, brush);
+    } else {
+        let rgn = CreateRoundRectRgn(
+            rc.left,
+            rc.top,
+            rc.right + 1,
+            rc.bottom + 1,
+            radius * 2,
+            radius * 2,
+        );
+        let _ = FillRgn(hdc, rgn, brush);
+        let _ = DeleteObject(HGDIOBJ(rgn.0));
+    }
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     windows::core::HSTRING::from(s).as_wide().to_vec()

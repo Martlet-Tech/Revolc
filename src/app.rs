@@ -48,14 +48,16 @@ static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// tree (the 2026-11-17 crash loop came from exactly that kind of kill).
 unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> windows::Win32::Foundation::BOOL {
     use windows::Win32::Foundation::BOOL;
-    use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
     // CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2, CTRL_LOGOFF=5, CTRL_SHUTDOWN=6
     if ctrl <= 2 || (5..=6).contains(&ctrl) {
         let hwnd = MAIN_HWND.load(AtomicOrdering::SeqCst);
         if hwnd != 0 {
-            let _ = PostMessageW(HWND(hwnd as _), WM_CLOSE, WPARAM(0), LPARAM(0));
+            // WM_APP_QUIT, not WM_CLOSE: WM_CLOSE only hides to the tray in
+            // redirect mode, which would let the OS kill us with the absorbed
+            // Explorer windows still re-parented.
+            let _ = PostMessageW(HWND(hwnd as _), ui::WM_APP_QUIT, WPARAM(0), LPARAM(0));
         }
-        // Logoff/shutdown: system waits ~5s; WM_CLOSE (restore + quit) is fast.
+        // Logoff/shutdown: system waits ~5s; restore + quit is fast.
         return BOOL(if (5..=6).contains(&ctrl) { 0 } else { 1 });
     }
     BOOL(0)

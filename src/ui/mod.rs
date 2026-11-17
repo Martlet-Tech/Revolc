@@ -28,6 +28,10 @@ pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher threa
 pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001; // lParam = tab index
 pub const WM_APP_TAB_CLOSE: u32 = 0x8002; // lParam = tab index
 pub const WM_APP_TAB_NEW: u32 = 0x8003; // lParam unused
+/// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
+/// to the tray in redirect mode, so shutdown paths (tray is direct, console
+/// handler and `--shutdown` post this) need their own message.
+pub const WM_APP_QUIT: u32 = 0x8010;
 pub(crate) use tray::WM_APP_TRAY;
 /// wParam = Explorer top-level HWND. Sent by the BHO via the registered
 /// window message "RevolcAbsorbExplorer" (system-assigned id, identical
@@ -223,7 +227,17 @@ impl App {
     }
 
     fn sync_tabbar(&self) {
-        let labels: Vec<String> = self.tabs.iter_all().map(|t| short_label(&t.path)).collect();
+        let labels: Vec<String> = self
+            .tabs
+            .iter_all()
+            .map(|t| {
+                if t.label.is_empty() {
+                    short_label(&t.path)
+                } else {
+                    t.label.clone()
+                }
+            })
+            .collect();
         tabbar::update(self.tabbar_hwnd, &labels, self.tabs.active_index(), &self.cfg.get());
     }
 
@@ -281,13 +295,18 @@ impl App {
         // 50ms per retry) for information we already have.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
         if need_path {
-            let store = host::read_folder_path(top, 2)
-                .or_else(|| {
-                    let t = host::window_title(top);
-                    if t.is_empty() { None } else { Some(t) }
-                })
-                .unwrap_or_else(|| "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string());
-            self.tabs.set_path(idx, store);
+            let store = host::read_folder_path(top, 2).unwrap_or_default();
+            if !store.is_empty() {
+                self.tabs.set_path(idx, store);
+            }
+        }
+        // Display text comes from the window title so it follows navigation.
+        let title = host::window_title(top);
+        if !title.is_empty() {
+            self.tabs.set_label(idx, title);
+        } else if self.tabs.get(idx).map(|t| t.label.is_empty()).unwrap_or(false) {
+            let fallback = short_label(&self.tabs.get(idx).map(|t| t.path.clone()).unwrap_or_default());
+            self.tabs.set_label(idx, fallback);
         }
 
         self.sync_tabbar();
@@ -377,6 +396,38 @@ impl App {
         self.layout();
     }
 
+    /// Keep tab labels in sync with the Explorer windows. GetWindowTextW on a
+    /// foreign window returns its cached caption (no WM_GETTEXT round-trip),
+    /// so one pass over all tabs is microseconds. This is what makes a tab
+    /// say "此电脑" after the user navigates away from "zt".
+    fn refresh_labels(&mut self) -> bool {
+        let mut changed = false;
+        for (i, slot) in self.views.iter().enumerate() {
+            if let Some(v) = slot {
+                let title = host::window_title(v.top);
+                if !title.is_empty() && self.tabs.set_label(i, title) {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Folder the active tab is actually showing right now. `Tab::path` is
+    /// only what the tab was opened with; the user may have navigated since.
+    fn active_folder_path(&self) -> String {
+        if let Some(v) = self.views.get(self.tabs.active_index()).and_then(|s| s.as_ref()) {
+            if let Some(p) = host::read_folder_path(v.top, 2) {
+                return p;
+            }
+        }
+        self.tabs
+            .active()
+            .map(|t| t.path.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(home_dir)
+    }
+
     /// Absorb every desktop folder window Revolc doesn't own yet.
     fn sweep(&mut self) {
         if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
@@ -399,6 +450,10 @@ impl App {
             self.absorb_window(top);
         }
         self.sweeping = false;
+
+        if self.refresh_labels() {
+            self.sync_tabbar();
+        }
 
         // Adaptive rate: keep hammering while a folder is expected, drop to
         // the once-a-second safety net otherwise.
@@ -468,7 +523,9 @@ impl App {
         tracing::debug!(?a, "action dispatched");
         match a {
             Action::NewTab => {
-                let path = self.tabs.active().map(|t| t.path.clone()).unwrap_or_else(home_dir);
+                // Reuse where the user actually is, not where the tab was
+                // opened (a tab navigated to This PC must not reopen "zt").
+                let path = self.active_folder_path();
                 self.new_tab(path);
             }
             Action::CloseTab => self.close_tab(self.tabs.active_index()),
@@ -568,8 +625,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
-            // spec §3.2 (M1): persist session here. M0: pass through.
+            // redirect mode: closing the window means "hide to the tray" —
+            // the takeover keeps running (Clover semantics). Real exit lives
+            // in the tray menu and in WM_APP_QUIT (--shutdown).
+            let app = app_from(hwnd);
+            if app.cfg.get().takeover.mode == "redirect" {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                tracing::info!("main window hidden to tray (redirect mode)");
+                return LRESULT(0);
+            }
             DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        m if m == WM_APP_QUIT => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
         }
         // WM_ENDSESSION (logoff/shutdown): restore absorbed windows NOW —
         // once we're killed mid-session, Explorer keeps dangling refs to the
@@ -596,7 +669,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         m if m == WM_APP_TAB_NEW => {
             let app = app_from(hwnd);
-            let path = app.tabs.active().map(|t| t.path.clone()).unwrap_or_else(home_dir);
+            let path = app.active_folder_path();
             app.new_tab(path);
             LRESULT(0)
         }
