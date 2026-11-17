@@ -271,8 +271,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SIZE => {
             // Tabs fill the bar; recompute and repaint on every resize.
+            //
+            // Ask the window, do not decode the message: wParam is the
+            // SIZE_* kind (0 = restored, 2 = maximized), the new size is in
+            // lParam. Reading wParam here fed `0` into fit(), which clamped
+            // to TAB_MIN_W — that is why the tabs snapped narrow the first
+            // time the window was maximized and never recovered.
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
             let st = state_from(hwnd);
-            st.fit(wp.0 as u16 as i32);
+            st.fit(rc.right);
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
