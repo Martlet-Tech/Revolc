@@ -42,12 +42,23 @@ fn absorb_msg() -> u32 {
 const TABBAR_HEIGHT: i32 = 28;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 
-/// Periodic stray-window sweep. The BHO notify is a hint, not a guarantee:
-/// SetSite fires before the frame is shown, and some folder windows never
-/// notify at all. 250ms keeps the "absorb latency" below the FE-flash the
-/// user can notice while healing every missed window.
+/// Stray-window sweep. The BHO notify is a hint, not a guarantee: SetSite
+/// fires before the frame is shown and some folder windows never notify at
+/// all, so the timer has to exist. But it does not have to be one constant
+/// rate — an EnumWindows pass plus one SetParent per hit is the whole cost:
+///
+/// * idle:    one pass every 200ms — the safety net for windows whose
+///            notification was lost (BHO not loaded, notify posted while we
+///            were busy). One EnumWindows pass over a few hundred windows is
+///            sub-millisecond, so this is well under 1% CPU.
+/// * burst:   15ms while a folder is expected (right after a notify or after
+///            we spawned Explorer ourselves), so the absorb lands before the
+///            FE window is even painted in the common case.
 const SWEEP_TIMER_ID: usize = 0x5EED;
-const SWEEP_INTERVAL_MS: u32 = 250;
+const SWEEP_IDLE_MS: u32 = 200;
+const SWEEP_FAST_MS: u32 = 15;
+/// How long a notify keeps us in fast mode.
+const BURST_WINDOW: Duration = Duration::from_millis(1500);
 /// A window we just restored (tab closed) stays parked this long so the
 /// sweep does not grab it back while Explorer finishes destroying it.
 const EXCLUDE_TTL: Duration = Duration::from_secs(8);
@@ -70,6 +81,8 @@ struct App {
     /// Reentrancy guard: absorb moves windows around, which can re-enter
     /// this app's message handlers.
     sweeping: bool,
+    /// Fast-poll window: a folder is expected until this instant.
+    burst_until: Option<Instant>,
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -177,6 +190,7 @@ impl App {
             views: Vec::new(),
             excluded: Vec::new(),
             sweeping: false,
+            burst_until: None,
             tabbar_hwnd,
             main_hwnd: hwnd,
         });
@@ -184,10 +198,8 @@ impl App {
         app.new_tab(first);
         if app.cfg.get().takeover.mode == "redirect" {
             tray::add(hwnd);
-            unsafe {
-                // Arm the sweep before the first absorb can be missed.
-                SetTimer(hwnd, SWEEP_TIMER_ID, SWEEP_INTERVAL_MS, None);
-            }
+            // Startup is a burst too: we just spawned Explorer.
+            app.arm_burst();
         }
         app
     }
@@ -215,12 +227,14 @@ impl App {
         tabbar::update(self.tabbar_hwnd, &labels, self.tabs.active_index(), &self.cfg.get());
     }
 
-    /// Open a folder: push a reserved tab, spawn Explorer, absorb on BHO notify.
+    /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
+    /// notify or on the next fast sweep tick, whichever comes first.
     fn new_tab(&mut self, path: String) {
         self.tabs.push(path.clone());
         self.views.push(None);
         self.sync_tabbar();
         self.activate(self.tabs.active_index());
+        self.arm_burst();
         host::spawn_explorer(&path);
     }
 
@@ -281,12 +295,36 @@ impl App {
         self.layout();
     }
 
-    /// BHO said "a shell window was created". Treat it as a hint and run a
-    /// sweep right away (sub-ms EnumWindows); the sweep timer is the safety
-    /// net for windows that notify late, early, or not at all.
+    /// BHO said "a shell window was created". Treat it as a hint: sweep
+    /// immediately, and stay in fast-poll mode while the window finishes
+    /// appearing (SetSite fires before the frame is shown).
     fn on_notify(&mut self) {
         tracing::info!("absorb notify received");
+        self.arm_burst();
         self.sweep();
+    }
+
+    /// Switch the sweep timer into 15ms mode for BURST_WINDOW.
+    fn arm_burst(&mut self) {
+        if self.cfg.get().takeover.mode != "redirect" {
+            return;
+        }
+        self.burst_until = Some(Instant::now() + BURST_WINDOW);
+        unsafe {
+            SetTimer(self.main_hwnd, SWEEP_TIMER_ID, SWEEP_FAST_MS, None);
+        }
+    }
+
+    /// Back off to the idle rate (one pass per second). Called from sweep so
+    /// the transition needs no extra timer bookkeeping.
+    fn arm_idle(&mut self) {
+        if self.cfg.get().takeover.mode != "redirect" {
+            return;
+        }
+        self.burst_until = None;
+        unsafe {
+            SetTimer(self.main_hwnd, SWEEP_TIMER_ID, SWEEP_IDLE_MS, None);
+        }
     }
 
     fn known_tops(&self) -> Vec<isize> {
@@ -361,6 +399,16 @@ impl App {
             self.absorb_window(top);
         }
         self.sweeping = false;
+
+        // Adaptive rate: keep hammering while a folder is expected, drop to
+        // the once-a-second safety net otherwise.
+        if self.burst_until.map(|t| Instant::now() < t).unwrap_or(false) {
+            unsafe {
+                SetTimer(self.main_hwnd, SWEEP_TIMER_ID, SWEEP_FAST_MS, None);
+            }
+        } else {
+            self.arm_idle();
+        }
     }
 
     fn close_tab(&mut self, i: usize) {
