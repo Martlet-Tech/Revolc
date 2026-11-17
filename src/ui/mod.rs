@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, RedrawWindow, HBRUSH, HDC, HGDIOBJ,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, RedrawWindow, UpdateWindow, HBRUSH,
+    HDC, HGDIOBJ, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
@@ -16,7 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow,
     PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW,
+    CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY,
     WM_KEYDOWN, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
@@ -95,12 +96,18 @@ struct App {
     attached_tid: u32,
     /// Our window is the foreground/active window.
     active: bool,
-    /// (tab index, l, t, r, b, nc metrics) of the last geometry pushed to an
-    /// absorbed window. Guards enforce_views() against re-issuing a
-    /// cross-process SetWindowPos on every 200ms tick — but NC metrics are
-    /// part of the key: Explorer changes them on maximize/restore without the
-    /// view rect changing.
-    laid_out: Option<(usize, i32, i32, i32, i32, (i32, i32, i32, i32))>,
+    /// (tab index, l, t, r, b, measured placement metrics) of the last
+    /// geometry pushed to an absorbed window. Guards enforce_views() against
+    /// re-issuing a cross-process SetWindowPos on every 200ms tick — but the
+    /// measured metrics are part of the key: Explorer changes them on
+    /// maximize/restore/navigation without the view rect changing.
+    laid_out: Option<(usize, i32, i32, i32, i32, ((i32, i32, i32, i32), i32))>,
+    /// Client size the current layout was computed for. WM_SIZE is
+    /// authoritative, but a resize can race the cross-process re-parent (or be
+    /// swallowed while our queue is attached to Explorer's); the sweep
+    /// compares this and re-lays out instead of leaving the view at its old
+    /// size under a newly sized host.
+    last_client: (i32, i32),
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -214,6 +221,7 @@ impl App {
             attached_tid: 0,
             active: true,
             laid_out: None,
+            last_client: (0, 0),
             tabbar_hwnd,
             main_hwnd: hwnd,
         });
@@ -593,12 +601,9 @@ impl App {
 
     fn layout(&mut self) {
         let rc = self.view_rect();
+        self.last_client = (rc.right, rc.bottom);
         unsafe {
             MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
-            // Repaint the bar explicitly: after a maximize/restore its client
-            // may be unchanged in size, so MoveWindow's repaint is a no-op and
-            // stale pixels stay on screen.
-            let _ = InvalidateRect(self.tabbar_hwnd, None, true);
             // Keep the bar above the absorbed Explorer child: a new child is
             // created with HWND_TOP and would otherwise cover the tabs.
             let _ = SetWindowPos(
@@ -607,6 +612,14 @@ impl App {
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            // Paint the bar NOW. Leaving it to the message queue is what
+            // produced the black rectangle on the right of the tabs after a
+            // maximize: the host had already grown and erased (clipping out
+            // child rects), the tab bar was resized in the same WM_SIZE, and
+            // until its WM_PAINT was dispatched that strip had neither a host
+            // background nor bar pixels — DWM composites it black.
+            let _ = InvalidateRect(self.tabbar_hwnd, None, true);
+            let _ = UpdateWindow(self.tabbar_hwnd);
         }
         self.laid_out = None;
         self.place_active();
@@ -617,18 +630,16 @@ impl App {
     fn place_active(&mut self) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
-        let nc = self
-            .views
-            .get(idx)
-            .and_then(|v| v.as_ref())
-            .and_then(|v| host::nc_metrics(v.top))
-            .unwrap_or((0, 0, 0, 0));
-        let key = (idx, rc.left, rc.top, rc.right, rc.bottom, nc);
+        let metrics = match self.views.get(idx).and_then(|v| v.as_ref()) {
+            Some(v) => v.placement_key(),
+            None => ((0, 0, 0, 0), 0),
+        };
+        let key = (idx, rc.left, rc.top, rc.right, rc.bottom, metrics);
         if self.laid_out == Some(key) {
             return;
         }
         if let Some(Some(v)) = self.views.get(idx) {
-            // Align the *client* area (ribbon onward) to the view rect.
+            // Align the *visible chrome* (ribbon onward) to the view rect.
             v.place_client(rc);
         }
         self.laid_out = Some(key);
@@ -646,6 +657,9 @@ impl App {
                 None,
                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
             );
+            // Same-thread children (our tab bar) are painted by the call
+            // above; the host's own erase still has to be flushed now.
+            let _ = UpdateWindow(self.main_hwnd);
         }
     }
 
@@ -654,6 +668,20 @@ impl App {
     /// inactive tab lands on top of the active one at its old size — exactly
     /// the "two ribbons stacked" glitch. One IsWindowVisible per view.
     fn enforce_views(&mut self) {
+        // Self-heal a missed resize first: everything below assumes the layout
+        // matches the current client size.
+        let mut cr = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.main_hwnd, &mut cr);
+        }
+        if self.last_client != (0, 0) && (cr.right, cr.bottom) != self.last_client {
+            tracing::warn!(
+                client = ?(cr.right, cr.bottom),
+                laid_out_for = ?self.last_client,
+                "client size drifted from layout, re-laying out"
+            );
+            self.layout();
+        }
         let active = self.tabs.active_index();
         for (i, slot) in self.views.iter().enumerate() {
             let Some(v) = slot else { continue };
@@ -789,9 +817,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // The main window has no background brush, so anything the tab
             // area does not cover keeps the *previous* frame's pixels: after
             // maximize/restore that shows up as a duplicate tab bar and black
-            // bands. Erase + repaint on every resize.
+            // bands. Erase + repaint on every resize, synchronously.
             unsafe {
                 let _ = InvalidateRect(hwnd, None, true);
+                let _ = UpdateWindow(hwnd);
             }
             LRESULT(0)
         }

@@ -13,7 +13,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
+    GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsWindow, IsWindowVisible,
+    SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SW_HIDE, SW_SHOW, WS_BORDER, WS_CAPTION,
@@ -33,6 +34,10 @@ pub struct Absorbed {
     pub top: HWND,
     orig_style: isize,
     orig_exstyle: isize,
+    /// Non-client metrics **before** we stripped WS_CAPTION: (l, t, r, b).
+    /// Explorer keeps reserving the caption band *inside* its client area
+    /// (custom frame), so this is the only cheap hint we get about it.
+    nc_pre: (i32, i32, i32, i32),
 }
 
 impl Absorbed {
@@ -43,6 +48,7 @@ impl Absorbed {
         }
         let orig_style = GetWindowLongPtrW(top, GWL_STYLE);
         let orig_exstyle = GetWindowLongPtrW(top, GWL_EXSTYLE);
+        let nc_pre = nc_metrics(top).unwrap_or((0, 0, 0, 0));
 
         // Failure here (e.g. UIPI block) must not be silent, or a duplicate
         // notify will absorb the same window again into a second tab.
@@ -63,8 +69,8 @@ impl Absorbed {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
                 | SWP_ASYNCWINDOWPOS,
         );
-        tracing::info!(?top, "explorer window absorbed");
-        Ok(Self { top, orig_style, orig_exstyle })
+        tracing::info!(?top, nc = ?nc_pre, "explorer window absorbed");
+        Ok(Self { top, orig_style, orig_exstyle, nc_pre })
     }
 
     /// Explorer re-applies its own frame styles on some navigations, which
@@ -104,30 +110,56 @@ impl Absorbed {
         tracing::info!(?self.top, "explorer window restored");
     }
 
-    /// Place the window so that its **client area** (ribbon, address bar,
-    /// list) lands exactly on `rect`, compensating whatever non-client chrome
-    /// Explorer currently has.
+    /// Place the window so that its **visible chrome** (ribbon / command bar,
+    /// i.e. the first thing Explorer actually paints) lands exactly on `rect`.
     ///
-    /// Measuring beats stripping: Explorer recomputes its frame on maximize,
-    /// restore and some navigations (NC height 0 / ~30 / ~35 px), so assuming
-    /// "WS_CAPTION stripped ⇒ NC is zero" leaves a band of foreign chrome
-    /// between the tab bar and the ribbon (2026-11-17 screenshots).
+    /// Two offsets have to be compensated, and only one of them is a real
+    /// non-client area:
+    ///
+    /// 1. `nc_metrics` — the frame around the client rect. Zero after we strip
+    ///    `WS_CAPTION`, non-zero if Explorer re-applied its styles.
+    /// 2. `band()` — the strip Explorer keeps *reserved inside its own client*
+    ///    for the custom titlebar it no longer draws once the caption is
+    ///    stripped. Measured from the real child layout (see `content_band`).
+    ///
+    /// Aligning the client rect instead of the chrome (the 2026-11-17
+    /// `25a5fbd` attempt) leaves that band — stale address-bar / column-header
+    /// pixels — right under the tab bar.
     pub fn place_client(&self, rect: RECT) {
-        let Some((nx, ny, nx2, ny2)) = nc_metrics(self.top) else {
-            self.resize(rect);
-            return;
-        };
+        let (nx, ny, nx2, ny2) = nc_metrics(self.top).unwrap_or((0, 0, 0, 0));
+        let band = self.band();
         unsafe {
             let _ = SetWindowPos(
                 self.top,
                 HWND_TOP,
                 rect.left - nx,
-                rect.top - ny,
+                rect.top - ny - band,
                 (rect.right - rect.left) + nx + nx2,
-                (rect.bottom - rect.top) + ny + ny2,
+                (rect.bottom - rect.top) + ny + ny2 + band,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        tracing::info!(
+            top = ?self.top,
+            band,
+            nc = ?(nx, ny, nx2, ny2),
+            view = ?(rect.left, rect.top, rect.right, rect.bottom),
+            "placed absorbed view"
+        );
+    }
+
+    /// Everything the placement depends on, for the caller's de-dup key:
+    /// non-client metrics and the internal band. Both change behind our back
+    /// (Explorer re-applies styles on navigation, ribbon auto-hide changes the
+    /// band), so they must be part of the key or the view drifts.
+    pub fn placement_key(&self) -> ((i32, i32, i32, i32), i32) {
+        (nc_metrics(self.top).unwrap_or((0, 0, 0, 0)), self.band())
+    }
+
+    /// Height of the reserved-but-unpainted strip at the top of the absorbed
+    /// window's client area.
+    fn band(&self) -> i32 {
+        content_band(self.top).unwrap_or(self.nc_pre.1).clamp(0, 80)
     }
 
     pub fn resize(&self, rect: RECT) {
@@ -154,6 +186,66 @@ impl Absorbed {
             let _ = ShowWindow(self.top, if visible { SW_SHOW } else { SW_HIDE });
         }
     }
+}
+
+/// Measure the strip Explorer reserves at the top of its own client area for
+/// the custom titlebar / tab strip it stops painting once `WS_CAPTION` is gone.
+///
+/// Probing the real child layout beats trusting a constant or the pre-strip NC
+/// metrics: the band follows DPI, theme and Explorer version, and it is *not*
+/// non-client area any more (`GetWindowRect - GetClientRect == 0`).
+///
+/// The known top-of-content bands are all we need — the smallest visible one
+/// wins, since everything else in the tree sits below the command bar.
+fn content_band(top: HWND) -> Option<i32> {
+    const BAND_CLASSES: [&str; 4] = [
+        "UIRibbonCommandBarDock",
+        "UIRibbonCommandBar",
+        "RebarWindow32",
+        "NUIPane",
+    ];
+    let (_, ny, _, _) = nc_metrics(top)?;
+    let mut wr = RECT::default();
+    unsafe { GetWindowRect(top, &mut wr).ok()? };
+    let client_top = wr.top + ny;
+
+    let mut best: Option<i32> = None;
+    for child in descendants(top) {
+        if !unsafe { IsWindowVisible(child).as_bool() } {
+            continue;
+        }
+        if !BAND_CLASSES.contains(&class_name(child).as_str()) {
+            continue;
+        }
+        let mut cr = RECT::default();
+        if unsafe { GetWindowRect(child, &mut cr) }.is_err() || cr.bottom <= cr.top {
+            continue;
+        }
+        let band = cr.top - client_top;
+        if !(0..=80).contains(&band) {
+            continue;
+        }
+        best = Some(best.map_or(band, |b| b.min(band)));
+    }
+    best
+}
+
+/// Every descendant of `parent` (EnumChildWindows is recursive).
+fn descendants(parent: HWND) -> Vec<HWND> {
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<HWND>);
+        out.push(hwnd);
+        BOOL(1)
+    }
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            parent,
+            Some(proc),
+            LPARAM(&mut out as *mut Vec<HWND> as isize),
+        );
+    }
+    out
 }
 
 /// True if `top` is already a child of our host (absorbed earlier).
