@@ -237,8 +237,16 @@ fn register() -> Result<(), HRESULT> {
     let threading = HSTRING::from("ThreadingModel");
     let friendly = HSTRING::from("Revolc Tab Explorer Helper");
 
-    // 1) HKCU\Software\Classes\CLSID\{clsid}\InprocServer32
-    let hk = reg_key(&clsid_path())?;
+    // 1) CLSID\{clsid}\InprocServer32. The BHO loader resolves the CLSID
+    //    from HKLM\Software\Classes; HKCU-only registration is invisible to
+    //    it. HKLM preferred (needs elevation), HKCU fallback for testing.
+    let hk = match reg_key_at(HKEY_LOCAL_MACHINE, &clsid_path()) {
+        Ok(hk) => { bho_log("CLSID written to HKLM"); hk }
+        Err(_) => {
+            bho_log("CLSID HKLM denied, using HKCU");
+            reg_key(&clsid_path())?
+        }
+    };
     set_value(&hk, None, &path_h);
     set_value(&hk, Some(&threading), &apartment);
     unsafe { let _ = RegCloseKey(hk); }

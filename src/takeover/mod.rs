@@ -68,6 +68,13 @@ pub fn ensure_bho_registered() {
     if !hklm_bho_present() {
         tracing::warn!("HKLM BHO key missing, requesting elevation via regsvr32");
         elevate_register(&dll);
+        // regsvr32 runs async after UAC consent; wait for it to finish.
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            if hklm_bho_present() {
+                break;
+            }
+        }
         if hklm_bho_present() {
             tracing::info!("HKLM BHO key present after elevated registration");
         } else {
@@ -79,7 +86,14 @@ pub fn ensure_bho_registered() {
 }
 
 fn hklm_bho_present() -> bool {
-    let path = HSTRING::from(BHO_CLSID_PATH);
+    hklm_key(BHO_CLSID_PATH.to_string())
+        && hklm_key(format!(
+            "Software\\Classes\\CLSID\\{{9F1C4E8B-6A2D-4E7B-8C13-5D04F7A2B916}}\\InprocServer32"
+        ))
+}
+
+fn hklm_key(path: String) -> bool {
+    let path = HSTRING::from(path);
     unsafe {
         let mut hk = HKEY::default();
         let r = RegOpenKeyExW(
