@@ -104,6 +104,32 @@ impl Absorbed {
         tracing::info!(?self.top, "explorer window restored");
     }
 
+    /// Place the window so that its **client area** (ribbon, address bar,
+    /// list) lands exactly on `rect`, compensating whatever non-client chrome
+    /// Explorer currently has.
+    ///
+    /// Measuring beats stripping: Explorer recomputes its frame on maximize,
+    /// restore and some navigations (NC height 0 / ~30 / ~35 px), so assuming
+    /// "WS_CAPTION stripped ⇒ NC is zero" leaves a band of foreign chrome
+    /// between the tab bar and the ribbon (2026-11-17 screenshots).
+    pub fn place_client(&self, rect: RECT) {
+        let Some((nx, ny, nx2, ny2)) = nc_metrics(self.top) else {
+            self.resize(rect);
+            return;
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                self.top,
+                HWND_TOP,
+                rect.left - nx,
+                rect.top - ny,
+                (rect.right - rect.left) + nx + nx2,
+                (rect.bottom - rect.top) + ny + ny2,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
     pub fn resize(&self, rect: RECT) {
         unsafe {
             // Synchronous on purpose: during a WM_SIZE the host window has
@@ -252,6 +278,32 @@ pub fn rect_in_parent(top: HWND) -> (i32, i32, i32, i32) {
             let _ = ScreenToClient(parent, &mut br);
         }
         (tl.x, tl.y, br.x, br.y)
+    }
+}
+
+/// Non-client metrics of `top`: (left, top, right, bottom) padding of the
+/// window rect around its client rect, in pixels.
+pub fn nc_metrics(top: HWND) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::MapWindowPoints;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+    unsafe {
+        let mut wr = RECT::default();
+        let mut cr = RECT::default();
+        GetWindowRect(top, &mut wr).ok()?;
+        GetClientRect(top, &mut cr).ok()?;
+        let mut pts = [
+            POINT { x: cr.left, y: cr.top },
+            POINT { x: cr.right, y: cr.bottom },
+        ];
+        // hwndFrom = top, hwndTo = NULL → screen coordinates.
+        MapWindowPoints(top, None, &mut pts);
+        Some((
+            pts[0].x - wr.left,
+            pts[0].y - wr.top,
+            wr.right - pts[1].x,
+            wr.bottom - pts[1].y,
+        ))
     }
 }
 

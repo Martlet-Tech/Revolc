@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, HBRUSH, HDC, HGDIOBJ,
+    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, RedrawWindow, HBRUSH, HDC, HGDIOBJ,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
@@ -94,10 +95,12 @@ struct App {
     attached_tid: u32,
     /// Our window is the foreground/active window.
     active: bool,
-    /// (tab index, l, t, r, b) of the last geometry pushed to an absorbed
-    /// window. Guards enforce_views() against re-issuing a cross-process
-    /// SetWindowPos on every 200ms tick.
-    laid_out: Option<(usize, i32, i32, i32, i32)>,
+    /// (tab index, l, t, r, b, nc metrics) of the last geometry pushed to an
+    /// absorbed window. Guards enforce_views() against re-issuing a
+    /// cross-process SetWindowPos on every 200ms tick — but NC metrics are
+    /// part of the key: Explorer changes them on maximize/restore without the
+    /// view rect changing.
+    laid_out: Option<(usize, i32, i32, i32, i32, (i32, i32, i32, i32))>,
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -523,7 +526,6 @@ impl App {
         if !self.tabs.activate(i) {
             return;
         }
-        let rc = self.view_rect();
         for (j, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot {
                 v.set_visible(j == i);
@@ -532,10 +534,8 @@ impl App {
         // A freshly absorbed window still has its desktop size; layout it at
         // once instead of waiting for the next WM_SIZE.
         self.laid_out = None;
-        if let Some(Some(v)) = self.views.get(i) {
-            v.resize(rc);
-            self.laid_out = Some((i, rc.left, rc.top, rc.right, rc.bottom));
-        }
+        self.place_active();
+        self.redraw_all();
         // Keyboard focus has to be handed to the other process explicitly, or
         // the address bar takes clicks but no keystrokes.
         if let Some(Some(v)) = self.views.get(i) {
@@ -610,20 +610,43 @@ impl App {
         }
         self.laid_out = None;
         self.place_active();
+        self.redraw_all();
     }
 
     /// Resize the active view, skipping the call when nothing changed.
     fn place_active(&mut self) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
-        let key = (idx, rc.left, rc.top, rc.right, rc.bottom);
+        let nc = self
+            .views
+            .get(idx)
+            .and_then(|v| v.as_ref())
+            .and_then(|v| host::nc_metrics(v.top))
+            .unwrap_or((0, 0, 0, 0));
+        let key = (idx, rc.left, rc.top, rc.right, rc.bottom, nc);
         if self.laid_out == Some(key) {
             return;
         }
         if let Some(Some(v)) = self.views.get(idx) {
-            v.resize(rc);
+            // Align the *client* area (ribbon onward) to the view rect.
+            v.place_client(rc);
         }
         self.laid_out = Some(key);
+    }
+
+    /// Repaint the whole client including children. Needed after any geometry
+    /// change: with WS_CLIPCHILDREN our own invalidate cannot touch the area a
+    /// shrunken child vacated, so it keeps the previous frame (the "残影" band
+    /// between the tab bar and the ribbon).
+    fn redraw_all(&self) {
+        unsafe {
+            let _ = RedrawWindow(
+                self.main_hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
     }
 
     /// Re-assert visibility/geometry of every tab every sweep. Explorer
@@ -708,6 +731,7 @@ impl App {
                 ?child,
                 class = %host::class_name(child),
                 rect = ?host::rect_in_parent(child),
+                nc = ?host::nc_metrics(child),
                 visible = host::is_visible(child),
                 "layout child"
             );
