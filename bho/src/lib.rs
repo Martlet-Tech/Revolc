@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
 use windows::Win32::UI::Shell::IWebBrowser2;
 use windows::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE,
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
@@ -66,6 +67,7 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
         let Some(site) = psite else {
             return Ok(()); // site released = window closing
         };
+        bho_log("SetSite called");
         unsafe {
             let Ok(browser) = site.cast::<IWebBrowser2>() else {
                 return Ok(());
@@ -90,6 +92,17 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
 
 /// Post the Explorer top-level HWND to the Revolc main window.
 /// Revolc not running → no-op (pure BHO, zero side effects).
+/// Debug log so we can tell "DLL not loaded" from "notify failed".
+fn bho_log(msg: &str) {
+    let Some(dir) = std::env::var_os("APPDATA") else { return };
+    let dir = std::path::Path::new(&dir).join("revolc");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+        .open(dir.join("bho.log")) else { return };
+    use std::io::Write as _;
+    let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
+}
+
 fn notify_revolc(top: HWND) {
     unsafe {
         if top.0.is_null() {
@@ -100,8 +113,10 @@ fn notify_revolc(top: HWND) {
         let n = GetClassNameW(top, &mut buf);
         let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
         if class != "CabinetWClass" && class != "ExploreWClass" {
+            bho_log(&format!("SetSite class={} ignored", class));
             return;
         }
+        bho_log(&format!("notifying revolc hwnd={:?}", top.0 as isize));
 
         static MSG_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let msg = *MSG_ID.get_or_init(|| RegisterWindowMessageW(w!("RevolcAbsorbExplorer")));
@@ -172,10 +187,14 @@ fn bho_path() -> HSTRING {
 }
 
 fn reg_key(path: &HSTRING) -> Result<HKEY, HRESULT> {
+    reg_key_at(HKEY_CURRENT_USER, path)
+}
+
+fn reg_key_at(root: HKEY, path: &HSTRING) -> Result<HKEY, HRESULT> {
     unsafe {
         let mut hk = HKEY::default();
         let r = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             path,
             0,
             PCWSTR::null(),
@@ -224,8 +243,17 @@ fn register() -> Result<(), HRESULT> {
     set_value(&hk, Some(&threading), &apartment);
     unsafe { let _ = RegCloseKey(hk); }
 
-    // 2) HKCU\...\Explorer\Browser Helper Objects\{clsid} (friendly name)
-    let hk = reg_key(&bho_path())?;
+    // 2) Explorer BHO list. Explorer reads the machine BHO list; HKCU-only
+    //    registration is ignored for folder windows (Clover's RGS used HKLM).
+    //    Try HKLM first (needs elevation); fall back to HKCU for IE/testing.
+    let hklm = reg_key_at(HKEY_LOCAL_MACHINE, &bho_path());
+    let hk = match hklm {
+        Ok(hk) => { bho_log("BHO key written to HKLM"); hk }
+        Err(_) => {
+            bho_log("HKLM denied, BHO key in HKCU only (Explorer will NOT load us)");
+            reg_key(&bho_path())?
+        }
+    };
     set_value(&hk, None, &friendly);
     unsafe { let _ = RegCloseKey(hk); }
     Ok(())
