@@ -243,11 +243,16 @@ unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
         if let Some(dump) = write_minidump(info, &dir, id) {
             text.push_str(&format!("minidump  = {}\n", dump.display()));
         }
+        let path = dir.join(format!("crash-{id}.txt"));
+        // Write the signature BEFORE walking the stack: dbghelp can hang on a
+        // half-dead process (it loads a PDB, takes locks), and the signature is
+        // the part we cannot afford to lose.
+        let _ = std::fs::write(&path, &text);
         text.push_str("\n# stack (innermost first)\n");
         for (i, line) in stack_lines(info).iter().enumerate() {
             text.push_str(&format!("#{i:<2} {line}\n"));
         }
-        let _ = std::fs::write(dir.join(format!("crash-{id}.txt")), text);
+        let _ = std::fs::write(&path, text);
     }
     EXCEPTION_CONTINUE_SEARCH
 }

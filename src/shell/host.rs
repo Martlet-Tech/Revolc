@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SW_HIDE, SW_SHOW, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_VISIBLE,
     WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows::Win32::Foundation::{BOOL, LPARAM};
@@ -59,21 +59,37 @@ impl Absorbed {
         let orig_exstyle = GetWindowLongPtrW(top, GWL_EXSTYLE);
         let nc_pre = nc_metrics(top).unwrap_or((0, 0, 0, 0));
 
-        // Failure here (e.g. UIPI block) must not be silent, or a duplicate
-        // notify will absorb the same window again into a second tab.
-        // Breadcrumbs: these three calls run in *our* thread but act on a
-        // window owned by another process, and the whole sequence has crashed
-        // before (2026-11-17, faulting module uxtheme.dll). Logging each step
-        // makes the next crash point at one call instead of a range.
+        // ORDER MATTERS, and it is the difference between a crash and a clean
+        // reparent (2026-11-17 dump, minidump in %APPDATA%\revolc\crash):
+        //
+        //   SetParent -> NtUserSetParent -> KiUserCallbackDispatcher
+        //             -> user32 DispatchMessage/CallWindowProc -> uxtheme+0xe9f6
+        //             ACCESS VIOLATION
+        //
+        // while the window still carried WS_CAPTION and WS_VISIBLE. Reparenting
+        // makes user32 recompute the non-client area for the new parent, and a
+        // captioned frame asks uxtheme for a themed border in a context where
+        // the theme data is not ours to draw. Clover's absorb (FUN_01e3ba50,
+        // clover/analysis) zeroes the style *before* SetParent and only sets
+        // WS_VISIBLE afterwards — this is that order.
+        //
+        // 1. Nothing may be on screen while it is still parentless.
+        tracing::info!(?top, step = "hide", "absorb");
+        let _ = ShowWindow(top, SW_HIDE);
+        // 2. Strip caption/frame and the visible bit *before* the reparent, so
+        //    the NC recompute SetParent triggers has nothing to theme.
+        tracing::info!(?top, step = "style", "absorb");
+        let stripped =
+            ((orig_style as u32) & !STRIP_STYLE & !WS_VISIBLE.0) | WS_CHILD.0;
+        SetWindowLongPtrW(top, GWL_STYLE, stripped as isize);
+        SetWindowLongPtrW(top, GWL_EXSTYLE, ((orig_exstyle as u32) & !STRIP_EXSTYLE) as isize);
+        // 3. Now the reparent itself: no style change is needed afterwards, so
+        //    there is no second NC recompute with a hostile state.
         tracing::info!(?top, step = "SetParent", "absorb");
         SetParent(top, host).map_err(|e| {
             tracing::error!(error = %e, ?top, "SetParent failed");
             e
         })?;
-        tracing::info!(?top, step = "style", "absorb");
-        let stripped = ((orig_style as u32) & !STRIP_STYLE) | WS_CHILD.0;
-        SetWindowLongPtrW(top, GWL_STYLE, stripped as isize);
-        SetWindowLongPtrW(top, GWL_EXSTYLE, ((orig_exstyle as u32) & !STRIP_EXSTYLE) as isize);
         // Do NOT show here: the caller decides visibility and geometry once the
         // window is assigned to a tab. SWP_SHOWWINDOW used to flash the window
         // at (0,0) with its old desktop size, on top of the tab bar.
