@@ -8,7 +8,9 @@
 use windows::core::{Interface as _, Result, VARIANT};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -38,6 +40,13 @@ pub struct Absorbed {
     /// Explorer keeps reserving the caption band *inside* its client area
     /// (custom frame), so this is the only cheap hint we get about it.
     nc_pre: (i32, i32, i32, i32),
+    /// Explorer has shown this frame at least once.
+    ///
+    /// A window adopted while still hidden is a *pre-show* shell frame: it
+    /// exists and navigates, but Explorer has not run its own ShowWindow yet.
+    /// We position it and leave visibility alone until that happens; showing
+    /// it ourselves would take Explorer's start-up show path out of the loop.
+    shown: bool,
 }
 
 impl Absorbed {
@@ -70,7 +79,7 @@ impl Absorbed {
                 | SWP_ASYNCWINDOWPOS,
         );
         tracing::info!(?top, nc = ?nc_pre, "explorer window absorbed");
-        Ok(Self { top, orig_style, orig_exstyle, nc_pre })
+        Ok(Self { top, orig_style, orig_exstyle, nc_pre, shown: false })
     }
 
     /// Explorer re-applies its own frame styles on some navigations, which
@@ -156,6 +165,27 @@ impl Absorbed {
         (nc_metrics(self.top).unwrap_or((0, 0, 0, 0)), self.band())
     }
 
+    /// Does the window actually sit where `place_client(rect)` would put it?
+    ///
+    /// Explorer shows its own frame (and may move it) when it finishes
+    /// navigating, so the geometry we set at absorb time is not authoritative
+    /// — the `laid_out` de-dup key cannot see that drift because *we* did not
+    /// change anything. One GetWindowRect per view per sweep.
+    pub fn is_placed(&self, rect: RECT) -> bool {
+        let (nx, ny, nx2, ny2) = nc_metrics(self.top).unwrap_or((0, 0, 0, 0));
+        let band = self.band();
+        let want = (
+            rect.left - nx,
+            rect.top - ny - band,
+            rect.right + nx2,
+            rect.bottom + ny2,
+        );
+        let got = rect_in_parent(self.top);
+        let want = [want.0, want.1, want.2, want.3];
+        let got = [got.0, got.1, got.2, got.3];
+        want.iter().zip(got.iter()).all(|(w, g)| (w - g).abs() <= 1)
+    }
+
     /// Height of the reserved-but-unpainted strip at the top of the absorbed
     /// window's client area.
     fn band(&self) -> i32 {
@@ -181,9 +211,36 @@ impl Absorbed {
         }
     }
 
-    pub fn set_visible(&self, visible: bool) {
+    pub fn set_visible(&mut self, visible: bool) {
+        // Record Explorer showing the frame by itself; that is what makes the
+        // tab content "ready".
+        if visible && !self.shown && is_visible(self.top) {
+            self.shown = true;
+        }
+        // Pre-show frame: positioned but not yet shown by Explorer. Leave it
+        // hidden — our own ShowWindow would be the window's first show, and
+        // Explorer's start-up path (navigation, ribbon init) expects to run
+        // that itself. It shows up inside the tab when it is ready.
+        if visible && !self.shown {
+            return;
+        }
         unsafe {
             let _ = ShowWindow(self.top, if visible { SW_SHOW } else { SW_HIDE });
+        }
+    }
+
+    /// Has Explorer shown this frame at least once (i.e. is the tab content
+    /// actually on screen, as opposed to still starting up)?
+    pub fn ready(&self) -> bool {
+        self.shown
+    }
+
+    /// Called from the sweep: Explorer's own ShowWindow is what promotes a
+    /// pre-show frame to ready. Readiness is a fact about the window, so the
+    /// sweep samples it instead of inferring it from our own calls.
+    pub fn mark_shown(&mut self) {
+        if is_visible(self.top) {
+            self.shown = true;
         }
     }
 }
@@ -292,9 +349,22 @@ pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
 /// at all (BHO absent from that window/process). A notify-only design drops
 /// those windows on the desktop as plain Explorer windows (observed
 /// 2026-11-17: "no new folder window found after notify").
-pub fn stray_folder_windows(known: &[isize], excluded: &[isize]) -> Vec<HWND> {
+///
+/// `include_hidden` is what makes a new tab flash-free. Measured on this
+/// machine (log/probe_hidden.ps1): a folder window exists **851ms before
+/// Explorer shows it** — created hidden, navigates, then `ShowWindow`. A
+/// visible-only filter therefore *guarantees* adopting the window after it is
+/// already on screen: one painted frame of a stray Explorer window, which is
+/// the "系统自带 FE 闪一下" the user sees. Adopting it while it is still
+/// hidden means it is ours before it is ever composited (Explorer's later
+/// ShowWindow simply shows it inside our tab).
+pub fn stray_folder_windows(
+    known: &[isize],
+    excluded: &[isize],
+    include_hidden: bool,
+) -> Vec<HWND> {
     let mut out: Vec<HWND> = Vec::new();
-    let ctx = FindCtx { known, excluded, out: &mut out };
+    let ctx = FindCtx { known, excluded, include_hidden, out: &mut out };
     unsafe {
         let _ = EnumWindows(Some(enum_find_proc), LPARAM(&ctx as *const FindCtx as isize));
     }
@@ -304,6 +374,7 @@ pub fn stray_folder_windows(known: &[isize], excluded: &[isize]) -> Vec<HWND> {
 struct FindCtx<'a> {
     known: &'a [isize],
     excluded: &'a [isize],
+    include_hidden: bool,
     out: &'a mut Vec<HWND>,
 }
 
@@ -315,12 +386,26 @@ unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if class != "CabinetWClass" && class != "ExploreWClass" {
         return BOOL(1);
     }
-    if !IsWindowVisible(hwnd).as_bool() {
+    // Hidden is not a rejection reason when we are expecting a folder (see
+    // `include_hidden`): it is the whole point — a pre-show frame is free to
+    // steal. Never adopt our own windows though (we create none, but a
+    // future in-process browser would look identical).
+    if !ctx.include_hidden && !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
     }
     let raw = hwnd.0 as isize;
     if ctx.known.contains(&raw) || ctx.excluded.contains(&raw) {
         return BOOL(1);
+    }
+    if ctx.include_hidden && !IsWindowVisible(hwnd).as_bool() {
+        // A hidden frame may be an Explorer window that is still navigating or
+        // one that is about to be torn down (never shown at all). Only take it
+        // when it is not owned by us and not another app's shell view.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return BOOL(1);
+        }
     }
     ctx.out.push(hwnd);
     BOOL(1)

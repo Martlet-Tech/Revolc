@@ -97,6 +97,14 @@ struct App {
     attached_tid: u32,
     /// Our window is the foreground/active window.
     active: bool,
+    /// The active tab's window was absorbed *before* Explorer showed it (the
+    /// flash-free path), so SetFocus could not land yet. Retried by the sweep
+    /// the moment it becomes visible.
+    focus_pending: bool,
+    /// HWNDs whose folder path we already tried to resolve. A window adopted
+    /// before it navigated has no LocationURL yet; without this the sweep
+    /// would ask IShellWindows (out-of-proc, 50ms) on every pass.
+    path_done: Vec<isize>,
     /// (tab index, l, t, r, b, measured placement metrics) of the last
     /// geometry pushed to an absorbed window. Guards enforce_views() against
     /// re-issuing a cross-process SetWindowPos on every 200ms tick — but the
@@ -221,6 +229,8 @@ impl App {
             burst_until: None,
             attached_tid: 0,
             active: true,
+            focus_pending: false,
+            path_done: Vec::new(),
             laid_out: None,
             last_client: (0, 0),
             tabbar_hwnd,
@@ -337,14 +347,20 @@ impl App {
         // happened" - surface the window so the user sees the result. Must not
         // un-maximize: this runs on every `+` click.
         self.surface();
-        tracing::info!(?top, idx, "absorbed into tab");
+        // The window is usually adopted while Explorer still keeps it hidden
+        // (that is the whole point — see stray_folder_windows). Everything
+        // below that needs a *live, navigated* browser is therefore deferred.
+        let visible = host::is_visible(top);
+        tracing::info!(?top, idx, visible, "absorbed into tab");
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
         // When we spawned the window ourselves the tab already carries the
         // path — never stall the UI thread on IShellWindows (out-of-proc COM,
-        // 50ms per retry) for information we already have.
+        // 50ms per retry) for information we already have. A window that has
+        // not navigated yet has no path at all, and asking would burn the
+        // retries for nothing: resolve it on a later sweep instead.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
-        if need_path {
+        if need_path && visible {
             let store = host::read_folder_path(top, 2).unwrap_or_default();
             if !store.is_empty() {
                 self.tabs.set_path(idx, store);
@@ -463,6 +479,32 @@ impl App {
         changed
     }
 
+    /// Fill in the folder path of tabs that were absorbed before their window
+    /// had navigated (the flash-free path). Once per window, only when it is
+    /// on screen and titled — IShellWindows is out-of-proc and costs 50ms.
+    fn resolve_pending_paths(&mut self) {
+        for i in 0..self.views.len() {
+            let (top, titled, visible) = match self.views[i].as_ref() {
+                Some(v) => (v.top, !host::window_title(v.top).is_empty(), host::is_visible(v.top)),
+                None => continue,
+            };
+            let want = self
+                .tabs
+                .get(i)
+                .map(|t| t.path.is_empty())
+                .unwrap_or(false);
+            if !want || !titled || !visible || self.path_done.contains(&(top.0 as isize)) {
+                continue;
+            }
+            self.path_done.push(top.0 as isize);
+            if let Some(p) = host::read_folder_path(top, 1) {
+                self.tabs.set_path(i, p);
+            }
+        }
+        let known = self.known_tops();
+        self.path_done.retain(|h| known.contains(h));
+    }
+
     /// Folder the active tab is actually showing right now. `Tab::path` is
     /// only what the tab was opened with; the user may have navigated since.
     fn active_folder_path(&self) -> String {
@@ -488,9 +530,21 @@ impl App {
         self.drop_dead_views();
 
         let excluded: Vec<isize> = self.excluded.iter().map(|(h, _)| *h).collect();
-        let strays = host::stray_folder_windows(&self.known_tops(), &excluded);
+        // Take windows while they are still hidden whenever a folder is
+        // expected. Explorer creates the frame **~850ms before showing it**
+        // (log/probe_hidden.ps1), so this is the difference between "absorbed
+        // before it was ever painted" and "one frame of a stray Explorer
+        // window" — the flash the user reports. Outside that window we keep
+        // the old visible-only rule: an unrelated hidden CabinetWClass is
+        // none of our business.
+        let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_none());
+        let strays = host::stray_folder_windows(&self.known_tops(), &excluded, expecting);
         if !strays.is_empty() {
-            tracing::info!(count = strays.len(), "sweep adopting stray folder windows");
+            tracing::info!(
+                count = strays.len(),
+                expecting,
+                "sweep adopting stray folder windows"
+            );
         }
         for top in strays {
             if self.tabs.len() >= MAX_TABS {
@@ -504,6 +558,7 @@ impl App {
         if self.refresh_labels() {
             self.sync_tabbar();
         }
+        self.resolve_pending_paths();
         self.enforce_views();
 
         // Adaptive rate: keep hammering while a folder is expected, drop to
@@ -521,13 +576,18 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
-        // Restore the Explorer window first, then let it close itself.
+        // Close the Explorer window where it is: hidden, still our child.
         if let Some(v) = self.views[i].take() {
             // Park it: the sweep must not grab the window back while it is
             // still alive during WM_CLOSE teardown.
             self.excluded.push((v.top.0 as isize, Instant::now()));
+            // `restore()` re-parents the window to the *desktop* and shows it
+            // (SWP_SHOWWINDOW) before the close lands, so every closed tab
+            // painted one frame of a plain native Explorer window — the
+            // "关闭文件夹时 FE 闪一下" report. Explorer shuts down just as
+            // happily while hidden, and then there is nothing to see.
             unsafe {
-                v.restore();
+                let _ = ShowWindow(v.top, SW_HIDE);
                 let _ = PostMessageW(v.top, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
@@ -557,21 +617,31 @@ impl App {
         if !self.tabs.activate(i) {
             return;
         }
-        for (j, slot) in self.views.iter().enumerate() {
+        // POSITION BEFORE SHOWING. A freshly absorbed window still carries its
+        // desktop size and origin, so showing it first paints it at (0,0) over
+        // the tab bar for one frame — the "content flashes at the wrong place"
+        // half of the glitch. Placing first also means a window Explorer has
+        // not shown yet becomes visible exactly where the tab expects it.
+        self.laid_out = None;
+        self.place_active();
+        for (j, slot) in self.views.iter_mut().enumerate() {
             if let Some(v) = slot {
                 v.set_visible(j == i);
             }
         }
-        // A freshly absorbed window still has its desktop size; layout it at
-        // once instead of waiting for the next WM_SIZE.
-        self.laid_out = None;
-        self.place_active();
         self.redraw_all();
         // Keyboard focus has to be handed to the other process explicitly, or
-        // the address bar takes clicks but no keystrokes.
-        if let Some(Some(v)) = self.views.get(i) {
-            host::focus_into(self.main_hwnd, v.top);
-        }
+        // the address bar takes clicks but no keystrokes. A window adopted
+        // before Explorer showed it cannot take focus yet: the sweep retries
+        // as soon as it appears (`focus_pending`).
+        self.focus_pending = match self.views.get(i) {
+            Some(Some(v)) if host::is_visible(v.top) => {
+                host::focus_into(self.main_hwnd, v.top);
+                false
+            }
+            Some(Some(_)) => true,
+            _ => false,
+        };
         self.sync_input_queue();
         self.sync_tabbar();
     }
@@ -706,19 +776,73 @@ impl App {
             self.layout();
         }
         let active = self.tabs.active_index();
+        let rc = self.view_rect();
+        let mut stale = false;
+        let mut became_visible = false;
+        let mut show: Option<HWND> = None;
+        let mut hide: Vec<HWND> = Vec::new();
         for (i, slot) in self.views.iter().enumerate() {
             let Some(v) = slot else { continue };
             // Explorer can restore its caption on navigation; that is the band
             // of foreign chrome that shows up between tab bar and ribbon.
             if unsafe { v.ensure_stripped() } {
-                self.laid_out = None;
+                stale = true;
+            }
+            // Explorer also moves and resizes its own frame when it finally
+            // shows it; the `laid_out` key cannot notice that because we did
+            // not change anything.
+            if i == active && !v.is_placed(rc) {
+                stale = true;
             }
             let want = i == active;
-            if host::is_visible(v.top) != want {
-                host::force_visible(v.top, want);
-                if want {
-                    self.laid_out = None; // a re-shown window is at its old size
+            let vis = host::is_visible(v.top);
+            if want && !v.ready() {
+                // Pre-show shell frame: positioned already, but Explorer has
+                // not shown it yet. Its own ShowWindow does that (and runs its
+                // start-up path), so we never force it on screen.
+                if vis {
+                    became_visible = true;
                 }
+            } else if want && !vis {
+                show = Some(v.top);
+            } else if !want && vis {
+                hide.push(v.top);
+            }
+        }
+        if stale || became_visible {
+            self.laid_out = None;
+        }
+        // Place BEFORE re-asserting visibility: a window that is about to be
+        // shown must already sit at the tab geometry, or its first frame lands
+        // at the desktop position it was born with.
+        self.place_active();
+        if became_visible {
+            // Explorer's ShowWindow may have restored its own geometry.
+            self.laid_out = None;
+            self.place_active();
+        }
+        if let Some(top) = show {
+            host::force_visible(top, true);
+        }
+        for top in hide {
+            host::force_visible(top, false);
+        }
+        for slot in self.views.iter_mut() {
+            if let Some(v) = slot {
+                v.mark_shown();
+            }
+        }
+
+        // A tab absorbed before Explorer showed it could not take focus; hand
+        // it over now that it is on screen.
+        if self.focus_pending {
+            match self.views.get(active).and_then(|v| v.as_ref()) {
+                Some(v) if host::is_visible(v.top) => {
+                    host::focus_into(self.main_hwnd, v.top);
+                    self.focus_pending = false;
+                }
+                None => self.focus_pending = false,
+                _ => {}
             }
         }
 
