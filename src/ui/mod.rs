@@ -14,12 +14,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible, IsZoomed, LoadCursorW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW,
     CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNORMAL,
+    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY,
     WM_KEYDOWN, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
 };
 
@@ -237,11 +238,34 @@ impl App {
 
     /// Show window; if no tabs remain (was hidden in tray), open a home tab.
     pub(crate) fn open_main(&mut self) {
-        unsafe {
-            let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
-        }
+        self.surface();
         if self.tabs.is_empty() {
             self.new_tab(home_dir());
+        }
+    }
+
+    /// Make sure the frame is on screen **without ever touching WS_MAXIMIZE**.
+    ///
+    /// SW_SHOWNORMAL and SW_RESTORE both mean "if maximized or minimized,
+    /// restore to the original size and position", so calling either as a
+    /// plain "make it visible" is destructive: absorbing a window (i.e. every
+    /// `+` click) un-maximized Revolc. Only act when the frame is actually
+    /// hidden or minimized, and pick a command that keeps the zoom state.
+    fn surface(&self) {
+        unsafe {
+            if IsIconic(self.main_hwnd).as_bool() {
+                // Minimized: restore returns to the pre-minimize state, which
+                // is maximized if it was maximized.
+                let _ = ShowWindow(self.main_hwnd, SW_RESTORE);
+            } else if !IsWindowVisible(self.main_hwnd).as_bool() {
+                let cmd = if IsZoomed(self.main_hwnd).as_bool() {
+                    SW_SHOWMAXIMIZED
+                } else {
+                    SW_SHOW
+                };
+                let _ = ShowWindow(self.main_hwnd, cmd);
+            }
+            // Visible and not minimized: do nothing at all.
         }
     }
 
@@ -310,10 +334,9 @@ impl App {
         };
         self.views[idx] = Some(view);
         // Absorbing into a hidden/minimized Revolc looks like "nothing
-        // happened" - surface the window so the user sees the result.
-        unsafe {
-            let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
-        }
+        // happened" - surface the window so the user sees the result. Must not
+        // un-maximize: this runs on every `+` click.
+        self.surface();
         tracing::info!(?top, idx, "absorbed into tab");
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
