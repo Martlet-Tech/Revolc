@@ -177,7 +177,7 @@ extern "system" fn DllGetClassObject(
 // ---------------------------------------------------------------- Registry
 
 fn clsid_path() -> HSTRING {
-    HSTRING::from(format!("Software\\Classes\\CLSID\\{{{CLSID:?}}}"))
+    HSTRING::from(format!("Software\\Classes\\CLSID\\{{{CLSID:?}}}\\InprocServer32"))
 }
 
 fn bho_path() -> HSTRING {

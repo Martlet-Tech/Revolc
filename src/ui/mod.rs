@@ -27,9 +27,15 @@ pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001; // lParam = tab index
 pub const WM_APP_TAB_CLOSE: u32 = 0x8002; // lParam = tab index
 pub const WM_APP_TAB_NEW: u32 = 0x8003; // lParam unused
 pub(crate) use tray::WM_APP_TRAY;
-/// wParam = Explorer top-level HWND. Sent by the BHO (registered message
-/// "RevolcAbsorbExplorer" resolves to this id in both processes).
-pub const WM_APP_ABSORB: u32 = WM_USER + 0x643;
+/// wParam = Explorer top-level HWND. Sent by the BHO via the registered
+/// window message "RevolcAbsorbExplorer" (system-assigned id, identical
+/// in every process of the session).
+fn absorb_msg() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("RevolcAbsorbExplorer"))
+    })
+}
 
 const TABBAR_HEIGHT: i32 = 28;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
@@ -387,7 +393,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.new_tab(path);
             LRESULT(0)
         }
-        m if m == WM_APP_ABSORB => {
+        m if m == absorb_msg() => {
             let top = HWND(wp.0 as *mut core::ffi::c_void);
             let app = app_from(hwnd);
             if app.cfg.get().takeover.mode == "redirect" {
