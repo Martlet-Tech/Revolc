@@ -8,15 +8,15 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    DestroyWindow, GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, IDC_ARROW, MSG, SW_HIDE, SW_SHOWNORMAL,
-    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SIZE, WM_TIMER,
-    WS_OVERLAPPEDWINDOW,
+    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, SW_SHOWNORMAL, WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
+    WM_SIZE, WM_TIMER, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::ConfigHandle;
@@ -87,6 +87,15 @@ struct App {
     sweeping: bool,
     /// Fast-poll window: a folder is expected until this instant.
     burst_until: Option<Instant>,
+    /// Explorer thread whose input queue we are currently attached to (0 =
+    /// none). Attached only while our window is the active window.
+    attached_tid: u32,
+    /// Our window is the foreground/active window.
+    active: bool,
+    /// (tab index, l, t, r, b) of the last geometry pushed to an absorbed
+    /// window. Guards enforce_views() against re-issuing a cross-process
+    /// SetWindowPos on every 200ms tick.
+    laid_out: Option<(usize, i32, i32, i32, i32)>,
     tabbar_hwnd: HWND,
     main_hwnd: HWND,
 }
@@ -195,6 +204,9 @@ impl App {
             excluded: Vec::new(),
             sweeping: false,
             burst_until: None,
+            attached_tid: 0,
+            active: true,
+            laid_out: None,
             tabbar_hwnd,
             main_hwnd: hwnd,
         });
@@ -454,6 +466,7 @@ impl App {
         if self.refresh_labels() {
             self.sync_tabbar();
         }
+        self.enforce_views();
 
         // Adaptive rate: keep hammering while a folder is expected, drop to
         // the once-a-second safety net otherwise.
@@ -506,17 +519,51 @@ impl App {
         if !self.tabs.activate(i) {
             return;
         }
+        let rc = self.view_rect();
         for (j, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot {
                 v.set_visible(j == i);
-                if j == i {
-                    unsafe {
-                        let _ = SetFocus(v.top);
-                    }
-                }
             }
         }
+        // A freshly absorbed window still has its desktop size; layout it at
+        // once instead of waiting for the next WM_SIZE.
+        self.laid_out = None;
+        if let Some(Some(v)) = self.views.get(i) {
+            v.resize(rc);
+            self.laid_out = Some((i, rc.left, rc.top, rc.right, rc.bottom));
+        }
+        // Keyboard focus has to be handed to the other process explicitly, or
+        // the address bar takes clicks but no keystrokes.
+        if let Some(Some(v)) = self.views.get(i) {
+            host::focus_into(self.main_hwnd, v.top);
+        }
+        self.sync_input_queue();
         self.sync_tabbar();
+    }
+
+    /// Keep our input queue attached to the active tab's Explorer thread while
+    /// our window is the active window, and detached otherwise: merged queues
+    /// also share hangs, so a stuck Explorer would freeze Revolc too.
+    fn sync_input_queue(&mut self) {
+        let want = if self.active {
+            self.views
+                .get(self.tabs.active_index())
+                .and_then(|v| v.as_ref())
+                .map(|v| host::thread_of(v.top))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if want == self.attached_tid {
+            return;
+        }
+        if self.attached_tid != 0 {
+            host::attach_input(self.attached_tid, false);
+        }
+        self.attached_tid = want;
+        if want != 0 {
+            host::attach_input(want, true);
+        }
     }
 
     fn action(&mut self, a: Action) {
@@ -543,10 +590,58 @@ impl App {
     fn layout(&mut self) {
         let rc = self.view_rect();
         unsafe {
-            let _ = MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
+            MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
+            // Keep the bar above the absorbed Explorer child: a new child is
+            // created with HWND_TOP and would otherwise cover the tabs.
+            let _ = SetWindowPos(
+                self.tabbar_hwnd,
+                HWND_TOP,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
-        if let Some(Some(v)) = self.views.get(self.tabs.active_index()) {
+        self.laid_out = None;
+        self.place_active();
+    }
+
+    /// Resize the active view, skipping the call when nothing changed.
+    fn place_active(&mut self) {
+        let idx = self.tabs.active_index();
+        let rc = self.view_rect();
+        let key = (idx, rc.left, rc.top, rc.right, rc.bottom);
+        if self.laid_out == Some(key) {
+            return;
+        }
+        if let Some(Some(v)) = self.views.get(idx) {
             v.resize(rc);
+        }
+        self.laid_out = Some(key);
+    }
+
+    /// Re-assert visibility/geometry of every tab every sweep. Explorer
+    /// re-shows its frame while it finishes navigating, and a re-shown
+    /// inactive tab lands on top of the active one at its old size — exactly
+    /// the "two ribbons stacked" glitch. One IsWindowVisible per view.
+    fn enforce_views(&mut self) {
+        let active = self.tabs.active_index();
+        for (i, slot) in self.views.iter().enumerate() {
+            let Some(v) = slot else { continue };
+            let want = i == active;
+            if host::is_visible(v.top) != want {
+                host::force_visible(v.top, want);
+                if want {
+                    self.laid_out = None; // a re-shown window is at its old size
+                }
+            }
+        }
+        self.place_active();
+        unsafe {
+            let _ = SetWindowPos(
+                self.tabbar_hwnd,
+                HWND_TOP,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -652,6 +747,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp.0 != 0 {
                 app.release_all();
                 let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+            let app = app_from(hwnd);
+            // low word: WA_INACTIVE(0) / WA_ACTIVE(1) / WA_CLICKACTIVE(2)
+            app.active = (wp.0 & 0xffff) as u32 != 0;
+            app.sync_input_queue();
+            if app.active {
+                if let Some(Some(v)) = app.views.get(app.tabs.active_index()) {
+                    host::focus_into(app.main_hwnd, v.top);
+                }
             }
             LRESULT(0)
         }

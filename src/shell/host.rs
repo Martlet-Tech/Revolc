@@ -8,12 +8,15 @@
 use windows::core::{Interface as _, Result, VARIANT};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetWindowTextW, GetWindowLongPtrW, IsWindow,
-    IsWindowVisible, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_HIDE, SW_SHOW,
-    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, WS_BORDER, WS_CAPTION,
+    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
+    SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SW_HIDE, SW_SHOW, WS_BORDER, WS_CAPTION,
     WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
@@ -50,12 +53,15 @@ impl Absorbed {
         let stripped = ((orig_style as u32) & !STRIP_STYLE) | WS_CHILD.0;
         SetWindowLongPtrW(top, GWL_STYLE, stripped as isize);
         SetWindowLongPtrW(top, GWL_EXSTYLE, ((orig_exstyle as u32) & !STRIP_EXSTYLE) as isize);
+        // Do NOT show here: the caller decides visibility and geometry once the
+        // window is assigned to a tab. SWP_SHOWWINDOW used to flash the window
+        // at (0,0) with its old desktop size, on top of the tab bar.
         let _ = SetWindowPos(
             top,
             HWND_TOP,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-                | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
+                | SWP_ASYNCWINDOWPOS,
         );
         tracing::info!(?top, "explorer window absorbed");
         Ok(Self { top, orig_style, orig_exstyle })
@@ -186,6 +192,81 @@ unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// holding a dead handle.
 pub fn is_window_alive(top: HWND) -> bool {
     unsafe { IsWindow(top).as_bool() }
+}
+
+/// Explorer re-shows its own frame while it finishes navigating, so a single
+/// SW_HIDE at absorb time does not stick: inactive tabs would reappear on top
+/// of the active one at their old geometry. Re-assert state every sweep.
+pub fn force_visible(top: HWND, visible: bool) {
+    unsafe {
+        let flags = if visible {
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                | SWP_ASYNCWINDOWPOS
+        } else {
+            SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                | SWP_ASYNCWINDOWPOS
+        };
+        let _ = SetWindowPos(top, HWND_TOP, 0, 0, 0, 0, flags);
+    }
+}
+
+pub fn is_visible(top: HWND) -> bool {
+    unsafe { IsWindowVisible(top).as_bool() }
+}
+
+/// Which thread owns `top` (0 on failure).
+pub fn thread_of(top: HWND) -> u32 {
+    unsafe { GetWindowThreadProcessId(top, None) }
+}
+
+/// Attach/detach our input queue to another thread's.
+///
+/// Required for the absorbed Explorer window to be *editable*: focus and
+/// keyboard state live in the input queue, so a cross-process child can take
+/// a click but never a keystroke until the queues are merged. Attach only
+/// while our window is the active one — shared queues also share hangs.
+pub fn attach_input(tid: u32, attach: bool) {
+    unsafe {
+        let ours = GetCurrentThreadId();
+        if tid != 0 && tid != ours {
+            let _ = AttachThreadInput(ours, tid, attach);
+        }
+    }
+}
+/// Bring `host` to the foreground and put the keyboard focus inside the
+/// absorbed window.
+///
+/// A re-parented Explorer window that never gets "activated" keeps painting,
+/// but its address bar cannot be typed into: focus lives in our input queue
+/// and the shell's queue never sees the keystrokes. AttachThreadInput merges
+/// the two queues for the duration of the handover (Clover does the same).
+pub fn focus_into(host: HWND, top: HWND) {
+    unsafe {
+        let ours = GetCurrentThreadId();
+        let target = GetWindowThreadProcessId(top, None);
+        let fg = GetForegroundWindow();
+        let fg_tid = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+
+        let attach_target = target != 0 && target != ours;
+        let attach_fg = fg_tid != 0 && fg_tid != ours && fg_tid != target;
+
+        if attach_target {
+            let _ = AttachThreadInput(ours, target, true);
+        }
+        if attach_fg {
+            let _ = AttachThreadInput(fg_tid, ours, true);
+        }
+
+        let _ = SetForegroundWindow(host);
+        let _ = SetFocus(top);
+
+        if attach_fg {
+            let _ = AttachThreadInput(fg_tid, ours, false);
+        }
+        if attach_target {
+            let _ = AttachThreadInput(ours, target, false);
+        }
+    }
 }
 
 /// "file:///D:/dir%20name" -> "D:\dir name"
