@@ -7,29 +7,42 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
     type Writer = Tee;
 
     fn make_writer(&'a self) -> Self::Writer {
-        Tee {
-            file: FILE.get().cloned(),
-        }
+        Tee
     }
 }
 
-/// Holds the non-blocking file writer handle.
-static FILE: std::sync::OnceLock<tracing_appender::non_blocking::NonBlocking> = std::sync::OnceLock::new();
+/// The rolling file appender, written **synchronously**.
+///
+/// It used to be wrapped in `tracing_appender::non_blocking`, which hands each
+/// record to a background thread through a channel: a hard crash (access
+/// violation, no unwinding) loses whatever the worker has not written yet.
+/// That is exactly what happened on 2026-11-17 — the log stopped at "sweep
+/// adopting stray folder windows" and the real last step stayed unknown, so
+/// the crash had to be diagnosed from Event Viewer alone. A few hundred lines
+/// per session do not justify that blind spot: `RollingFileAppender` writes
+/// straight to the `File`, so every record is on disk before the next
+/// statement runs.
+static FILE: std::sync::Mutex<Option<tracing_appender::rolling::RollingFileAppender>> =
+    std::sync::Mutex::new(None);
 
-struct Tee {
-    file: Option<tracing_appender::non_blocking::NonBlocking>,
-}
+struct Tee;
 
 impl std::io::Write for Tee {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use tracing_subscriber::fmt::MakeWriter as _;
         let _ = std::io::stdout().write_all(buf);
-        if let Some(f) = &self.file {
-            let _ = f.make_writer().write_all(buf);
+        if let Ok(mut guard) = FILE.lock() {
+            if let Some(f) = guard.as_mut() {
+                let _ = f.write_all(buf);
+            }
         }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(mut guard) = FILE.lock() {
+            if let Some(f) = guard.as_mut() {
+                let _ = f.flush();
+            }
+        }
         Ok(())
     }
 }
@@ -40,10 +53,9 @@ pub fn init() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let file_appender = tracing_appender::rolling::daily(log_dir(), "revolc.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-    // Leak the guard: logger must live for the whole process lifetime.
-    std::mem::forget(guard);
-    let _ = FILE.set(file_writer);
+    if let Ok(mut guard) = FILE.lock() {
+        *guard = Some(file_appender);
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

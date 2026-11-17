@@ -61,16 +61,23 @@ impl Absorbed {
 
         // Failure here (e.g. UIPI block) must not be silent, or a duplicate
         // notify will absorb the same window again into a second tab.
+        // Breadcrumbs: these three calls run in *our* thread but act on a
+        // window owned by another process, and the whole sequence has crashed
+        // before (2026-11-17, faulting module uxtheme.dll). Logging each step
+        // makes the next crash point at one call instead of a range.
+        tracing::info!(?top, step = "SetParent", "absorb");
         SetParent(top, host).map_err(|e| {
             tracing::error!(error = %e, ?top, "SetParent failed");
             e
         })?;
+        tracing::info!(?top, step = "style", "absorb");
         let stripped = ((orig_style as u32) & !STRIP_STYLE) | WS_CHILD.0;
         SetWindowLongPtrW(top, GWL_STYLE, stripped as isize);
         SetWindowLongPtrW(top, GWL_EXSTYLE, ((orig_exstyle as u32) & !STRIP_EXSTYLE) as isize);
         // Do NOT show here: the caller decides visibility and geometry once the
         // window is assigned to a tab. SWP_SHOWWINDOW used to flash the window
         // at (0,0) with its old desktop size, on top of the tab bar.
+        tracing::info!(?top, step = "framechanged", "absorb");
         let _ = SetWindowPos(
             top,
             HWND_TOP,
@@ -539,6 +546,9 @@ pub fn attach_input(tid: u32, attach: bool) {
 /// and the shell's queue never sees the keystrokes. AttachThreadInput merges
 /// the two queues for the duration of the handover (Clover does the same).
 pub fn focus_into(host: HWND, top: HWND) {
+    // Breadcrumb: AttachThreadInput + SetForegroundWindow is the other place
+    // where we touch foreign window state from our own thread.
+    tracing::info!(?host, ?top, "focus_into");
     unsafe {
         let ours = GetCurrentThreadId();
         let target = GetWindowThreadProcessId(top, None);

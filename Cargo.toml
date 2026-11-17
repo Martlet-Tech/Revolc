@@ -25,6 +25,10 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
 ] }
 notify = "6"
 tracing = "0.1"
@@ -36,3 +40,7 @@ arc-swap = "1"
 
 [profile.release]
 lto = true
+# Line tables + symbols so the crash reporter can name the function that
+# faults (src/crash.rs walks the stack with dbghelp). Costs a PDB next to the
+# exe, nothing at run time.
+debug = 1

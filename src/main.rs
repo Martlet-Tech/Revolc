@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod crash;
 mod logging;
 mod shell;
 mod tabs;
@@ -36,6 +37,12 @@ fn shutdown_running() -> i32 {
 
 fn main() {
     let started = Instant::now();
+    // Before anything else: a crash must leave a dump, not just an Event
+    // Viewer line naming a system DLL.
+    crash::install();
+    if std::env::var_os("REVOLC_CRASH_SELFTEST").is_some() {
+        crash::selftest();
+    }
     logging::init();
 
     // Command line: revolc.exe [path] | --shutdown
