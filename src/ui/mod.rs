@@ -95,6 +95,14 @@ impl MainWindow {
                 Some(args as _),
             )?;
 
+            // Allow the BHO notify message through UIPI: when Revolc runs
+            // elevated (launched from an admin terminal), Explorer's lower-IL
+            // PostMessageW would be silently dropped (observed err 5, 10:36).
+            let m = absorb_msg();
+            let _ = windows::Win32::UI::WindowsAndMessaging::ChangeWindowMessageFilterEx(
+                hwnd, m, windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW, None,
+            );
+
             // Accelerator table from the event-driven keymap
             // (event-driven, no GetAsyncKeyState polling).
             let mut accels: Vec<ACCEL> = Vec::new();
@@ -196,39 +204,65 @@ impl App {
         if host::is_absorbed(top, self.main_hwnd) {
             return;
         }
-        let path = host::read_folder_path(top).unwrap_or_default();
-        let label = if path.is_empty() { "Explorer".to_string() } else { short_label(&path) };
-
+        // ABSORB FIRST. Resolving the path before SetParent blocked the main
+        // thread ~1s (20×50ms retries) — every absorb flashed a full Explorer
+        // window for 1.6s (2026-11-17). Clover semantics: re-parent the window
+        // immediately; metadata (tab label/path) is filled in after.
         let idx = match self.views.iter().position(|v| v.is_none()) {
-            Some(i) => {
-                self.tabs.set_path(i, label);
-                i
-            }
+            Some(i) => i,
             None => {
-                self.tabs.push(label);
+                self.tabs.push(String::new());
                 self.views.push(None);
                 self.views.len() - 1
             }
         };
 
-        match unsafe { Absorbed::absorb(top, self.main_hwnd) } {
-            Ok(view) => {
-                self.views[idx] = Some(view);
-                // Absorbing into a hidden/minimized Revolc looks like "nothing
-                // happened" - surface the window so the user sees the result.
-                unsafe {
-                    let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
-                }
-                tracing::info!(?top, idx, "absorbed into tab");
-            }
+        let view = match unsafe { Absorbed::absorb(top, self.main_hwnd) } {
+            Ok(view) => view,
             Err(e) => {
                 tracing::error!(error = %e, ?top, "absorb failed");
                 return;
             }
+        };
+        self.views[idx] = Some(view);
+        // Absorbing into a hidden/minimized Revolc looks like "nothing
+        // happened" - surface the window so the user sees the result.
+        unsafe {
+            let _ = ShowWindow(self.main_hwnd, SW_SHOWNORMAL);
         }
+        tracing::info!(?top, idx, "absorbed into tab");
+
+        // Best-effort path for Tab-New reuse (~0.3s); the label falls back to
+        // the window title, which Explorer sets as soon as it navigates.
+        let store = host::read_folder_path(top, 6)
+            .or_else(|| {
+                let t = host::window_title(top);
+                if t.is_empty() { None } else { Some(t) }
+            })
+            .unwrap_or_else(|| "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string());
+        self.tabs.set_path(idx, store);
+
         self.sync_tabbar();
         self.activate(idx);
         self.layout();
+    }
+
+    /// BHO notified "a shell window was created". Find it via IShellWindows
+    /// (the BHO never touches the site object — that crashed explorerframe)
+    /// and absorb the first folder window we don't already own.
+    fn absorb_new_window(&mut self) {
+        tracing::info!("absorb notify received");
+        let known: Vec<isize> = self
+            .views
+            .iter()
+            .flatten()
+            .map(|v| v.top.0 as isize)
+            .collect();
+        tracing::debug!(known = known.len(), "searching for new folder window");
+        match host::find_new_folder_window(&known, 25) {
+            Some(top) => self.absorb_window(top),
+            None => tracing::warn!("no new folder window found after notify"),
+        }
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -325,6 +359,14 @@ fn home_dir() -> String {
 }
 
 fn short_label(path: &str) -> String {
+    // Shell-namespace items (LocationURL empty -> stored as CLSID path).
+    if path.starts_with("::") {
+        return if path.contains("20D04FE0-3AEA-1069-A2D8-08002B30309D") {
+            "此电脑".into()
+        } else {
+            "Shell".into()
+        };
+    }
     path.trim_end_matches(['\\', '/'])
         .rsplit(['\\', '/'])
         .next()
@@ -380,6 +422,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // spec §3.2 (M1): persist session here. M0: pass through.
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+        // WM_ENDSESSION (logoff/shutdown): restore absorbed windows NOW —
+        // once we're killed mid-session, Explorer keeps dangling refs to the
+        // re-parented/destroyed windows (2026-11-17 crash loop).
+        windows::Win32::UI::WindowsAndMessaging::WM_ENDSESSION => {
+            let app = app_from(hwnd);
+            if wp.0 != 0 {
+                app.release_all();
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         m if m == WM_APP_CONFIG_CHANGED => {
             app_from(hwnd).sync_tabbar();
             LRESULT(0)
@@ -399,10 +452,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == absorb_msg() => {
-            let top = HWND(wp.0 as *mut core::ffi::c_void);
+            // wParam unused: BHO reports "window created" without touching
+            // the site object; we discover the HWND via IShellWindows.
             let app = app_from(hwnd);
             if app.cfg.get().takeover.mode == "redirect" {
-                app.absorb_window(top);
+                app.absorb_new_window();
             }
             LRESULT(0)
         }

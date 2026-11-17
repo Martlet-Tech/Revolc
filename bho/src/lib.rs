@@ -64,19 +64,15 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
     // Explorer calls this once per folder window with the window's
     // IWebBrowser2. Forward the top-level HWND to Revolc.
     fn SetSite(&self, psite: Option<&IUnknown>) -> windows::core::Result<()> {
-        let Some(site) = psite else {
-            return Ok(()); // site released = window closing
-        };
-        bho_log("SetSite called");
-        unsafe {
-            let Ok(browser) = site.cast::<IWebBrowser2>() else {
-                return Ok(());
-            };
-            let Ok(shwnd) = browser.HWND() else {
-                return Ok(());
-            };
-            let top = GetAncestor(HWND(shwnd.0 as *mut _), GA_ROOT);
-            notify_revolc(top);
+        // NEVER touch the site object here. QI(IWebBrowser2) on the site
+        // during window creation corrupts explorerframe state: Explorer
+        // later faults in a COM identity-compare helper on a dangling
+        // pointer (crash loop explorerframe.dll+0x4d29a, 2026-11-17, 79
+        // crashes). BHO reports "a shell window was created"; Revolc
+        // discovers the new window itself via IShellWindows (out-of-proc).
+        if psite.is_some() {
+            bho_log("SetSite (notify only)");
+            notify_revolc();
         }
         Ok(())
     }
@@ -86,7 +82,12 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
         _riid: *const GUID,
         _ppvsite: *mut *mut core::ffi::c_void,
     ) -> windows::core::Result<()> {
-        Err(windows::core::Error::empty()) // we never hold a site reference
+        // MUST return a real failure. Error::empty() carries S_OK(0): Explorer
+        // would read its uninitialized ppvsite and later fault on the dangling
+        // pointer (explorerframe.dll+0x4d29a crash loop, 2026-11-17).
+        Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ))
     }
 }
 
@@ -103,21 +104,8 @@ fn bho_log(msg: &str) {
     let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
 }
 
-fn notify_revolc(top: HWND) {
+fn notify_revolc() {
     unsafe {
-        if top.0.is_null() {
-            return;
-        }
-        // Only folder windows (Explorer), never IE tabs or our own children.
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(top, &mut buf);
-        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        if class != "CabinetWClass" && class != "ExploreWClass" {
-            bho_log(&format!("SetSite class={} ignored", class));
-            return;
-        }
-        bho_log(&format!("notifying revolc hwnd={:?}", top.0 as isize));
-
         static MSG_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let msg = *MSG_ID.get_or_init(|| RegisterWindowMessageW(w!("RevolcAbsorbExplorer")));
 
@@ -127,7 +115,8 @@ fn notify_revolc(top: HWND) {
         if target.0.is_null() {
             return;
         }
-        let _ = PostMessageW(target, msg, WPARAM(top.0 as usize), LPARAM(0));
+        // wParam unused: Revolc finds the new window via IShellWindows.
+        let _ = PostMessageW(target, msg, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -269,10 +258,12 @@ fn register() -> Result<(), HRESULT> {
 
 fn unregister() -> Result<(), HRESULT> {
     unsafe {
-        let r1 = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR::from_raw(bho_path().as_ptr()));
-        if r1.is_err() { return Err(HRESULT(r1.0 as i32)); }
-        let r2 = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR::from_raw(clsid_path().as_ptr()));
-        if r2.is_err() { return Err(HRESULT(r2.0 as i32)); }
+        // HKCU (per-user registration)
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR::from_raw(bho_path().as_ptr()));
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR::from_raw(clsid_path().as_ptr()));
+        // HKLM (machine registration; succeeds when running elevated)
+        let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR::from_raw(bho_path().as_ptr()));
+        let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR::from_raw(clsid_path().as_ptr()));
     }
     Ok(())
 }

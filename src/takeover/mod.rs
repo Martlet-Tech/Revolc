@@ -15,13 +15,16 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::FreeLibrary;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    RegCloseKey, RegDeleteTreeW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    KEY_READ,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOASYNC};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 const BHO_CLSID_PATH: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Browser Helper Objects\\{9F1C4E8B-6A2D-4E7B-8C13-5D04F7A2B916}";
+const BHO_CLSID_REG_PATH: &str =
+    "Software\\Classes\\CLSID\\{9F1C4E8B-6A2D-4E7B-8C13-5D04F7A2B916}";
 
 /// Ensure the BHO DLL is registered (idempotent). The DLL ships next to
 /// revolc.exe as revolc_bho.dll. With mode != "redirect" the BHO is fully
@@ -91,9 +94,27 @@ pub fn ensure_bho_registered(mode: &str) {
 }
 
 fn unregister_bho() {
+    // Always wipe the HKCU registration, even if the DLL is missing or
+    // unregistering fails: stale keys make Explorer load a dead DLL into
+    // every folder window (observed 2026-11-17).
+    unsafe {
+        let _ = RegDeleteTreeW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(HSTRING::from(BHO_CLSID_PATH).as_ptr()),
+        );
+        let _ = RegDeleteTreeW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(HSTRING::from(BHO_CLSID_REG_PATH).as_ptr()),
+        );
+        tracing::info!("bho HKCU keys deleted");
+    }
+
     let exe = std::env::current_exe().ok();
     let dll = exe.and_then(|e| e.parent().map(|d| d.join("revolc_bho.dll")));
-    let Some(dll) = dll.filter(|p| p.exists()) else { return };
+    let Some(dll) = dll.filter(|p| p.exists()) else {
+        tracing::info!("takeover disabled (bho dll absent, registry wiped)");
+        return;
+    };
     unsafe {
         let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
         let Ok(module) = LoadLibraryW(PCWSTR::from_raw(wide.as_ptr())) else { return };
