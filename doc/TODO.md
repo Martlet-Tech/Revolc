@@ -26,6 +26,14 @@
    `WM_NCHITTEST` 自己回答 `HTCAPTION` / `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE`
    + 8 条缩放边框。tab 条 34px、圆角只在顶部、底部与内容区齐平。
    主题新增 `caption_hover` / `caption_close_hover`。
+5b. **标签占满行为的两条支线（未做，先记下要改哪里）**：
+   a) 单行缩窄 —— 现在已经是 `TAB_MIN_W=90` / `TAB_MAX_W=190` 的折中，要更彻底地缩窄得配合文字省略策略。
+   b) 多行标签 —— 需要 **band 高度动态化**。目前当成常量 34 的地方：`ui/mod.rs` 的 `TABBAR_HEIGHT`
+   （`view_rect`、`WM_NCHITTEST` 的条带判定、`invalidate_band`、吸收窗口的 rect.top）以及
+   `ui/tabbar.rs` 里的 `TAB_BOTTOM` / `CENTER` / `hit()` 的 y 范围。改成 `TabBar::height()` 由
+   `TabBar` 自己算（行数 × 行高 + 边距），其余地方都从它取即可。标签形状已经是"上圆下直"的独立区域，
+   不依赖底下压着什么，多行不会露圆角。
+
 6. **M3 第二阶段（未做）：tab 拖拽分窗/合并**（`Rebuild_Target_Spec.md` §3.1/§3.4）。
    现状是单窗口单进程，这一阶段要先把「多窗口」从 `App` 里拆出来（现在 `App` 持有
    唯一 `main_hwnd` + 一份 tabs），再做：tab 拖拽有插入位/落地预览、拖到同进程另一个
