@@ -1,0 +1,47 @@
+# Revolc 待办
+
+> 排序 = 建议执行顺序。历史项与踩坑记录见 `../Revolc_交接文档.md`，行为规格见
+> `Rebuild_Target_Spec.md`（里程碑 M0–M6），本文件只留“还没做、以及为什么做”。
+
+## P0 — 已知缺陷
+
+1. **启动期吸收「已打开的窗口」是串行的，每个窗口约 100–150ms**
+   （2026-11-18 实测 log：`hide → style → SetParent → framechanged` 每步 20–40ms，
+   跨进程同步调用的固有代价）。4 个窗口 ≈ 0.5s，视觉上像“一个个被吞进去”。
+   想法：吸收与摆位拆成两步（SetParent 用 `SWP_ASYNCWINDOWPOS` 之后不再同步等），
+   或者按窗口 post 一个工作项、下一个窗口的 SetParent 与上一个的摆位重叠。
+   非阻塞的替代：启动时先给所有待吸收窗口套一层遮罩（见 P2）。
+2. **`startup path` 不做校验**：`revolc.exe Explorer` 会把字面量 `"Explorer"`
+   当路径 spawn（log 实锤 `2026-11-17T00:40:30 path="Explorer"`）。
+   修法：`initial_path` 必须通过 `GetFileAttributesW` / 存在性检查，否则回退 `home_dir()`。
+3. **soak 测试**（交接文档 §6-1）：日常使用 1–2 天，重点开关机/注销/强杀后无僵尸窗口，
+   以及“连开 10 个文件夹是否每个都进 tab”。
+
+## P1 — 里程碑主线
+
+4. **M1 会话持久化 + 崩溃恢复**（`Rebuild_Target_Spec.md` §3.2）：
+   退出时保存每个窗口的 tab 路径 + 激活态 + 几何；启动检测不正常退出标志并提示恢复；
+   `behavior.startup_mode` 三态（last / new / list）。写盘必须原子替换。
+5. **M2 书签栏**，之后 M3 tab 拖拽分窗、M4 主题系统（含 Chrome 式一体化标题栏）、
+   M5 安装包、M6 接管完善（`associate` 模式目前未做）。
+
+## P2 — 体验/性能想法池（未排期）
+
+6. **启动遮罩（障眼法）**：进程启动后立即铺一层与主题同色的窗口/分层位图，
+   把所有窗口吸收完再淡出；用于掩盖 P0-1 的顺序感。
+   进阶：吸收中的窗口位置用模糊/占位块盖住，等它真正上屏再揭开。
+7. **吸收并行化**：需要先厘清哪些跨进程调用必须同步（`SetWindowPos` 同步是为了
+   避免子窗口落后一帧，见 `host::place_client` 注释），哪些可以异步化。
+8. **DWebBrowserEvents2 订阅**（交接文档 §6-2）：导航/标题毫秒级同步，
+   现在靠 200ms 扫描读窗口标题，晚一帧。
+9. **REA 对照 Clover 的三个细节**：点击 tab 区域时的 SetForegroundWindow 顺序、
+   Alt+Tab 表现、关闭语义；以及吸收后 `Ctrl+Z` / 右键菜单 / OLE 拖放是否正常
+   （输入队列只解决键盘）。
+10. **发布形态**：release DLL 签名、安装器、注册表开关设置页、
+    BHO 被安全软件禁用时的降级提示。
+
+## 参数速查（调参先看这里）
+
+`src/ui/mod.rs`：`SWEEP_FAST_MS`(15) / `SWEEP_IDLE_MS`(200) / `BURST_WINDOW`(1.5s) /
+`EXCLUDE_TTL`(8s) / `RESERVE_TTL`(6s)。
+`src/shell/host.rs`：`PRE_SHOW_GRACE`(1.5s，等 Explorer 自己 ShowWindow 的宽限期)。
