@@ -1,5 +1,6 @@
 //! Application orchestration: COM init, config handle + watcher, window, message loop.
 
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -40,12 +41,14 @@ fn ensure_single_instance() -> bool {
 }
 
 /// Main window hwnd for the console ctrl handler (set once after creation).
+#[cfg(debug_assertions)]
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Console Ctrl+C / console-close handler (debug builds only — release has no
 /// console). Routes termination through WM_CLOSE so absorbed Explorer windows
 /// are restored via WM_DESTROY instead of being destroyed inside our window
 /// tree (the 2026-11-17 crash loop came from exactly that kind of kill).
+#[cfg(debug_assertions)]
 unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> windows::Win32::Foundation::BOOL {
     use windows::Win32::Foundation::BOOL;
     // CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2, CTRL_LOGOFF=5, CTRL_SHUTDOWN=6

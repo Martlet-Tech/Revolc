@@ -6,8 +6,11 @@
 
 /// Modifier/VK constants (Win32 values kept local so this module stays pure).
 pub mod vk {
+    #[allow(dead_code)] // kept for reference: modifiers are read via GetKeyState
     pub const SHIFT: u16 = 0x10;
+    #[allow(dead_code)]
     pub const CONTROL: u16 = 0x11;
+    #[allow(dead_code)]
     pub const MENU: u16 = 0x12;
     pub const TAB: u16 = 0x09;
     pub const T: u16 = 0x54;

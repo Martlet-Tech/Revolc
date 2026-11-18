@@ -3,13 +3,13 @@
 //! Minimal: default icon, right-click menu, left-double-click to restore.
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-    TrackPopupMenuEx, HMENU, IDI_APPLICATION, MF_STRING, SW_SHOW, TPM_RETURNCMD,
+    TrackPopupMenuEx, IDI_APPLICATION, MF_STRING, SW_SHOW, TPM_RETURNCMD,
     WM_LBUTTONDBLCLK, WM_RBUTTONUP,
 };
 

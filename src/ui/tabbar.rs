@@ -33,11 +33,13 @@ enum Hit {
     Tab(usize),
     Close(usize),
     Plus,
-    None,
 }
 
 /// Snapshot of what to draw; rebuilt on every update() from the config + tabs.
 struct State {
+    /// Tab ids, parallel to `labels`. Posted back instead of indices: see
+    /// WM_APP_TAB_ACTIVATED in ui/mod.rs.
+    ids: Vec<u64>,
     labels: Vec<String>,
     active: usize,
     bg: COLORREF,
@@ -58,6 +60,7 @@ impl State {
             COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32) // COLORREF = 0x00BBGGRR
         };
         Self {
+            ids: Vec::new(),
             labels: Vec::new(),
             active: 0,
             bg: c(&|t| &t.tabbar_background),
@@ -111,7 +114,7 @@ pub fn create(parent: HWND, cfg: &Config) -> HWND {
 }
 
 /// Push a new snapshot into the tab bar and repaint.
-pub fn update(hwnd: HWND, labels: &[String], active: usize, cfg: &Config) {
+pub fn update(hwnd: HWND, ids: &[u64], labels: &[String], active: usize, cfg: &Config) {
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
         if ptr.is_null() {
@@ -120,6 +123,7 @@ pub fn update(hwnd: HWND, labels: &[String], active: usize, cfg: &Config) {
         // Mutate in place: the allocation is owned by GWLP_USERDATA, not by us.
         let st = &mut *ptr;
         let colors = State::new(cfg);
+        st.ids = ids.to_vec();
         st.labels = labels.to_vec();
         st.active = active;
         st.bg = colors.bg;
@@ -174,7 +178,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let st = state_from(hwnd);
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            let mut rc = RECT {
+            let rc = RECT {
                 left: ps.rcPaint.left,
                 top: ps.rcPaint.top,
                 right: ps.rcPaint.right,
@@ -252,18 +256,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            match hit_test(lp, state_from(hwnd)) {
+            let st = state_from(hwnd);
+            let hit = hit_test(lp, st);
+            let parent = GetParent(hwnd).unwrap();
+            // Resolve the id at click time: the parent's tab list can change
+            // before the posted message is dispatched, an index cannot.
+            match hit {
                 Some(Hit::Close(i)) => {
-                    let parent = GetParent(hwnd).unwrap();
-                    let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(i as _));
+                    if let Some(id) = st.ids.get(i) {
+                        let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(*id as isize));
+                    }
                 }
                 Some(Hit::Plus) => {
-                    let parent = GetParent(hwnd).unwrap();
                     let _ = PostMessageW(parent, WM_APP_TAB_NEW, WPARAM(0), LPARAM(0));
                 }
                 Some(Hit::Tab(i)) => {
-                    let parent = GetParent(hwnd).unwrap();
-                    let _ = PostMessageW(parent, WM_APP_TAB_ACTIVATED, WPARAM(0), LPARAM(i as _));
+                    if let Some(id) = st.ids.get(i) {
+                        let _ =
+                            PostMessageW(parent, WM_APP_TAB_ACTIVATED, WPARAM(0), LPARAM(*id as isize));
+                    }
                 }
                 _ => {}
             }
@@ -285,9 +296,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_MBUTTONUP => {
-            if let Some(Hit::Tab(i)) = hit_test(lp, state_from(hwnd)) {
-                let parent = GetParent(hwnd).unwrap();
-                let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(i as _));
+            let st = state_from(hwnd);
+            if let Some(Hit::Tab(i)) = hit_test(lp, st) {
+                if let Some(id) = st.ids.get(i) {
+                    let parent = GetParent(hwnd).unwrap();
+                    let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(*id as isize));
+                }
             }
             LRESULT(0)
         }

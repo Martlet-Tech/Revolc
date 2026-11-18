@@ -30,8 +30,12 @@ use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
 
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
-pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001; // lParam = tab index
-pub const WM_APP_TAB_CLOSE: u32 = 0x8002; // lParam = tab index
+/// lParam = tab **id** (not index). The tab bar posts these from a click, and
+/// by the time the message is dispatched the list may already have shrunk (a
+/// sweep dropped a dead view); an index would then act on the wrong tab.
+pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001;
+/// lParam = tab id, see WM_APP_TAB_ACTIVATED.
+pub const WM_APP_TAB_CLOSE: u32 = 0x8002;
 pub const WM_APP_TAB_NEW: u32 = 0x8003; // lParam unused
 /// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
@@ -71,6 +75,12 @@ const BURST_WINDOW: Duration = Duration::from_millis(1500);
 /// A window we just restored (tab closed) stays parked this long so the
 /// sweep does not grab it back while Explorer finishes destroying it.
 const EXCLUDE_TTL: Duration = Duration::from_secs(8);
+/// A tab whose Explorer window never arrived is dropped after this. Explorer
+/// can refuse to spawn (no shell running at that moment), the spawn can fail,
+/// and a slow network path can take seconds — but a reserved tab that never
+/// fills is not cosmetic: while any tab has no view, the sweep treats *every*
+/// hidden folder window as "the one we are waiting for" and steals it.
+const RESERVE_TTL: Duration = Duration::from_secs(6);
 /// Hard cap: a runaway explorer.exe storm must not eat the desktop.
 const MAX_TABS: usize = 40;
 
@@ -79,7 +89,7 @@ struct WindowArgs {
     initial_path: Option<String>,
 }
 
-struct App {
+pub(crate) struct App {
     cfg: Arc<ConfigHandle>,
     keymap: Vec<(Binding, Action)>,
     tabs: TabList,
@@ -105,6 +115,13 @@ struct App {
     /// before it navigated has no LocationURL yet; without this the sweep
     /// would ask IShellWindows (out-of-proc, 50ms) on every pass.
     path_done: Vec<isize>,
+    /// When the oldest still-empty tab was reserved (`new_tab`). Used to drop
+    /// tabs whose window never showed up — see RESERVE_TTL.
+    reserve_deadline: Option<Instant>,
+    /// Windows that belong to a tab the user closed *before* its Explorer
+    /// window was absorbed. We spawned that window; adopting it later would
+    /// make the closed tab reappear. Matched by title, with a timestamp.
+    discard: Vec<(String, Instant)>,
     /// (tab index, l, t, r, b, measured placement metrics) of the last
     /// geometry pushed to an absorbed window. Guards enforce_views() against
     /// re-issuing a cross-process SetWindowPos on every 200ms tick — but the
@@ -231,6 +248,8 @@ impl App {
             active: true,
             focus_pending: false,
             path_done: Vec::new(),
+            reserve_deadline: None,
+            discard: Vec::new(),
             laid_out: None,
             last_client: (0, 0),
             tabbar_hwnd,
@@ -288,6 +307,7 @@ impl App {
     }
 
     fn sync_tabbar(&self) {
+        let ids: Vec<u64> = self.tabs.iter_all().map(|t| t.id).collect();
         let labels: Vec<String> = self
             .tabs
             .iter_all()
@@ -299,7 +319,18 @@ impl App {
                 }
             })
             .collect();
-        tabbar::update(self.tabbar_hwnd, &labels, self.tabs.active_index(), &self.cfg.get());
+        tabbar::update(
+            self.tabbar_hwnd,
+            &ids,
+            &labels,
+            self.tabs.active_index(),
+            &self.cfg.get(),
+        );
+    }
+
+    /// Index of the tab with `id`, if it still exists.
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.tabs.iter_all().position(|t| t.id == id)
     }
 
     /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
@@ -307,6 +338,8 @@ impl App {
     fn new_tab(&mut self, path: String) {
         self.tabs.push(path.clone());
         self.views.push(None);
+        // Start (or restart) the "its window must arrive" clock.
+        self.reserve_deadline = Some(Instant::now() + RESERVE_TTL);
         self.sync_tabbar();
         self.activate(self.tabs.active_index());
         self.arm_burst();
@@ -317,6 +350,11 @@ impl App {
     /// or a brand-new tab if none is reserved.
     fn absorb_window(&mut self, top: HWND) {
         if host::is_absorbed(top, self.main_hwnd) {
+            return;
+        }
+        // A tab the user closed while its window was still on its way: the
+        // window is not wanted any more. Close it instead of resurrecting it.
+        if self.discard_window(top) {
             return;
         }
         // ABSORB FIRST. Resolving the path before SetParent blocked the main
@@ -361,7 +399,7 @@ impl App {
         // retries for nothing: resolve it on a later sweep instead.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
         if need_path && visible {
-            let store = host::read_folder_path(top, 2).unwrap_or_default();
+            let store = host::read_folder_path(top, 1).unwrap_or_default();
             if !store.is_empty() {
                 self.tabs.set_path(idx, store);
             }
@@ -422,6 +460,77 @@ impl App {
             now.duration_since(*at) < EXCLUDE_TTL
                 && host::is_window_alive(HWND(*raw as *mut core::ffi::c_void))
         });
+    }
+
+    /// Drop tabs whose Explorer window never arrived — see RESERVE_TTL.
+    fn expire_reserved(&mut self) {
+        let Some(deadline) = self.reserve_deadline else { return };
+        if Instant::now() < deadline {
+            return;
+        }
+        let empty: Vec<usize> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.is_none().then_some(i))
+            .collect();
+        self.reserve_deadline = None;
+        if empty.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = empty.len(),
+            "reserved tab never got its window, dropping"
+        );
+        for i in empty.into_iter().rev() {
+            self.close_tab(i);
+        }
+    }
+
+    /// Is `top` the window of a tab the user closed before absorption?
+    /// Returns true when it was consumed (hidden and asked to close).
+    fn discard_window(&mut self, top: HWND) -> bool {
+        if self.discard.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        self.discard.retain(|(_, at)| now.duration_since(*at) < EXCLUDE_TTL);
+        if self.discard.is_empty() {
+            return false;
+        }
+        let title = host::window_title(top);
+        let hit = if title.is_empty() {
+            // A shell frame that has not navigated yet has no title. Only take
+            // it when nothing else is waiting for a window of its own, and
+            // only while it is still invisible — that is the shape of the
+            // window we just asked Explorer to open.
+            let waiting = self.views.iter().any(|v| v.is_none());
+            if waiting || host::is_visible(top) {
+                None
+            } else {
+                self.discard.first().map(|(l, _)| l.clone())
+            }
+        } else {
+            self.discard
+                .iter()
+                .find(|(l, _)| *l == title)
+                .map(|(l, _)| l.clone())
+        };
+        let Some(label) = hit else { return false };
+        self.discard.retain(|(l, _)| *l != label);
+        // Park it so the sweep does not try again while it closes.
+        self.excluded.push((top.0 as isize, Instant::now()));
+        tracing::info!(
+            ?top,
+            title,
+            label,
+            "closing window of a tab closed before absorb"
+        );
+        unsafe {
+            let _ = ShowWindow(top, SW_HIDE);
+            let _ = PostMessageW(top, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        true
     }
 
     /// Drop tabs whose Explorer window died on its own (its own X button, a
@@ -509,7 +618,7 @@ impl App {
     /// only what the tab was opened with; the user may have navigated since.
     fn active_folder_path(&self) -> String {
         if let Some(v) = self.views.get(self.tabs.active_index()).and_then(|s| s.as_ref()) {
-            if let Some(p) = host::read_folder_path(v.top, 2) {
+            if let Some(p) = host::read_folder_path(v.top, 1) {
                 return p;
             }
         }
@@ -528,6 +637,7 @@ impl App {
         self.sweeping = true;
         self.prune_excluded();
         self.drop_dead_views();
+        self.expire_reserved();
 
         let excluded: Vec<isize> = self.excluded.iter().map(|(h, _)| *h).collect();
         // Take windows while they are still hidden whenever a folder is
@@ -575,6 +685,23 @@ impl App {
     fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
+        }
+        // Closing a tab whose window has not arrived yet: the Explorer process
+        // we spawned is still starting and will show its window seconds later.
+        // Remember the title so the sweep closes that window instead of
+        // adopting it back as a brand-new tab (which made a closed tab
+        // reappear).
+        if self.views.get(i).map(|v| v.is_none()).unwrap_or(false) {
+            if let Some(t) = self.tabs.get(i) {
+                let label = if t.label.is_empty() {
+                    short_label(&t.path)
+                } else {
+                    t.label.clone()
+                };
+                if !label.is_empty() {
+                    self.discard.push((label, Instant::now()));
+                }
+            }
         }
         // Close the Explorer window where it is: hidden, still our child.
         if let Some(v) = self.views[i].take() {
@@ -636,7 +763,7 @@ impl App {
         // as soon as it appears (`focus_pending`).
         self.focus_pending = match self.views.get(i) {
             Some(Some(v)) if host::is_visible(v.top) => {
-                host::focus_into(self.main_hwnd, v.top);
+                focus_view(self.main_hwnd, self.attached_tid, v);
                 false
             }
             Some(Some(_)) => true,
@@ -696,7 +823,7 @@ impl App {
         let rc = self.view_rect();
         self.last_client = (rc.right, rc.bottom);
         unsafe {
-            MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
+            let _ = MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
             // Keep the bar above the absorbed Explorer child: a new child is
             // created with HWND_TOP and would otherwise cover the tabs.
             let _ = SetWindowPos(
@@ -720,22 +847,31 @@ impl App {
     }
 
     /// Resize the active view, skipping the call when nothing changed.
+    ///
+    /// `sampled` lets callers that already measured the active view (the
+    /// sweep does, for its drift check) hand the value down: `sample()` walks
+    /// the window's child tree, and this used to happen three times per sweep
+    /// tick at 15ms intervals during a burst.
     fn place_active(&mut self) {
+        self.place_active_sampled(None);
+    }
+
+    fn place_active_sampled(&mut self, sampled: Option<host::Metrics>) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
         let metrics = match self.views.get(idx).and_then(|v| v.as_ref()) {
-            Some(v) => v.placement_key(),
-            None => ((0, 0, 0, 0), 0),
+            Some(v) => Some(sampled.unwrap_or_else(|| v.sample())),
+            None => None,
         };
-        let key = (idx, rc.left, rc.top, rc.right, rc.bottom, metrics);
-        if self.laid_out == Some(key) {
+        let key = metrics.map(|m| (idx, rc.left, rc.top, rc.right, rc.bottom, (m.nc, m.band)));
+        if key.is_some() && self.laid_out == key {
             return;
         }
-        if let Some(Some(v)) = self.views.get(idx) {
+        if let (Some(Some(v)), Some(m)) = (self.views.get(idx), metrics) {
             // Align the *visible chrome* (ribbon onward) to the view rect.
-            v.place_client(rc);
+            v.place_client(rc, m);
         }
-        self.laid_out = Some(key);
+        self.laid_out = key;
     }
 
     /// Repaint the whole client including children. Needed after any geometry
@@ -777,7 +913,7 @@ impl App {
         }
         let active = self.tabs.active_index();
         let rc = self.view_rect();
-        let mut stale = false;
+        let mut restyled = false;
         let mut became_visible = false;
         let mut show: Option<HWND> = None;
         let mut hide: Vec<HWND> = Vec::new();
@@ -786,13 +922,7 @@ impl App {
             // Explorer can restore its caption on navigation; that is the band
             // of foreign chrome that shows up between tab bar and ribbon.
             if unsafe { v.ensure_stripped() } {
-                stale = true;
-            }
-            // Explorer also moves and resizes its own frame when it finally
-            // shows it; the `laid_out` key cannot notice that because we did
-            // not change anything.
-            if i == active && !v.is_placed(rc) {
-                stale = true;
+                restyled = true;
             }
             let want = i == active;
             let vis = host::is_visible(v.top);
@@ -809,13 +939,29 @@ impl App {
                 hide.push(v.top);
             }
         }
-        if stale || became_visible {
+        // Measure the active view **once** and reuse it for the drift check and
+        // the placement below. `sample()` walks the window's child tree; this
+        // used to happen three times per tick (15ms apart during a burst).
+        // Measured after ensure_stripped(), because re-stripping the caption is
+        // exactly what changes the non-client metrics.
+        let metrics = self
+            .views
+            .get(active)
+            .and_then(|v| v.as_ref())
+            .map(|v| v.sample());
+        // Explorer moves and resizes its own frame when it finally shows it;
+        // the `laid_out` key cannot notice that because *we* changed nothing.
+        let drifted = match (self.views.get(active).and_then(|v| v.as_ref()), metrics) {
+            (Some(v), Some(m)) => !v.is_placed(rc, m),
+            _ => false,
+        };
+        if restyled || became_visible || drifted {
             self.laid_out = None;
         }
         // Place BEFORE re-asserting visibility: a window that is about to be
         // shown must already sit at the tab geometry, or its first frame lands
         // at the desktop position it was born with.
-        self.place_active();
+        self.place_active_sampled(metrics);
         if became_visible {
             // Explorer's ShowWindow may have restored its own geometry.
             self.laid_out = None;
@@ -838,7 +984,7 @@ impl App {
         if self.focus_pending {
             match self.views.get(active).and_then(|v| v.as_ref()) {
                 Some(v) if host::is_visible(v.top) => {
-                    host::focus_into(self.main_hwnd, v.top);
+                    focus_view(self.main_hwnd, self.attached_tid, v);
                     self.focus_pending = false;
                 }
                 None => self.focus_pending = false,
@@ -921,6 +1067,14 @@ impl App {
             }
         }
     }
+}
+
+/// Hand keyboard focus to an absorbed view without breaking the persistent
+/// input-queue attachment (`attached_tid`) — AttachThreadInput is not reference
+/// counted, so a blind attach/detach pair would silently undo it.
+fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
+    let already = attached_tid != 0 && attached_tid == host::thread_of(v.top);
+    host::focus_into(main, v.top, already);
 }
 
 fn home_dir() -> String {
@@ -1047,7 +1201,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.sync_input_queue();
             if app.active {
                 if let Some(Some(v)) = app.views.get(app.tabs.active_index()) {
-                    host::focus_into(app.main_hwnd, v.top);
+                    focus_view(app.main_hwnd, app.attached_tid, v);
                 }
             }
             LRESULT(0)
@@ -1057,11 +1211,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == WM_APP_TAB_ACTIVATED => {
-            app_from(hwnd).activate(lp.0 as usize);
+            let app = app_from(hwnd);
+            if let Some(i) = app.index_of(lp.0 as u64) {
+                app.activate(i);
+            }
             LRESULT(0)
         }
         m if m == WM_APP_TAB_CLOSE => {
-            app_from(hwnd).close_tab(lp.0 as usize);
+            let app = app_from(hwnd);
+            // Gone already (dropped by a sweep or closed twice): nothing to do.
+            if let Some(i) = app.index_of(lp.0 as u64) {
+                app.close_tab(i);
+            }
             LRESULT(0)
         }
         m if m == WM_APP_TAB_NEW => {

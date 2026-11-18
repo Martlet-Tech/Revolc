@@ -31,6 +31,15 @@ const STRIP_STYLE: u32 = WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_
 const STRIP_EXSTYLE: u32 =
     WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_CLIENTEDGE.0;
 
+/// Placement inputs measured from a live absorbed window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metrics {
+    /// Non-client padding around the client rect: (l, t, r, b).
+    pub nc: (i32, i32, i32, i32),
+    /// Reserved-but-unpainted strip at the top of the client area.
+    pub band: i32,
+}
+
 /// A real Explorer window absorbed as tab content. MAIN THREAD ONLY.
 pub struct Absorbed {
     pub top: HWND,
@@ -142,6 +151,19 @@ impl Absorbed {
         tracing::info!(?self.top, "explorer window restored");
     }
 
+    /// Everything the placement math needs, measured **once**.
+    ///
+    /// `band()` walks the window's whole child tree, and the sweep used to ask
+    /// for it 3-4 times per tick (placement key, drift check, placement
+    /// itself) at 15ms intervals while a folder was expected. Callers sample
+    /// once and pass the value down instead.
+    pub fn sample(&self) -> Metrics {
+        Metrics {
+            nc: nc_metrics(self.top).unwrap_or((0, 0, 0, 0)),
+            band: self.band(),
+        }
+    }
+
     /// Place the window so that its **visible chrome** (ribbon / command bar,
     /// i.e. the first thing Explorer actually paints) lands exactly on `rect`.
     ///
@@ -157,9 +179,9 @@ impl Absorbed {
     /// Aligning the client rect instead of the chrome (the 2026-11-17
     /// `25a5fbd` attempt) leaves that band — stale address-bar / column-header
     /// pixels — right under the tab bar.
-    pub fn place_client(&self, rect: RECT) {
-        let (nx, ny, nx2, ny2) = nc_metrics(self.top).unwrap_or((0, 0, 0, 0));
-        let band = self.band();
+    pub fn place_client(&self, rect: RECT, m: Metrics) {
+        let (nx, ny, nx2, ny2) = m.nc;
+        let band = m.band;
         unsafe {
             let _ = SetWindowPos(
                 self.top,
@@ -180,23 +202,15 @@ impl Absorbed {
         );
     }
 
-    /// Everything the placement depends on, for the caller's de-dup key:
-    /// non-client metrics and the internal band. Both change behind our back
-    /// (Explorer re-applies styles on navigation, ribbon auto-hide changes the
-    /// band), so they must be part of the key or the view drifts.
-    pub fn placement_key(&self) -> ((i32, i32, i32, i32), i32) {
-        (nc_metrics(self.top).unwrap_or((0, 0, 0, 0)), self.band())
-    }
-
     /// Does the window actually sit where `place_client(rect)` would put it?
     ///
     /// Explorer shows its own frame (and may move it) when it finishes
     /// navigating, so the geometry we set at absorb time is not authoritative
     /// — the `laid_out` de-dup key cannot see that drift because *we* did not
     /// change anything. One GetWindowRect per view per sweep.
-    pub fn is_placed(&self, rect: RECT) -> bool {
-        let (nx, ny, nx2, ny2) = nc_metrics(self.top).unwrap_or((0, 0, 0, 0));
-        let band = self.band();
+    pub fn is_placed(&self, rect: RECT, m: Metrics) -> bool {
+        let (nx, ny, nx2, ny2) = m.nc;
+        let band = m.band;
         let want = (
             rect.left - nx,
             rect.top - ny - band,
@@ -213,25 +227,6 @@ impl Absorbed {
     /// window's client area.
     fn band(&self) -> i32 {
         content_band(self.top).unwrap_or(self.nc_pre.1).clamp(0, 80)
-    }
-
-    pub fn resize(&self, rect: RECT) {
-        unsafe {
-            // Synchronous on purpose: during a WM_SIZE the host window has
-            // already changed size, and an async child resize leaves the
-            // absorbed Explorer one frame behind at its old geometry — that
-            // is what produced the "two chromes / stale tab bar" screenshots
-            // on maximize and restore (2026-11-17).
-            let _ = SetWindowPos(
-                self.top,
-                HWND_TOP,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
     }
 
     pub fn set_visible(&mut self, visible: bool) {
@@ -310,6 +305,42 @@ fn content_band(top: HWND) -> Option<i32> {
     best
 }
 
+/// Is `pid` the shell (explorer.exe)?
+///
+/// Only used to vet **hidden** adoption candidates. If the process cannot be
+/// opened (higher integrity, protected process) the answer is `true`: that is
+/// exactly the previous behaviour, and refusing would lose the flash-free path
+/// for windows we are not allowed to inspect.
+fn is_shell_process(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return true; // cannot look: keep the old accept-by-default
+        };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if ok.is_err() {
+            return true;
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        let file = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+        file.eq_ignore_ascii_case("explorer.exe")
+    }
+}
+
 /// Every descendant of `parent` (EnumChildWindows is recursive).
 fn descendants(parent: HWND) -> Vec<HWND> {
     unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -336,11 +367,16 @@ pub fn is_absorbed(top: HWND, host: HWND) -> bool {
 
 /// Read the folder path of an Explorer window via IShellWindows (main thread).
 /// Brief retries: the window exists before it navigates.
+///
+/// This runs on the UI thread, so the sleep between attempts is real freeze
+/// time for the user — hence "between", not "after each": the old loop slept
+/// 50ms even after its last attempt, i.e. every call paid a full frame stall
+/// for nothing.
 pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
     unsafe {
         let svc: IShellWindows =
             CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER).ok()?;
-        for _ in 0..retries {
+        for attempt in 0..retries.max(1) {
             let count = svc.Count().unwrap_or(0);
             for i in 0..count {
                 let Ok(dispatch) = svc.Item(&VARIANT::from(i)) else { continue };
@@ -355,7 +391,9 @@ pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if attempt + 1 < retries {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
         None
     }
@@ -423,10 +461,15 @@ unsafe extern "system" fn enum_find_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if ctx.include_hidden && !IsWindowVisible(hwnd).as_bool() {
         // A hidden frame may be an Explorer window that is still navigating or
         // one that is about to be torn down (never shown at all). Only take it
-        // when it is not owned by us and not another app's shell view.
+        // when it is not owned by us and it really is the shell: an invisible
+        // CabinetWClass from some other process (a host that creates shell
+        // views off-screen) is nobody's tab.
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == GetCurrentProcessId() {
+            return BOOL(1);
+        }
+        if !is_shell_process(pid) {
             return BOOL(1);
         }
     }
@@ -561,17 +604,23 @@ pub fn attach_input(tid: u32, attach: bool) {
 /// but its address bar cannot be typed into: focus lives in our input queue
 /// and the shell's queue never sees the keystrokes. AttachThreadInput merges
 /// the two queues for the duration of the handover (Clover does the same).
-pub fn focus_into(host: HWND, top: HWND) {
+///
+/// `already_attached` is the persistent attach `App::sync_input_queue` keeps
+/// for the active tab. AttachThreadInput is *not* reference counted: attaching
+/// an already-attached pair and detaching once afterwards tears the permanent
+/// link down, after which the address bar silently stops taking keystrokes.
+/// So when the pair is already ours, do not touch it.
+pub fn focus_into(host: HWND, top: HWND, already_attached: bool) {
     // Breadcrumb: AttachThreadInput + SetForegroundWindow is the other place
     // where we touch foreign window state from our own thread.
-    tracing::info!(?host, ?top, "focus_into");
+    tracing::info!(?host, ?top, already_attached, "focus_into");
     unsafe {
         let ours = GetCurrentThreadId();
         let target = GetWindowThreadProcessId(top, None);
         let fg = GetForegroundWindow();
         let fg_tid = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
 
-        let attach_target = target != 0 && target != ours;
+        let attach_target = !already_attached && target != 0 && target != ours;
         let attach_fg = fg_tid != 0 && fg_tid != ours && fg_tid != target;
 
         if attach_target {
