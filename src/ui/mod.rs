@@ -926,14 +926,19 @@ impl App {
             }
             let want = i == active;
             let vis = host::is_visible(v.top);
-            if want && !v.ready() {
-                // Pre-show shell frame: positioned already, but Explorer has
-                // not shown it yet. Its own ShowWindow does that (and runs its
-                // start-up path), so we never force it on screen.
+            if want && v.waiting_for_explorer() {
+                // Pre-show shell frame, still inside the grace period:
+                // Explorer's own ShowWindow does the showing (and runs its
+                // start-up path). After the grace we stop waiting — see
+                // waiting_for_explorer(): no show ever arrives for some
+                // windows and the tab would stay black forever.
                 if vis {
                     became_visible = true;
                 }
+                // else: still inside the grace, keep waiting.
             } else if want && !vis {
+                // Includes "grace expired and Explorer never showed it": the
+                // tab must not stay black forever.
                 show = Some(v.top);
             } else if !want && vis {
                 hide.push(v.top);

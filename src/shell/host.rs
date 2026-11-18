@@ -7,6 +7,7 @@
 
 use windows::core::{Interface as _, Result, VARIANT};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
@@ -30,6 +31,11 @@ const STRIP_STYLE: u32 = WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_
     | WS_SYSMENU.0 | WS_BORDER.0;
 const STRIP_EXSTYLE: u32 =
     WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_CLIENTEDGE.0;
+
+/// How long to wait for Explorer to show a pre-show frame before showing it
+/// ourselves. Measured create→show gap on this machine is ~850ms, so this is
+/// "one missed show", not "a slow disk".
+const PRE_SHOW_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Placement inputs measured from a live absorbed window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +62,8 @@ pub struct Absorbed {
     /// We position it and leave visibility alone until that happens; showing
     /// it ourselves would take Explorer's start-up show path out of the loop.
     shown: bool,
+    /// When we adopted it, for the pre-show grace period.
+    adopted_at: std::time::Instant,
 }
 
 impl Absorbed {
@@ -67,6 +75,15 @@ impl Absorbed {
         let orig_style = GetWindowLongPtrW(top, GWL_STYLE);
         let orig_exstyle = GetWindowLongPtrW(top, GWL_EXSTYLE);
         let nc_pre = nc_metrics(top).unwrap_or((0, 0, 0, 0));
+        // Was Explorer already showing this frame? A window that was on screen
+        // (Revolc started while folder windows were open, or a second folder
+        // opened from one of our own tabs) is **not** a pre-show frame: Explorer
+        // will never run its start-up ShowWindow for it again, so if we keep
+        // treating it as "waiting for Explorer", nobody ever brings it back and
+        // the tab shows the host's empty background — black. Everything below
+        // still hides it (that is the crash-safe order); this only records the
+        // fact so `set_visible` knows it has to do the showing.
+        let was_visible = IsWindowVisible(top).as_bool();
 
         // ORDER MATTERS, and it is the difference between a crash and a clean
         // reparent (2026-11-17 dump, minidump in %APPDATA%\revolc\crash):
@@ -110,8 +127,15 @@ impl Absorbed {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
                 | SWP_ASYNCWINDOWPOS,
         );
-        tracing::info!(?top, nc = ?nc_pre, "explorer window absorbed");
-        Ok(Self { top, orig_style, orig_exstyle, nc_pre, shown: false })
+        tracing::info!(?top, nc = ?nc_pre, was_visible, "explorer window absorbed");
+        Ok(Self {
+            top,
+            orig_style,
+            orig_exstyle,
+            nc_pre,
+            shown: was_visible,
+            adopted_at: std::time::Instant::now(),
+        })
     }
 
     /// Explorer re-applies its own frame styles on some navigations, which
@@ -230,27 +254,47 @@ impl Absorbed {
     }
 
     pub fn set_visible(&mut self, visible: bool) {
-        // Record Explorer showing the frame by itself; that is what makes the
-        // tab content "ready".
-        if visible && !self.shown && is_visible(self.top) {
-            self.shown = true;
+        if visible {
+            // Record Explorer showing the frame by itself; that is what makes
+            // the tab content "ready".
+            if is_visible(self.top) {
+                self.shown = true;
+            } else if self.waiting_for_explorer() {
+                // Pre-show frame inside the grace: Explorer's start-up path
+                // (navigation, ribbon init) expects to run the first show, and
+                // letting it is what makes the adoption flash-free. It appears
+                // in the tab when that happens. After the grace this branch is
+                // skipped and we show it ourselves — see waiting_for_explorer.
+                return;
+            }
         }
-        // Pre-show frame: positioned but not yet shown by Explorer. Leave it
-        // hidden — our own ShowWindow would be the window's first show, and
-        // Explorer's start-up path (navigation, ribbon init) expects to run
-        // that itself. It shows up inside the tab when it is ready.
-        if visible && !self.shown {
-            return;
-        }
+        let was = is_visible(self.top);
         unsafe {
             let _ = ShowWindow(self.top, if visible { SW_SHOW } else { SW_HIDE });
         }
+        // A window that was hidden and comes back keeps its DWM redirection
+        // surface, but the show alone does not make its thread paint again —
+        // the tab renders as an empty (black) rectangle until something forces
+        // a paint. Invalidate on the hidden→visible edge only (a window that is
+        // already up must not be repainted just because its tab was clicked).
+        if visible && !was {
+            nudge_paint(self.top);
+        }
     }
 
-    /// Has Explorer shown this frame at least once (i.e. is the tab content
-    /// actually on screen, as opposed to still starting up)?
-    pub fn ready(&self) -> bool {
-        self.shown
+    /// Still waiting for Explorer to run the show we deliberately skipped?
+    ///
+    /// Only for the first PRE_SHOW_GRACE: Explorer creates a folder window
+    /// ~850ms before showing it, and letting its own start-up path do the show
+    /// is what makes the adoption flash-free. But that show does not always
+    /// arrive — the window can be adopted *after* Explorer already decided it
+    /// was shown, or its show path bails out once the frame has a new parent.
+    /// A frame still hidden after the grace is ours to show: otherwise the tab
+    /// is a black rectangle that survives maximize, restore and clicking the
+    /// tab (2026-11-18: three windows opened before Revolc started, absorbed at
+    /// startup with nc=(8,0,8,8) and never shown again).
+    pub fn waiting_for_explorer(&self) -> bool {
+        !self.shown && self.adopted_at.elapsed() < PRE_SHOW_GRACE
     }
 
     /// Called from the sweep: Explorer's own ShowWindow is what promotes a
@@ -571,6 +615,23 @@ pub fn force_visible(top: HWND, visible: bool) {
                 | SWP_ASYNCWINDOWPOS
         };
         let _ = SetWindowPos(top, HWND_TOP, 0, 0, 0, 0, flags);
+    }
+    if visible {
+        // Same as Absorbed::set_visible: re-showing a shell frame does not make
+        // it paint, and an unpainted tab area is indistinguishable from a
+        // black one.
+        nudge_paint(top);
+    }
+}
+
+/// Ask a foreign window to repaint its whole client now.
+///
+/// InvalidateRect is allowed across processes (it just marks the region dirty
+/// in the owner's queue), unlike RedrawWindow with RDW_UPDATENOW which would
+/// block us until the other thread paints.
+pub fn nudge_paint(top: HWND) {
+    unsafe {
+        let _ = InvalidateRect(top, None, true);
     }
 }
 
