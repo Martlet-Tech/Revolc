@@ -28,7 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, NCCALCSIZE_PARAMS,
     SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK,
     WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT,
     WM_SETICON, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
     WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -375,6 +376,21 @@ impl App {
 
     fn is_maximized(&self) -> bool {
         unsafe { IsZoomed(self.main_hwnd).as_bool() }
+    }
+
+    /// Minimize / maximize-restore / close, driven by our own click handling.
+    fn caption_action(&mut self, b: caption::Button) {
+        match b {
+            caption::Button::Minimize => unsafe {
+                let _ = ShowWindow(self.main_hwnd, SW_MINIMIZE);
+            },
+            caption::Button::Maximize => self.toggle_maximize(),
+            // Same path as the system button: WM_CLOSE means "hide to tray"
+            // in redirect mode (Clover semantics), not "exit".
+            caption::Button::Close => unsafe {
+                let _ = PostMessageW(self.main_hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
+        }
     }
 
     /// Maximize/restore without `SW_RESTORE`'s side effect of also undoing a
@@ -1302,7 +1318,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // whether the point ends up client or non-client.
             app.update_hover(pt.x, pt.y, cr.right);
             match app.tabbar.hit(pt.x, pt.y, cr.right) {
-                tabbar::Hit::Caption(b) => LRESULT(b.hit_code() as isize),
+                // Caption buttons stay CLIENT on purpose: reporting
+                // HTMAXBUTTON hands the button to the shell, which pops the
+                // Win11 Snap Layouts flyout on top of it — the flyout lands in
+                // the wrong place (a window with no non-client area gives it no
+                // anchor), eats the click and leaves a blank white box behind.
+                // Measured 2026-11-18: min/max stopped working, white artifact
+                // on press. Own the clicks, own the behaviour.
+                tabbar::Hit::Caption(_) => LRESULT(HTCLIENT as isize),
                 // Empty strip = caption. Below the band there must be no
                 // HTCAPTION: while a tab is still reserved there is no child
                 // covering the content, and the whole window would drag.
@@ -1369,7 +1392,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         );
                     }
                 }
-                tabbar::Hit::Caption(_) => {}
+                tabbar::Hit::Caption(b) => app.caption_action(b),
             }
             LRESULT(0)
         }

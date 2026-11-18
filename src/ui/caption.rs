@@ -21,8 +21,6 @@ use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, FillRect, LineTo, MoveToEx, SelectObject, HDC,
     HGDIOBJ, PS_SOLID,
 };
-use windows::Win32::UI::WindowsAndMessaging::{HTCLOSE, HTMAXBUTTON, HTMINBUTTON};
-
 /// Height of the caption band, i.e. the whole tab bar. Windows' own caption is
 /// 31–32px at 100% DPI; 34 leaves room for a full-height tab plus its rounding.
 pub const HEIGHT: i32 = 34;
@@ -39,17 +37,6 @@ pub enum Button {
 }
 
 impl Button {
-    /// Non-client hit code for this button. Returned by the main window's
-    /// `WM_NCHITTEST`; `DefWindowProc` turns a click on it into the matching
-    /// `WM_SYSCOMMAND`.
-    pub fn hit_code(self) -> u32 {
-        match self {
-            Button::Minimize => HTMINBUTTON,
-            Button::Maximize => HTMAXBUTTON,
-            Button::Close => HTCLOSE,
-        }
-    }
-
     fn slot(self) -> i32 {
         match self {
             Button::Minimize => 0,
