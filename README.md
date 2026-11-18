@@ -11,8 +11,6 @@
   <code>r&nbsp;e&nbsp;v&nbsp;o&nbsp;l&nbsp;C</code>
 </p>
 
-<p align="center"><sub>倒着读一遍。</sub></p>
-
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0f6cbd?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/Rust-native%20Win32-b7410e?style=flat-square">
@@ -25,12 +23,6 @@
 ---
 
 ## 先说 Clover
-
-上面那两行不是排版失误：**Clover 倒着写，就是 Revolc。**
-
-名字先立个誓——同一件事，反着重新做一遍。
-
-再看一眼顶上那枚图标：真的三叶草，四片心形叶的尖是在中心会合成一点的；这一枚反着长，圆钝的那头聚在中间，尖朝外散开。**名字倒着写，叶子也倒着长。**
 
 如果你用过三叶草（Clover），应该懂那种感觉：用完之后再也回不去原生资源管理器了。
 
