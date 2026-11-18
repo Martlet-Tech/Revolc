@@ -73,7 +73,8 @@
 - **实现于 M3 第一阶段**（2026-11-18，分支 `m3-integrated-titlebar`）：
   `WS_POPUP|WS_THICKFRAME|WS_MIN/MAXBOX|WS_SYSMENU` + `WM_NCCALCSIZE` 返回 0，
   标题栏与 tab 条由主窗口自绘（`ui/tabbar.rs` + `ui/caption.rs`），
-  `WM_NCHITTEST` 出 `HTCAPTION`/`HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` 与缩放边框。
+  `WM_NCHITTEST` 出 `HTCAPTION`（空白条带）与缩放边框；三个标题栏按钮**按客户区自己处理**
+  （上报成 `HTMIN/MAX/CLOSE` 会走 `DefWindowProc`，无 NC 区的窗口上点击失效还会冒出白色方块）。
   原计划放 M4，现提前；M4 只做主题化（配色/圆角半径/暗色）
 
 ### 4.3 布局
