@@ -57,6 +57,9 @@ fn absorb_msg() -> u32 {
 }
 
 const TABBAR_HEIGHT: i32 = caption::HEIGHT;
+/// Hairline between the window and whatever is behind it. The Explorer view is
+/// inset by this much, otherwise the child window paints over the frame.
+const WINDOW_BORDER: i32 = 1;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 
 /// Stray-window sweep. The BHO notify is a hint, not a guarantee: SetSite
@@ -327,11 +330,50 @@ impl App {
         }
     }
 
+    /// Where the absorbed Explorer window goes: inside the hairline frame.
     fn view_rect(&self) -> RECT {
+        let rc = self.client();
+        let b = self.border();
+        RECT {
+            left: b,
+            top: TABBAR_HEIGHT,
+            right: (rc.right - b).max(b),
+            bottom: (rc.bottom - b).max(TABBAR_HEIGHT),
+        }
+    }
+
+    /// A maximized window sits flush against the work area; a hairline there
+    /// only draws a stray dark line on the screen edge (Chrome does the same).
+    fn border(&self) -> i32 {
+        if self.is_maximized() {
+            0
+        } else {
+            WINDOW_BORDER
+        }
+    }
+
+    /// 1px frame around the client. The band is ours, and the view is inset, so
+    /// nothing covers it.
+    fn paint_frame(&self, hdc: HDC) {
+        let b = self.border();
+        if b == 0 {
+            return;
+        }
+        let rc = self.client();
+        let (r, g, bl) = self.cfg.get().color(|t| &t.window_border);
+        let color = COLORREF((bl as u32) << 16 | (g as u32) << 8 | r as u32);
+        let strips = [
+            RECT { left: 0, top: 0, right: rc.right, bottom: b },
+            RECT { left: 0, top: rc.bottom - b, right: rc.right, bottom: rc.bottom },
+            RECT { left: 0, top: 0, right: b, bottom: rc.bottom },
+            RECT { left: rc.right - b, top: 0, right: rc.right, bottom: rc.bottom },
+        ];
         unsafe {
-            let mut rc = RECT::default();
-            let _ = GetClientRect(self.main_hwnd, &mut rc);
-            RECT { top: TABBAR_HEIGHT, ..rc }
+            let brush = CreateSolidBrush(color);
+            for s in strips.iter() {
+                let _ = FillRect(hdc, s, brush);
+            }
+            let _ = DeleteObject(HGDIOBJ(brush.0));
         }
     }
 
@@ -951,7 +993,9 @@ impl App {
     }
 
     fn layout(&mut self) {
-        let rc = self.view_rect();
+        // Width for the strip and the drift check come from the *client*, not
+        // from the view rect: the view is inset by the hairline frame.
+        let rc = self.client();
         self.last_client = (rc.right, rc.bottom);
         // Tab widths follow the client width; the band itself is painted by our
         // own WM_PAINT, so there is no child to move or raise any more (the old
@@ -1432,6 +1476,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
             app.tabbar.paint(hdc, app.client().right);
+            app.paint_frame(hdc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
