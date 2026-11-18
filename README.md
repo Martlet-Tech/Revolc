@@ -7,6 +7,13 @@
 <p align="center">把 Windows 资源管理器变成多标签浏览器<br><sub>Clover 的原生重制版 · 不内嵌浏览器内核</sub></p>
 
 <p align="center">
+  <code>C&nbsp;l&nbsp;o&nbsp;v&nbsp;e&nbsp;r</code><br>
+  <code>r&nbsp;e&nbsp;v&nbsp;o&nbsp;l&nbsp;C</code>
+</p>
+
+<p align="center"><sub>倒着读一遍。</sub></p>
+
+<p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0f6cbd?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/Rust-native%20Win32-b7410e?style=flat-square">
   <img alt="status" src="https://img.shields.io/badge/status-daily%20usable-2ea44f?style=flat-square">
@@ -18,6 +25,10 @@
 ---
 
 ## 先说 Clover
+
+上面那两行不是排版失误：**Clover 倒着写，就是 Revolc。**
+
+名字先立个誓——同一件事，反着重新做一遍。
 
 如果你用过三叶草（Clover），应该懂那种感觉：用完之后再也回不去原生资源管理器了。
 
@@ -95,4 +106,4 @@ cargo build --release -p revolc-bho    # BHO（要单独编，注册才生效）
 
 ---
 
-<p align="center"><sub>致敬 Clover。那个把文件管理器做对了的工具。</sub></p>
+<p align="center"><sub>致敬 Clover。那个把文件管理器做对了的工具。<br>名字反着写，事也重做一遍。</sub></p>
