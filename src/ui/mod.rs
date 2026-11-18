@@ -380,6 +380,9 @@ impl App {
 
     /// Minimize / maximize-restore / close, driven by our own click handling.
     fn caption_action(&mut self, b: caption::Button) {
+        // One line per click: rare enough to keep at info, and the only way to
+        // tell "the click never arrived" from "the action did nothing".
+        tracing::info!(?b, maximized = self.is_maximized(), "caption button clicked");
         match b {
             caption::Button::Minimize => unsafe {
                 let _ = ShowWindow(self.main_hwnd, SW_MINIMIZE);
