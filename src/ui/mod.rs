@@ -1,3 +1,4 @@
+pub mod icon;
 pub mod tabbar;
 pub mod tray;
 
@@ -15,12 +16,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible, IsZoomed, LoadCursorW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW,
-    CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, IDC_ARROW, MSG, SWP_NOACTIVATE,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
+    CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
+    SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNORMAL,
-    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_SETICON,
     WM_KEYDOWN, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
 };
 
@@ -152,6 +154,10 @@ impl MainWindow {
                 lpfnWndProc: Some(wndproc),
                 hInstance: hinstance.into(),
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
+                // Class icons: what the title bar and Alt-Tab read before the
+                // window has painted or handled WM_SETICON.
+                hIcon: icon::big(),
+                hIconSm: icon::small(),
                 lpszClassName: CLASS_NAME,
                 style: CS_HREDRAW | CS_VREDRAW,
                 hbrBackground: HBRUSH(std::ptr::null_mut()),
@@ -1109,6 +1115,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let args = Box::from_raw((*cs).lpCreateParams as *mut WindowArgs);
             let app = App::build(hwnd, args);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
+            // The class icons cover Alt-Tab and the title bar; the taskbar button
+            // and `SendMessage`-based consumers read the *window* icon, which
+            // only exists once it is set explicitly. Both come from the same .ico.
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_BIG as usize),
+                    LPARAM(icon::big().0 as isize),
+                );
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_SMALL as usize),
+                    LPARAM(icon::small().0 as isize),
+                );
+            }
             LRESULT(0)
         }
         WM_DESTROY => {

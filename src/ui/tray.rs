@@ -8,9 +8,8 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-    TrackPopupMenuEx, IDI_APPLICATION, MF_STRING, SW_SHOW, TPM_RETURNCMD,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    AppendMenuW, CreatePopupMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenuEx, MF_STRING,
+    SW_SHOW, TPM_RETURNCMD, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
 };
 
 pub const WM_APP_TRAY: u32 = 0x8004;
@@ -27,7 +26,9 @@ pub fn add(hwnd: HWND) -> bool {
         nid.uID = TRAY_ID;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
-        nid.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        // Same .ico as the window/exe icon, loaded at SM_CXSMICON so it is
+        // sharp on 125%/150% displays instead of a rescaled 16px bitmap.
+        nid.hIcon = crate::ui::icon::small();
         let tip = w!("Revolc (文件夹接管中)");
         let tip_bytes: Vec<u16> = tip.as_wide().iter().take(127).copied().collect();
         for (i, c) in tip_bytes.into_iter().enumerate() {
