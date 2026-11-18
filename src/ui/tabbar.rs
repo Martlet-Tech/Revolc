@@ -18,9 +18,10 @@ use windows::Win32::Graphics::Gdi::{
     FillRect, FillRgn, GetStockObject, SelectObject, SetBkMode, SetTextColor, HDC, HFONT, HGDIOBJ,
     DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
 use crate::config::Config;
-use crate::ui::caption;
+use crate::ui::{caption, icon};
 
 pub const TAB_MIN_W: i32 = 90;
 pub const TAB_MAX_W: i32 = 190;
@@ -29,7 +30,12 @@ pub const TAB_MAX_W: i32 = 190;
 const TAB_TOP: i32 = 4;
 const TAB_BOTTOM: i32 = caption::HEIGHT;
 const TAB_GAP: i32 = 4;
-const PAD_LEFT: i32 = 4;
+/// Leading app-icon gutter. Tabs start to its right, so this strip is bare band
+/// at all times: once the tabs fill the width there is nowhere else left to
+/// grab the window, and a full row of tabs would make it unmovable (and
+/// undrag-by-title). Sized 16px icon + 6px breathing room on both sides.
+const GUTTER: i32 = 28;
+const ICON_SIZE: i32 = 16;
 const CLOSE_BOX: i32 = 16; // per-tab close (X) button size
 const PLUS_SIZE: i32 = 26; // trailing "+" button size
 /// Vertical centre of the band, for the "+" pill.
@@ -164,7 +170,7 @@ impl TabBar {
     /// Recompute tab widths for a new client width. Returns true on change.
     pub fn fit(&mut self, width: i32) -> bool {
         let n = self.labels.len().max(1) as i32;
-        let avail = width - PAD_LEFT - PLUS_SIZE - 8 - caption::WIDTH - n * TAB_GAP;
+        let avail = width - GUTTER - PLUS_SIZE - 8 - caption::WIDTH - n * TAB_GAP;
         let want = (avail / n).clamp(TAB_MIN_W, TAB_MAX_W);
         if want == self.tab_w {
             return false;
@@ -174,7 +180,7 @@ impl TabBar {
     }
 
     fn tab_x(&self, i: usize) -> i32 {
-        PAD_LEFT + i as i32 * (self.tab_w + TAB_GAP)
+        GUTTER + i as i32 * (self.tab_w + TAB_GAP)
     }
 
     fn plus_x(&self) -> i32 {
@@ -197,10 +203,12 @@ impl TabBar {
         if x >= plus_x && x <= plus_x + PLUS_SIZE && (plus_top..plus_top + PLUS_SIZE).contains(&y) {
             return Hit::Plus;
         }
-        if x < PAD_LEFT || y < TAB_TOP || n == 0 {
+        // Left of the first tab (the icon gutter) is always bare band, i.e. a
+        // caption hit; same for the gaps and the strip above the tabs.
+        if x < GUTTER || y < TAB_TOP || n == 0 {
             return Hit::Band;
         }
-        let i = (x - PAD_LEFT) / (self.tab_w + TAB_GAP);
+        let i = (x - GUTTER) / (self.tab_w + TAB_GAP);
         if i < 0 || i >= n {
             return Hit::Band;
         }
@@ -226,6 +234,23 @@ impl TabBar {
             let brush = CreateSolidBrush(self.bg);
             let _ = FillRect(hdc, &band, brush);
             let _ = DeleteObject(HGDIOBJ(brush.0));
+
+            // Leading app icon, centred in the gutter. Same resource the
+            // taskbar/tray use (ui/icon.rs); it never overlaps a tab.
+            let app_icon = icon::small();
+            if !app_icon.0.is_null() {
+                let _ = DrawIconEx(
+                    hdc,
+                    (GUTTER - ICON_SIZE) / 2,
+                    CENTER - ICON_SIZE / 2,
+                    app_icon,
+                    ICON_SIZE,
+                    ICON_SIZE,
+                    0,
+                    None,
+                    DI_NORMAL,
+                );
+            }
 
             let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
             let old_font = SelectObject(hdc, HGDIOBJ(font.0));
