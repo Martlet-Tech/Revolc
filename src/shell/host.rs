@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
+    BringWindowToTop, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsWindow, IsWindowVisible,
     SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
@@ -743,6 +743,45 @@ pub fn focus_into(host: HWND, top: HWND, already_attached: bool) {
         if attach_target {
             let _ = AttachThreadInput(ours, target, false);
         }
+    }
+}
+
+/// Bring our frame to the foreground **without touching its zoom state**.
+///
+/// A tray click arrives while the *taskbar* (explorer.exe) owns the foreground.
+/// The foreground lock turns a bare `SetForegroundWindow` from a background
+/// process into a no-op that only flashes the taskbar button, so the call has
+/// to be issued from inside the current foreground thread's input queue.
+///
+/// `AttachThreadInput` is not reference counted and `App::sync_input_queue`
+/// keeps a *persistent* attach on the active tab's Explorer thread: attaching
+/// and detaching the same pair here would silently tear that link down and the
+/// address bar would stop taking keystrokes. That is why `attached_tid` is
+/// passed in and that specific pair is left alone.
+pub fn activate(host: HWND, attached_tid: u32) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg == host {
+            // Already foreground (and therefore unoccluded): no z-order churn
+            // and no spurious WM_ACTIVATE.
+            return;
+        }
+        let ours = GetCurrentThreadId();
+        let fg_tid = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let attach = fg_tid != 0 && fg_tid != ours && fg_tid != attached_tid;
+        if attach {
+            let _ = AttachThreadInput(fg_tid, ours, true);
+        }
+        let ok = SetForegroundWindow(host).as_bool();
+        if !ok {
+            // Last resort: z-order only. BringWindowToTop never un-maximizes
+            // and never un-minimizes, unlike SW_SHOWNORMAL/SW_RESTORE.
+            let _ = BringWindowToTop(host);
+        }
+        if attach {
+            let _ = AttachThreadInput(fg_tid, ours, false);
+        }
+        tracing::info!(?host, fg_tid, attached_tid, ok, "activate");
     }
 }
 

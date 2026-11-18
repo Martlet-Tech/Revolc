@@ -300,11 +300,18 @@ impl App {
     }
 
     /// Show window; if no tabs remain (was hidden in tray), open a home tab.
+    ///
+    /// Tray clicks land here, so this also takes the foreground. Two separate
+    /// dimensions on purpose: `surface` decides *visibility* (and restores a
+    /// minimized frame to its previous zoom), `host::activate` decides
+    /// *foreground*. A maximized window stays maximized, a restored one stays
+    /// restored — this never calls SW_RESTORE on a zoomed window.
     pub(crate) fn open_main(&mut self) {
         self.surface();
         if self.tabs.is_empty() {
             self.new_tab(home_dir());
         }
+        host::activate(self.main_hwnd, self.attached_tid);
     }
 
     /// Make sure the frame is on screen **without ever touching WS_MAXIMIZE**.

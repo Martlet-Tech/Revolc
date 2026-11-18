@@ -1,6 +1,6 @@
 //! Tray icon: resident mode for takeover (spec §1 主程序可常驻; user request:
 //! "彻底关了就没接管" → redirect 模式下进程缩托盘继续拦截).
-//! Minimal: default icon, right-click menu, left-double-click to restore.
+//! Minimal: our icon, right-click menu, left click to bring the window back.
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT};
@@ -9,7 +9,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenuEx, MF_STRING,
-    SW_SHOW, TPM_RETURNCMD, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    TPM_RETURNCMD, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 pub const WM_APP_TRAY: u32 = 0x8004;
@@ -56,14 +56,22 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// Handle WM_APP_TRAY mouse events. Returns Some(LRESULT) if consumed.
+///
+/// Left click = "show me the window", like every other tray app: one click,
+/// one action. It never toggles (no hide-on-click) and never touches the zoom
+/// state — `App::open_main` restores only what was minimized/hidden and then
+/// takes the foreground. Double click needs no separate path: the
+/// `WM_LBUTTONUP` before `WM_LBUTTONDBLCLK` already did the work, and the
+/// second call is idempotent.
 pub unsafe fn on_tray_message(hwnd: HWND, lp: LPARAM, app: &mut crate::ui::App) -> Option<LRESULT> {
     let m = lp.0 as u32;
-    if m != WM_RBUTTONUP && m != WM_LBUTTONDBLCLK {
-        return None;
-    }
-    if m == WM_LBUTTONDBLCLK {
-        app.open_main();
-        return Some(LRESULT(0));
+    match m {
+        WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+            app.open_main();
+            return Some(LRESULT(0));
+        }
+        WM_RBUTTONUP => {}
+        _ => return None,
     }
     // Right-click: context menu.
     let menu = CreatePopupMenu().ok()?;
@@ -76,7 +84,6 @@ pub unsafe fn on_tray_message(hwnd: HWND, lp: LPARAM, app: &mut crate::ui::App) 
     match cmd {
         CMD_OPEN => {
             app.open_main();
-            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, SW_SHOW);
             Some(LRESULT(0))
         }
         CMD_EXIT => {
