@@ -31,6 +31,10 @@ pub struct Theme {
     pub tab_text: String,
     pub tab_text_active: String,
     pub tabbar_text: String,
+    /// Hover fill behind a caption button (min/max), and the red used by the
+    /// close button — Chrome-style integrated title bar uses these.
+    pub caption_hover: String,
+    pub caption_close_hover: String,
     /// Corner radius in px; 0 = square (Win7 fallback also forces 0)
     pub tab_radius: i32,
 }
@@ -71,6 +75,8 @@ impl Default for Theme {
             tab_text: "#cccccc".into(),
             tab_text_active: "#ffffff".into(),
             tabbar_text: "#cccccc".into(),
+            caption_hover: "#3d3d3d".into(),
+            caption_close_hover: "#c42b1c".into(),
             tab_radius: 6,
         }
     }
@@ -130,6 +136,8 @@ tab_inactive      = "#3c3c3c"
 tab_text          = "#cccccc"
 tab_text_active   = "#ffffff"
 tabbar_text       = "#cccccc"
+caption_hover     = "#3d3d3d"  # min/max button hover fill
+caption_close_hover = "#c42b1c" # close button hover (red)
 tab_radius        = 6      # 0 = square corners
 
 [behavior]

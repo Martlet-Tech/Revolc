@@ -19,11 +19,19 @@
 
 ## P1 — 里程碑主线
 
-4. **M1 会话持久化 + 崩溃恢复**（`Rebuild_Target_Spec.md` §3.2）：
-   退出时保存每个窗口的 tab 路径 + 激活态 + 几何；启动检测不正常退出标志并提示恢复；
-   `behavior.startup_mode` 三态（last / new / list）。写盘必须原子替换。
-5. **M2 书签栏**，之后 M3 tab 拖拽分窗、M4 主题系统（含 Chrome 式一体化标题栏）、
-   M5 安装包、M6 接管完善（`associate` 模式目前未做）。
+4. ~~M1 会话持久化~~ / ~~M2 书签栏~~：**缓办**（2026-11-18 决定先做 M3）。
+5. **M3 第一阶段（已做，分支 `m3-integrated-titlebar`）：Chrome 式一体化标题栏**
+   —— 窗口去掉 `WS_CAPTION`，`WM_NCCALCSIZE` 返回 0（客户区 = 窗口矩形），
+   标题栏由主窗口自绘（`ui/caption.rs` 三个按钮 + `ui/tabbar.rs` 标签条），
+   `WM_NCHITTEST` 自己回答 `HTCAPTION` / `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE`
+   + 8 条缩放边框。tab 条 34px、圆角只在顶部、底部与内容区齐平。
+   主题新增 `caption_hover` / `caption_close_hover`。
+6. **M3 第二阶段（未做）：tab 拖拽分窗/合并**（`Rebuild_Target_Spec.md` §3.1/§3.4）。
+   现状是单窗口单进程，这一阶段要先把「多窗口」从 `App` 里拆出来（现在 `App` 持有
+   唯一 `main_hwnd` + 一份 tabs），再做：tab 拖拽有插入位/落地预览、拖到同进程另一个
+   窗口 = 合并、拖到桌面 = 新进程承接该 tab。
+7. 之后 M4 主题系统（圆角/透明/配色 + 一体化标题栏的主题化）、M5 安装包、
+   M6 接管完善（`associate` 模式目前未做）。
 
 ## P2 — 体验/性能想法池（未排期）
 

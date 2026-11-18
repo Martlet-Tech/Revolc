@@ -1,44 +1,58 @@
-//! Tab bar: self-drawn child window (M0 design §1 ui/tabbar.rs).
-//! Main-thread only. State updates flow main window -> update() -> invalidate.
+//! Tab strip: pure painting + hit testing, owned by the main window.
+//!
+//! It used to be a child window. It cannot be one any more: the strip is the
+//! title bar now (spec §4.2.1), and a child window cannot answer a *non-client*
+//! hit test — `HTTRANSPARENT` only forwards to the parent as a **client** hit,
+//! so user32 re-asks the child forever (measured: 30 hit tests in 1.5ms) and
+//! the click never lands anywhere. Chrome draws its tab strip in the toplevel
+//! for the same reason, and so do we: the main window paints the band and
+//! answers `HTCAPTION` / `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE` itself,
+//! which is also what brings native drag, double-click and Win11 Snap Layouts.
+//!
+//! Everything here is main-thread only and paint-only (no state machine): the
+//! caller decides when to invalidate.
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FillRgn, GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
-    HBRUSH, HFONT, HGDIOBJ, PAINTSTRUCT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
-    DEFAULT_GUI_FONT, TRANSPARENT,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetParent, GetWindowLongPtrW, LoadCursorW,
-    PostMessageW, RegisterClassExW, SetWindowLongPtrW, IDC_ARROW, WM_LBUTTONDOWN, WM_MBUTTONUP,
-    WM_PAINT, WNDCLASSEXW, GWLP_USERDATA, HMENU, WS_CHILD, WS_VISIBLE,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FillRgn, GetStockObject,
+    SelectObject, SetBkMode, SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_END_ELLIPSIS,
+    DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, TRANSPARENT,
 };
 
 use crate::config::Config;
-use crate::ui::{WM_APP_TAB_ACTIVATED, WM_APP_TAB_CLOSE, WM_APP_TAB_NEW};
+use crate::ui::caption;
 
-const TAB_MIN_W: i32 = 90;
-const TAB_MAX_W: i32 = 190;
-const TAB_HEIGHT: i32 = 22;
+pub const TAB_MIN_W: i32 = 90;
+pub const TAB_MAX_W: i32 = 190;
+/// Tabs stop this far above the band's bottom edge; the strip above keeps the
+/// rounded top corners off the window's own rounding and is the drag area.
+const TAB_TOP: i32 = 4;
+const TAB_BOTTOM: i32 = caption::HEIGHT;
 const TAB_GAP: i32 = 4;
 const PAD_LEFT: i32 = 4;
 const CLOSE_BOX: i32 = 16; // per-tab close (X) button size
-const PLUS_SIZE: i32 = 24; // trailing "+" button size
-const CLASS_NAME: PCWSTR = w!("RevolcTabBar");
+const PLUS_SIZE: i32 = 26; // trailing "+" button size
+/// Vertical centre of the band, for the "+" pill.
+const CENTER: i32 = caption::HEIGHT / 2;
 
-/// What a click landed on.
-enum Hit {
+/// What a point in the band landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit {
     Tab(usize),
+    /// The per-tab X.
     Close(usize),
+    /// The trailing "+".
     Plus,
+    /// Bare strip background: window drag / double-click maximize.
+    Band,
+    /// One of the caption buttons; the main window answers with its NC code.
+    Caption(caption::Button),
 }
 
-/// Snapshot of what to draw; rebuilt on every update() from the config + tabs.
-struct State {
-    /// Tab ids, parallel to `labels`. Posted back instead of indices: see
-    /// WM_APP_TAB_ACTIVATED in ui/mod.rs.
+/// Tab strip state + painter.
+pub struct TabBar {
+    /// Tab ids, parallel to `labels`. Callbacks report ids, not indices: the
+    /// list can shrink between a click and its dispatch.
     ids: Vec<u64>,
     labels: Vec<String>,
     active: usize,
@@ -48,36 +62,115 @@ struct State {
     text: COLORREF,
     text_active: COLORREF,
     radius: i32,
-    /// Per-tab width, recomputed from the bar's client width so the tabs fill
-    /// the window instead of being stuck at one hard-coded size.
+    /// Per-tab width, recomputed from the client width so the tabs fill the
+    /// band instead of being stuck at one hard-coded size.
     tab_w: i32,
+    hover: Option<caption::Button>,
+    maximized: bool,
+    window_active: bool,
+    caption_colors: caption::Colors,
 }
 
-impl State {
-    fn new(cfg: &Config) -> Self {
+impl TabBar {
+    pub fn new(cfg: &Config) -> Self {
+        let mut bar = Self {
+            ids: Vec::new(),
+            labels: Vec::new(),
+            active: 0,
+            bg: COLORREF(0),
+            active_bg: COLORREF(0),
+            inactive_bg: COLORREF(0),
+            text: COLORREF(0),
+            text_active: COLORREF(0),
+            radius: 0,
+            tab_w: TAB_MAX_W,
+            hover: None,
+            maximized: false,
+            window_active: true,
+            caption_colors: caption::Colors::new(
+                COLORREF(0),
+                COLORREF(0),
+                COLORREF(0),
+                COLORREF(0),
+            ),
+        };
+        bar.restyle(cfg);
+        bar
+    }
+
+    /// Re-read every theme value (config hot reload).
+    pub fn restyle(&mut self, cfg: &Config) {
         let c = |f: &dyn Fn(&crate::config::Theme) -> &str| {
             let (r, g, b) = cfg.color(f);
             COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32) // COLORREF = 0x00BBGGRR
         };
-        Self {
-            ids: Vec::new(),
-            labels: Vec::new(),
-            active: 0,
-            bg: c(&|t| &t.tabbar_background),
-            active_bg: c(&|t| &t.tab_active),
-            inactive_bg: c(&|t| &t.tab_inactive),
-            text: c(&|t| &t.tab_text),
-            text_active: c(&|t| &t.tab_text_active),
-            radius: cfg.theme.tab_radius.max(0),
-            tab_w: TAB_MAX_W,
-        }
+        self.bg = c(&|t| &t.tabbar_background);
+        self.active_bg = c(&|t| &t.tab_active);
+        self.inactive_bg = c(&|t| &t.tab_inactive);
+        self.text = c(&|t| &t.tab_text);
+        self.text_active = c(&|t| &t.tab_text_active);
+        self.radius = cfg.theme.tab_radius.max(0);
+        let symbol = c(&|t| &t.tabbar_text);
+        let bg = self.bg;
+        self.caption_colors = caption::Colors::new(
+            c(&|t| &t.caption_hover),
+            c(&|t| &t.caption_close_hover),
+            symbol,
+            dim(symbol, bg),
+        );
     }
 
-    /// Fit n tabs + the trailing "+" into the bar, clamped to [MIN, MAX].
-    fn fit(&mut self, bar_width: i32) {
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    /// Snapshot push from the app (caller invalidates the band afterwards).
+    pub fn update(
+        &mut self,
+        ids: &[u64],
+        labels: &[String],
+        active: usize,
+        cfg: &Config,
+        width: i32,
+    ) {
+        self.ids = ids.to_vec();
+        self.labels = labels.to_vec();
+        self.active = active;
+        self.restyle(cfg);
+        self.fit(width);
+    }
+
+    /// Caption-band state the strip paints but does not own. Returns true when
+    /// the caller must repaint.
+    pub fn set_chrome(
+        &mut self,
+        hover: Option<caption::Button>,
+        maximized: bool,
+        active: bool,
+    ) -> bool {
+        if self.hover == hover && self.maximized == maximized && self.window_active == active {
+            return false;
+        }
+        self.hover = hover;
+        self.maximized = maximized;
+        self.window_active = active;
+        true
+    }
+
+    pub fn hover(&self) -> Option<caption::Button> {
+        self.hover
+    }
+
+    /// Recompute tab widths for a new client width. Returns true on change.
+    pub fn fit(&mut self, width: i32) -> bool {
         let n = self.labels.len().max(1) as i32;
-        let avail = bar_width - PAD_LEFT - PLUS_SIZE - 8 - n * TAB_GAP;
-        self.tab_w = (avail / n).clamp(TAB_MIN_W, TAB_MAX_W);
+        let avail = width - PAD_LEFT - PLUS_SIZE - 8 - caption::WIDTH - n * TAB_GAP;
+        let want = (avail / n).clamp(TAB_MIN_W, TAB_MAX_W);
+        if want == self.tab_w {
+            return false;
+        }
+        self.tab_w = want;
+        true
     }
 
     fn tab_x(&self, i: usize) -> i32 {
@@ -87,131 +180,77 @@ impl State {
     fn plus_x(&self) -> i32 {
         self.tab_x(self.labels.len())
     }
-}
 
-/// Create the tab bar child window. Returns its HWND.
-pub fn create(parent: HWND, cfg: &Config) -> HWND {
-    unsafe {
-        register_class();
-        let state = Box::into_raw(Box::new(State::new(cfg)));
-        let hinstance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
-        CreateWindowExW(
-            Default::default(),
-            CLASS_NAME,
-            w!(""),
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            800,
-            28,
-            parent,
-            HMENU::default(),
-            hinstance,
-            Some(state as _),
-        )
-        .expect("tabbar create failed")
+    /// Client coords -> hit. `Band` for everything that is neither a tab nor a
+    /// button, so callers never re-derive "is this the drag area".
+    pub fn hit(&self, x: i32, y: i32, width: i32) -> Hit {
+        if let Some(b) = caption::hit(x, y, width) {
+            return Hit::Caption(b);
+        }
+        if !(0..caption::HEIGHT).contains(&y) {
+            return Hit::Band;
+        }
+        let n = self.labels.len() as i32;
+        // Trailing "+" button.
+        let plus_x = self.plus_x();
+        let plus_top = CENTER - PLUS_SIZE / 2;
+        if x >= plus_x && x <= plus_x + PLUS_SIZE && (plus_top..plus_top + PLUS_SIZE).contains(&y) {
+            return Hit::Plus;
+        }
+        if x < PAD_LEFT || y < TAB_TOP || n == 0 {
+            return Hit::Band;
+        }
+        let i = (x - PAD_LEFT) / (self.tab_w + TAB_GAP);
+        if i < 0 || i >= n {
+            return Hit::Band;
+        }
+        let tab_left = self.tab_x(i as usize);
+        if x > tab_left + self.tab_w {
+            return Hit::Band; // in the gap between tabs
+        }
+        // Close box occupies the tab's right edge.
+        let close_left = tab_left + self.tab_w - CLOSE_BOX - 4;
+        if x >= close_left {
+            Hit::Close(i as usize)
+        } else {
+            Hit::Tab(i as usize)
+        }
     }
-}
 
-/// Push a new snapshot into the tab bar and repaint.
-pub fn update(hwnd: HWND, ids: &[u64], labels: &[String], active: usize, cfg: &Config) {
-    unsafe {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
-        if ptr.is_null() {
-            return;
-        }
-        // Mutate in place: the allocation is owned by GWLP_USERDATA, not by us.
-        let st = &mut *ptr;
-        let colors = State::new(cfg);
-        st.ids = ids.to_vec();
-        st.labels = labels.to_vec();
-        st.active = active;
-        st.bg = colors.bg;
-        st.active_bg = colors.active_bg;
-        st.inactive_bg = colors.inactive_bg;
-        st.text = colors.text;
-        st.text_active = colors.text_active;
-        st.radius = colors.radius;
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-        st.fit(rc.right);
-        let _ = InvalidateRect(hwnd, None, false);
-    }
-}
-
-unsafe fn state_from(hwnd: HWND) -> &'static mut State {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
-    &mut *ptr
-}
-
-fn register_class() {
-    static REGISTERED: std::sync::Once = std::sync::Once::new();
-    REGISTERED.call_once(|| unsafe {
-        let hinstance = GetModuleHandleW(None).unwrap();
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinstance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
-            lpszClassName: CLASS_NAME,
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            ..Default::default()
-        };
-        let atom = RegisterClassExW(&wc);
-        if atom == 0 {
-            tracing::error!("tabbar class registration failed");
-        }
-    });
-}
-
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
-        windows::Win32::UI::WindowsAndMessaging::WM_CREATE => {
-            // Receive the State pointer passed via CreateWindowExW lpParam and
-            // store it in GWLP_USERDATA. Without this, WM_PAINT would deref null.
-            let cs = lp.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
-            let state = (*cs).lpCreateParams as *mut State;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as _);
-            LRESULT(0)
-        }
-        WM_PAINT => {
-            let st = state_from(hwnd);
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let rc = RECT {
-                left: ps.rcPaint.left,
-                top: ps.rcPaint.top,
-                right: ps.rcPaint.right,
-                bottom: ps.rcPaint.bottom,
-            };
-            let _ = FillRect(hdc, &rc, CreateSolidBrush(st.bg));
+    /// Paint the whole band. `width` is the client width. The caller has
+    /// already erased the background; painting the band again keeps it correct
+    /// when only the strip is invalidated.
+    pub fn paint(&self, hdc: HDC, width: i32) {
+        let band = RECT { left: 0, top: 0, right: width, bottom: caption::HEIGHT };
+        unsafe {
+            let brush = CreateSolidBrush(self.bg);
+            let _ = FillRect(hdc, &band, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
 
             let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
             let old_font = SelectObject(hdc, HGDIOBJ(font.0));
             let _ = SetBkMode(hdc, TRANSPARENT);
 
-            for (i, label) in st.labels.iter().enumerate() {
-                let x = st.tab_x(i);
-                if x + st.tab_w < ps.rcPaint.left || x > ps.rcPaint.right {
-                    continue; // clip
-                }
+            for (i, label) in self.labels.iter().enumerate() {
+                let x = self.tab_x(i);
                 let tab_rc = RECT {
                     left: x,
-                    top: 3,
-                    right: x + st.tab_w,
-                    bottom: TAB_HEIGHT,
+                    top: TAB_TOP,
+                    right: x + self.tab_w,
+                    bottom: TAB_BOTTOM,
                 };
-                let bg = if i == st.active { st.active_bg } else { st.inactive_bg };
-                fill_round(hdc, &tab_rc, bg, st.radius);
+                let bg = if i == self.active { self.active_bg } else { self.inactive_bg };
+                fill_round(hdc, &tab_rc, bg, self.radius, true);
 
-                // Close (X) button on the tab's right edge.
+                // Close (X) on the tab's right edge.
+                let cy = (tab_rc.top + tab_rc.bottom) / 2;
                 let close_rc = RECT {
                     left: tab_rc.right - CLOSE_BOX - 4,
-                    top: 6,
+                    top: cy - CLOSE_BOX / 2,
                     right: tab_rc.right - 4,
-                    bottom: TAB_HEIGHT - 4,
+                    bottom: cy + CLOSE_BOX / 2,
                 };
-                let fg = if i == st.active { st.text_active } else { st.text };
+                let fg = if i == self.active { self.text_active } else { self.text };
                 let _ = SetTextColor(hdc, fg);
                 let _ = DrawTextW(
                     hdc,
@@ -220,7 +259,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );
 
-                // Label text, clipped to leave room for the X button.
+                // Label, clipped to leave room for the X.
                 let mut wide = to_wide(label);
                 let mut text_rc = RECT {
                     left: tab_rc.left + 8,
@@ -235,128 +274,61 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 );
             }
 
-            // Trailing "+" (new tab): its own pill so it reads as a button.
-            let plus_x = st.plus_x();
+            // Trailing "+": its own pill so it reads as a button.
+            let plus_x = self.plus_x();
             let plus_rc = RECT {
                 left: plus_x,
-                top: 3,
+                top: CENTER - PLUS_SIZE / 2,
                 right: plus_x + PLUS_SIZE,
-                bottom: TAB_HEIGHT,
+                bottom: CENTER + PLUS_SIZE / 2,
             };
-            fill_round(hdc, &plus_rc, st.inactive_bg, st.radius);
-            let _ = SetTextColor(hdc, st.text_active);
+            fill_round(hdc, &plus_rc, self.inactive_bg, self.radius, false);
+            let _ = SetTextColor(hdc, self.text_active);
             let _ = DrawTextW(
                 hdc,
                 &mut to_wide("+"),
                 &mut { RECT { ..plus_rc } },
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
-            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old_font);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
+
+            let _ = SelectObject(hdc, old_font);
+            // Caption buttons last: chrome must never be under a tab that
+            // overflowed into their corner.
+            caption::paint(
+                hdc,
+                width,
+                self.hover,
+                self.maximized,
+                self.window_active,
+                &self.caption_colors,
+            );
         }
-        WM_LBUTTONDOWN => {
-            let st = state_from(hwnd);
-            let hit = hit_test(lp, st);
-            let parent = GetParent(hwnd).unwrap();
-            // Resolve the id at click time: the parent's tab list can change
-            // before the posted message is dispatched, an index cannot.
-            match hit {
-                Some(Hit::Close(i)) => {
-                    if let Some(id) = st.ids.get(i) {
-                        let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(*id as isize));
-                    }
-                }
-                Some(Hit::Plus) => {
-                    let _ = PostMessageW(parent, WM_APP_TAB_NEW, WPARAM(0), LPARAM(0));
-                }
-                Some(Hit::Tab(i)) => {
-                    if let Some(id) = st.ids.get(i) {
-                        let _ =
-                            PostMessageW(parent, WM_APP_TAB_ACTIVATED, WPARAM(0), LPARAM(*id as isize));
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-        windows::Win32::UI::WindowsAndMessaging::WM_SIZE => {
-            // Tabs fill the bar; recompute and repaint on every resize.
-            //
-            // Ask the window, do not decode the message: wParam is the
-            // SIZE_* kind (0 = restored, 2 = maximized), the new size is in
-            // lParam. Reading wParam here fed `0` into fit(), which clamped
-            // to TAB_MIN_W — that is why the tabs snapped narrow the first
-            // time the window was maximized and never recovered.
-            let mut rc = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rc);
-            let st = state_from(hwnd);
-            st.fit(rc.right);
-            let _ = InvalidateRect(hwnd, None, false);
-            LRESULT(0)
-        }
-        WM_MBUTTONUP => {
-            let st = state_from(hwnd);
-            if let Some(Hit::Tab(i)) = hit_test(lp, st) {
-                if let Some(id) = st.ids.get(i) {
-                    let parent = GetParent(hwnd).unwrap();
-                    let _ = PostMessageW(parent, WM_APP_TAB_CLOSE, WPARAM(0), LPARAM(*id as isize));
-                }
-            }
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
-/// lParam of WM_*BUTTON*: x/y client coords -> hit region.
-fn hit_test(lp: LPARAM, st: &State) -> Option<Hit> {
-    let x = (lp.0 as u16) as i32; // loword
-    let y = ((lp.0 >> 16) as u16) as i32; // hiword
-    if x < 0 || y > TAB_HEIGHT + 4 {
-        return None;
-    }
-    let n = st.labels.len() as i32;
-    // Trailing "+" button.
-    let plus_x = st.plus_x();
-    if x >= plus_x && x <= plus_x + PLUS_SIZE {
-        return Some(Hit::Plus);
-    }
-    if x < PAD_LEFT {
-        return None;
-    }
-    let i = (x - PAD_LEFT) / (st.tab_w + TAB_GAP);
-    if i < 0 || i >= n {
-        return None;
-    }
-    let tab_left = st.tab_x(i as usize);
-    if x > tab_left + st.tab_w {
-        return None; // in the gap between tabs
-    }
-    // Close box occupies the tab's right edge.
-    let close_left = tab_left + st.tab_w - CLOSE_BOX - 4;
-    if x >= close_left && y >= 4 {
-        Some(Hit::Close(i as usize))
-    } else {
-        Some(Hit::Tab(i as usize))
-    }
+/// Blend towards the band background: the "window is inactive" glyph colour.
+fn dim(fg: COLORREF, bg: COLORREF) -> COLORREF {
+    let mix = |f: u32, b: u32| (f * 45 + b * 55) / 100;
+    let fg_r = fg.0 & 0xff;
+    let fg_g = (fg.0 >> 8) & 0xff;
+    let fg_b = (fg.0 >> 16) & 0xff;
+    let bg_r = bg.0 & 0xff;
+    let bg_g = (bg.0 >> 8) & 0xff;
+    let bg_b = (bg.0 >> 16) & 0xff;
+    COLORREF(mix(fg_r, bg_r) | mix(fg_g, bg_g) << 8 | mix(fg_b, bg_b) << 16)
 }
 
-/// Rounded fill: the theme's `tab_radius` was silently ignored while the tab
-/// bar only had FillRect.
-unsafe fn fill_round(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT, color: COLORREF, radius: i32) {
+/// Rounded fill. `square_bottom` is the Chrome tab shape: rounding on the top
+/// corners only, the tab sits flush on the content area. The region is drawn
+/// taller than the rect and clipped by the band, which squares the bottom
+/// corners without a second region.
+unsafe fn fill_round(hdc: HDC, rc: &RECT, color: COLORREF, radius: i32, square_bottom: bool) {
     let brush = CreateSolidBrush(color);
     if radius <= 0 {
         let _ = FillRect(hdc, rc, brush);
     } else {
-        let rgn = CreateRoundRectRgn(
-            rc.left,
-            rc.top,
-            rc.right + 1,
-            rc.bottom + 1,
-            radius * 2,
-            radius * 2,
-        );
+        let bottom = if square_bottom { rc.bottom + radius + 1 } else { rc.bottom + 1 };
+        let rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, bottom, radius * 2, radius * 2);
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(HGDIOBJ(rgn.0));
     }

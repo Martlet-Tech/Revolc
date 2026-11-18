@@ -1,3 +1,5 @@
+pub mod caption;
+pub mod dwm;
 pub mod icon;
 pub mod tabbar;
 pub mod tray;
@@ -5,25 +7,31 @@ pub mod tray;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, RedrawWindow, UpdateWindow, HBRUSH,
-    HDC, HGDIOBJ, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    RedrawWindow, ScreenToClient, UpdateWindow, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, RDW_ALLCHILDREN,
+    RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
+};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible, IsZoomed, LoadCursorW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
-    CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
-    SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNORMAL,
-    WNDCLASSEXW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_SETICON,
-    WM_KEYDOWN, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindowVisible,
+    IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
+    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL,
+    HTCAPTION, HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP,
+    HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, NCCALCSIZE_PARAMS,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT,
+    WM_SETICON, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
 use crate::config::ConfigHandle;
@@ -32,13 +40,6 @@ use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
 
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
-/// lParam = tab **id** (not index). The tab bar posts these from a click, and
-/// by the time the message is dispatched the list may already have shrunk (a
-/// sweep dropped a dead view); an index would then act on the wrong tab.
-pub const WM_APP_TAB_ACTIVATED: u32 = 0x8001;
-/// lParam = tab id, see WM_APP_TAB_ACTIVATED.
-pub const WM_APP_TAB_CLOSE: u32 = 0x8002;
-pub const WM_APP_TAB_NEW: u32 = 0x8003; // lParam unused
 /// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
 /// handler and `--shutdown` post this) need their own message.
@@ -54,7 +55,7 @@ fn absorb_msg() -> u32 {
     })
 }
 
-const TABBAR_HEIGHT: i32 = 28;
+const TABBAR_HEIGHT: i32 = caption::HEIGHT;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 
 /// Stray-window sweep. The BHO notify is a hint, not a guarantee: SetSite
@@ -136,8 +137,13 @@ pub(crate) struct App {
     /// compares this and re-lays out instead of leaving the view at its old
     /// size under a newly sized host.
     last_client: (i32, i32),
-    tabbar_hwnd: HWND,
+    /// The title bar: painted here, hit-tested here (see ui/tabbar.rs).
+    tabbar: tabbar::TabBar,
     main_hwnd: HWND,
+    /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
+    /// run, and it is the only way to drop a hover that the cursor walked out
+    /// of without a further hit test.
+    hover_tracking: bool,
 }
 
 pub struct MainWindow {
@@ -159,7 +165,9 @@ impl MainWindow {
                 hIcon: icon::big(),
                 hIconSm: icon::small(),
                 lpszClassName: CLASS_NAME,
-                style: CS_HREDRAW | CS_VREDRAW,
+                // CS_DBLCLKS: double-click on the empty strip toggles maximize,
+                // which only works if the class receives WM_LBUTTONDBLCLK.
+                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
                 hbrBackground: HBRUSH(std::ptr::null_mut()),
                 ..Default::default()
             };
@@ -174,9 +182,18 @@ impl MainWindow {
                 Default::default(),
                 CLASS_NAME,
                 w!("Revolc"),
-                // WS_CLIPCHILDREN: our WM_ERASEBKGND sweep must not paint over
-                // the tab bar or the absorbed Explorer window.
-                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                // Chrome-style integrated title bar (spec §4.2.1): no
+                // WS_CAPTION at all. WS_THICKFRAME is kept only for the
+                // resize/snap behaviour and the DWM shadow — WM_NCCALCSIZE
+                // hands the entire frame to us, so the frame is invisible.
+                // WS_CLIPCHILDREN: erasing the window must not paint over the
+                // absorbed Explorer window (the strip is ours to paint).
+                WS_POPUP
+                    | WS_THICKFRAME
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX
+                    | WS_SYSMENU
+                    | WS_CLIPCHILDREN,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 1000,
@@ -186,6 +203,10 @@ impl MainWindow {
                 hinstance,
                 Some(args as _),
             )?;
+
+            // Frameless windows get square corners from DWM on Win11 unless
+            // asked otherwise; every native app here is rounded.
+            dwm::round_corners(hwnd);
 
             // Allow the BHO notify message through UIPI: when Revolc runs
             // elevated (launched from an admin terminal), Explorer's lower-IL
@@ -241,7 +262,7 @@ unsafe fn app_from(hwnd: HWND) -> &'static mut App {
 
 impl App {
     fn build(hwnd: HWND, args: Box<WindowArgs>) -> Box<App> {
-        let tabbar_hwnd = tabbar::create(hwnd, &args.cfg.get());
+        let tabbar = tabbar::TabBar::new(&args.cfg.get());
         let mut app = Box::new(App {
             cfg: args.cfg,
             keymap: events::default_keymap(),
@@ -258,8 +279,9 @@ impl App {
             discard: Vec::new(),
             laid_out: None,
             last_client: (0, 0),
-            tabbar_hwnd,
+            tabbar,
             main_hwnd: hwnd,
+            hover_tracking: false,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -312,7 +334,15 @@ impl App {
         }
     }
 
-    fn sync_tabbar(&self) {
+    fn client(&self) -> RECT {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.main_hwnd, &mut rc);
+        }
+        rc
+    }
+
+    fn sync_tabbar(&mut self) {
         let ids: Vec<u64> = self.tabs.iter_all().map(|t| t.id).collect();
         let labels: Vec<String> = self
             .tabs
@@ -325,13 +355,89 @@ impl App {
                 }
             })
             .collect();
-        tabbar::update(
-            self.tabbar_hwnd,
-            &ids,
-            &labels,
-            self.tabs.active_index(),
-            &self.cfg.get(),
-        );
+        let width = self.client().right;
+        self.tabbar
+            .update(&ids, &labels, self.tabs.active_index(), &self.cfg.get(), width);
+        self.invalidate_band();
+        // With no caption there is nothing left that shows the current folder
+        // outside the strip itself, so the taskbar tooltip / Alt-Tab entry take
+        // the active tab's name — same as a browser.
+        let title = if labels.is_empty() {
+            "Revolc".to_string()
+        } else {
+            labels[self.tabs.active_index().min(labels.len() - 1)].clone()
+        };
+        unsafe {
+            let _ = SetWindowTextW(self.main_hwnd, &HSTRING::from(title));
+        }
+        self.sync_chrome();
+    }
+
+    fn is_maximized(&self) -> bool {
+        unsafe { IsZoomed(self.main_hwnd).as_bool() }
+    }
+
+    /// Maximize/restore without `SW_RESTORE`'s side effect of also undoing a
+    /// minimize (see surface()).
+    fn toggle_maximize(&mut self) {
+        let cmd = if self.is_maximized() { SW_RESTORE } else { SW_SHOWMAXIMIZED };
+        unsafe {
+            let _ = ShowWindow(self.main_hwnd, cmd);
+        }
+    }
+
+    /// Repaint only the caption band. Hover and tab changes touch nothing else,
+    /// and a full-window invalidate would drag the absorbed Explorer child into
+    /// the update twice per mouse move.
+    fn invalidate_band(&self) {
+        let rc = self.client();
+        let band = RECT { left: 0, top: 0, right: rc.right, bottom: TABBAR_HEIGHT };
+        unsafe {
+            let _ = InvalidateRect(self.main_hwnd, Some(&band), false);
+        }
+    }
+
+    /// Pull maximize/active state into the strip (glyphs depend on both).
+    fn sync_chrome(&mut self) {
+        let maximized = self.is_maximized();
+        let active = self.active;
+        if self.tabbar.set_chrome(self.tabbar.hover(), maximized, active) {
+            self.invalidate_band();
+        }
+    }
+
+    /// Track which caption button the cursor is over. Driven from
+    /// WM_NCHITTEST: that is the one place every mouse move passes through,
+    /// whether the point resolves to a client area (tabs) or a non-client one
+    /// (caption buttons).
+    fn update_hover(&mut self, x: i32, y: i32, width: i32) {
+        let want = caption::hit(x, y, width);
+        let maximized = self.is_maximized();
+        let active = self.active;
+        if self.tabbar.set_chrome(want, maximized, active) {
+            self.invalidate_band();
+        }
+        if want.is_some() && !self.hover_tracking {
+            self.hover_tracking = true;
+            unsafe {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE | TME_NONCLIENT,
+                    hwndTrack: self.main_hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+        }
+    }
+
+    fn clear_hover(&mut self) {
+        self.hover_tracking = false;
+        let maximized = self.is_maximized();
+        let active = self.active;
+        if self.tabbar.set_chrome(None, maximized, active) {
+            self.invalidate_band();
+        }
     }
 
     /// Index of the tab with `id`, if it still exists.
@@ -828,27 +934,15 @@ impl App {
     fn layout(&mut self) {
         let rc = self.view_rect();
         self.last_client = (rc.right, rc.bottom);
-        unsafe {
-            let _ = MoveWindow(self.tabbar_hwnd, 0, 0, rc.right, TABBAR_HEIGHT, true);
-            // Keep the bar above the absorbed Explorer child: a new child is
-            // created with HWND_TOP and would otherwise cover the tabs.
-            let _ = SetWindowPos(
-                self.tabbar_hwnd,
-                HWND_TOP,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            // Paint the bar NOW. Leaving it to the message queue is what
-            // produced the black rectangle on the right of the tabs after a
-            // maximize: the host had already grown and erased (clipping out
-            // child rects), the tab bar was resized in the same WM_SIZE, and
-            // until its WM_PAINT was dispatched that strip had neither a host
-            // background nor bar pixels — DWM composites it black.
-            let _ = InvalidateRect(self.tabbar_hwnd, None, true);
-            let _ = UpdateWindow(self.tabbar_hwnd);
-        }
+        // Tab widths follow the client width; the band itself is painted by our
+        // own WM_PAINT, so there is no child to move or raise any more (the old
+        // HWND_TOP shuffle against the absorbed Explorer child is gone with it).
+        self.tabbar.fit(rc.right);
         self.laid_out = None;
         self.place_active();
+        // The strip must be painted **now**, synchronously: leaving it to the
+        // message queue is what produced the black rectangle right of the tabs
+        // after a maximize (host already grown and erased, band not yet drawn).
         self.redraw_all();
     }
 
@@ -1015,9 +1109,6 @@ impl App {
             .unwrap_or(0);
         for child in host::child_windows(self.main_hwnd) {
             let raw = child.0 as isize;
-            if raw == self.tabbar_hwnd.0 as isize {
-                continue;
-            }
             if self.views.iter().flatten().any(|v| v.top.0 as isize == raw) {
                 continue; // tracked; visibility already handled above
             }
@@ -1033,14 +1124,6 @@ impl App {
         }
 
         self.place_active();
-        unsafe {
-            let _ = SetWindowPos(
-                self.tabbar_hwnd,
-                HWND_TOP,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
     }
 
     /// Layout ground truth in the log: main client, tab bar and every child
@@ -1053,7 +1136,6 @@ impl App {
         tracing::info!(
             why,
             client = ?(rc.left, rc.top, rc.right, rc.bottom),
-            tabbar = ?host::rect_in_parent(self.tabbar_hwnd),
             views = self.views.len(),
             "layout"
         );
@@ -1086,6 +1168,14 @@ impl App {
 fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
     let already = attached_tid != 0 && attached_tid == host::thread_of(v.top);
     host::focus_into(main, v.top, already);
+}
+
+/// x/y out of a mouse message's lParam, sign-extended (screen coords can be
+/// negative on a monitor to the left of the primary).
+fn point_from_lparam(lp: LPARAM) -> (i32, i32) {
+    let x = (lp.0 as u16) as i16 as i32;
+    let y = ((lp.0 >> 16) as u16) as i16 as i32;
+    (x, y)
 }
 
 fn home_dir() -> String {
@@ -1139,10 +1229,185 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             PostQuitMessage(0);
             LRESULT(0)
         }
+        // The window has no non-client area at all: the client rect *is* the
+        // window rect. Returning 0 (not calling DefWindowProc) is what removes
+        // the frame — the tab bar is the caption now.
+        WM_NCCALCSIZE => {
+            // lParam is NCCALCSIZE_PARAMS for wParam != 0, a bare RECT
+            // otherwise. Both describe "the proposed client rect"; we accept it
+            // untouched, which is exactly "client area == window rect".
+            if wp.0 != 0 {
+                // A maximized WS_THICKFRAME window is laid out with its
+                // invisible border hanging off-screen; without this inset the
+                // content would be clipped by that border on all four sides.
+                if IsZoomed(hwnd).as_bool() {
+                    let params = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+                    let fx = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    let fy = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    params.rgrc[0].left += fx;
+                    params.rgrc[0].right -= fx;
+                    params.rgrc[0].top += fy;
+                    params.rgrc[0].bottom -= fy;
+                }
+            }
+            LRESULT(0)
+        }
+        // Everything the pointer can hit in the caption band is answered here.
+        //
+        // This has to be the toplevel: a child window cannot produce a
+        // non-client hit (`HTTRANSPARENT` only forwards a *client* hit, and
+        // user32 then re-asks the child in a loop). Coming from here instead
+        // gives native drag (`HTCAPTION`), native double-click maximize and
+        // Win11 Snap Layouts (`HTMAXBUTTON`), all via DefWindowProc.
+        WM_NCHITTEST => {
+            let app = app_from(hwnd);
+            let (sx, sy) = point_from_lparam(lp);
+            let mut pt = POINT { x: sx, y: sy };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let cr = app.client();
+            // Resize borders are ours to answer now that there is no
+            // non-client area left. Skipped while maximized: the frame hangs
+            // off-screen there, so the screen edge must not answer "resize".
+            if !app.is_maximized() {
+                const BORDER: i32 = 6;
+                const TOP_BORDER: i32 = 4;
+                let left = pt.x < BORDER;
+                let right = pt.x >= cr.right - BORDER;
+                let top = pt.y < TOP_BORDER;
+                let bottom = pt.y >= cr.bottom - BORDER;
+                let code = match (left, right, top, bottom) {
+                    (true, _, true, _) => Some(HTTOPLEFT),
+                    (_, true, true, _) => Some(HTTOPRIGHT),
+                    (true, _, _, true) => Some(HTBOTTOMLEFT),
+                    (_, true, _, true) => Some(HTBOTTOMRIGHT),
+                    (true, _, _, _) => Some(HTLEFT),
+                    (_, true, _, _) => Some(HTRIGHT),
+                    (_, _, true, _) => Some(HTTOP),
+                    (_, _, _, true) => Some(HTBOTTOM),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    app.update_hover(-1, -1, cr.right);
+                    return LRESULT(code as isize);
+                }
+            }
+            // Hover tracking rides on the hit test: every mouse move gets one,
+            // whether the point ends up client or non-client.
+            app.update_hover(pt.x, pt.y, cr.right);
+            match app.tabbar.hit(pt.x, pt.y, cr.right) {
+                tabbar::Hit::Caption(b) => LRESULT(b.hit_code() as isize),
+                // Empty strip = caption. Below the band there must be no
+                // HTCAPTION: while a tab is still reserved there is no child
+                // covering the content, and the whole window would drag.
+                tabbar::Hit::Band if pt.y < TABBAR_HEIGHT => LRESULT(HTCAPTION as isize),
+                _ => LRESULT(HTCLIENT as isize),
+            }
+        }
+        // We paint the caption band ourselves, so the default frame painting
+        // must stay out of the way (returning TRUE = "handled").
+        WM_NCACTIVATE => {
+            let app = app_from(hwnd);
+            if wp.0 == 0 {
+                app.clear_hover();
+            }
+            let maximized = app.is_maximized();
+            if app.tabbar.set_chrome(app.tabbar.hover(), maximized, wp.0 != 0) {
+                app.invalidate_band();
+            }
+            LRESULT(1)
+        }
+        // The cursor walked out of the window (or its caption band) without
+        // another hit test: drop the hover highlight.
+        WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
+            app_from(hwnd).clear_hover();
+            LRESULT(0)
+        }
+        // The strip is our own client area now, so its clicks arrive here.
+        // Anything that is not a control starts a window drag the native way.
+        windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN => {
+            let app = app_from(hwnd);
+            let (x, y) = point_from_lparam(lp);
+            let width = app.client().right;
+            match app.tabbar.hit(x, y, width) {
+                tabbar::Hit::Tab(i) => {
+                    if let Some(id) = app.tabbar.ids().get(i).copied() {
+                        if let Some(i) = app.index_of(id) {
+                            app.activate(i);
+                        }
+                    }
+                }
+                tabbar::Hit::Close(i) => {
+                    if let Some(id) = app.tabbar.ids().get(i).copied() {
+                        if let Some(i) = app.index_of(id) {
+                            app.close_tab(i);
+                        }
+                    }
+                }
+                tabbar::Hit::Plus => {
+                    let path = app.active_folder_path();
+                    app.new_tab(path);
+                }
+                tabbar::Hit::Band => {
+                    // Drag the whole window from the empty strip, the way a
+                    // caption would. DefWindowProc owns the move loop.
+                    let mut sp = POINT { x, y };
+                    unsafe {
+                        let _ = ClientToScreen(hwnd, &mut sp);
+                        let _ = ReleaseCapture();
+                        SendMessageW(
+                            hwnd,
+                            windows::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN,
+                            WPARAM(HTCAPTION as usize),
+                            LPARAM(sp.x as isize | (sp.y as isize) << 16),
+                        );
+                    }
+                }
+                tabbar::Hit::Caption(_) => {}
+            }
+            LRESULT(0)
+        }
+        // Double click on the empty strip = maximize / restore, matching what
+        // a real caption does (the window class needs CS_DBLCLKS for this).
+        WM_LBUTTONDBLCLK => {
+            let app = app_from(hwnd);
+            let (x, y) = point_from_lparam(lp);
+            let width = app.client().right;
+            if app.tabbar.hit(x, y, width) == tabbar::Hit::Band {
+                app.toggle_maximize();
+            }
+            LRESULT(0)
+        }
+        // Middle click on a tab closes it (spec §3.1).
+        WM_MBUTTONUP => {
+            let app = app_from(hwnd);
+            let (x, y) = point_from_lparam(lp);
+            let width = app.client().right;
+            if let tabbar::Hit::Tab(i) = app.tabbar.hit(x, y, width) {
+                if let Some(id) = app.tabbar.ids().get(i).copied() {
+                    if let Some(i) = app.index_of(id) {
+                        app.close_tab(i);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        // The caption band is the only part of the client we paint; every other
+        // pixel belongs to the absorbed Explorer child (WS_CLIPCHILDREN keeps
+        // the two apart).
+        WM_PAINT => {
+            let app = app_from(hwnd);
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            app.tabbar.paint(hdc, app.client().right);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
         WM_SIZE => {
             let app = app_from(hwnd);
             app.layout();
             app.dump_layout("WM_SIZE");
+            // Maximize state drives the restore glyph in the caption buttons.
+            app.sync_chrome();
             // The main window has no background brush, so anything the tab
             // area does not cover keeps the *previous* frame's pixels: after
             // maximize/restore that shows up as a duplicate tab bar and black
@@ -1227,6 +1492,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // low word: WA_INACTIVE(0) / WA_ACTIVE(1) / WA_CLICKACTIVE(2)
             app.active = (wp.0 & 0xffff) as u32 != 0;
             app.sync_input_queue();
+            app.sync_chrome();
             if app.active {
                 if let Some(Some(v)) = app.views.get(app.tabs.active_index()) {
                     focus_view(app.main_hwnd, app.attached_tid, v);
@@ -1236,27 +1502,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         m if m == WM_APP_CONFIG_CHANGED => {
             app_from(hwnd).sync_tabbar();
-            LRESULT(0)
-        }
-        m if m == WM_APP_TAB_ACTIVATED => {
-            let app = app_from(hwnd);
-            if let Some(i) = app.index_of(lp.0 as u64) {
-                app.activate(i);
-            }
-            LRESULT(0)
-        }
-        m if m == WM_APP_TAB_CLOSE => {
-            let app = app_from(hwnd);
-            // Gone already (dropped by a sweep or closed twice): nothing to do.
-            if let Some(i) = app.index_of(lp.0 as u64) {
-                app.close_tab(i);
-            }
-            LRESULT(0)
-        }
-        m if m == WM_APP_TAB_NEW => {
-            let app = app_from(hwnd);
-            let path = app.active_folder_path();
-            app.new_tab(path);
             LRESULT(0)
         }
         m if m == WM_TIMER && wp.0 == SWEEP_TIMER_ID => {

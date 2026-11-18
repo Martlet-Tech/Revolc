@@ -70,7 +70,11 @@
 ### 4.2.1 Chrome 式一体化标题栏（用户明确要求，高优先）
 - tab 条与窗口按钮（最小化 `_` / 最大化 `□` / 关闭 `X`）在同一行，浏览器风格
 - 实现方向：去掉系统标题栏（WS_POPUP + 自绘客户区 + WM_NCHITTEST 自定义拖拽/按钮区）
-- M0 不做；列入 M4 主题系统范围
+- **实现于 M3 第一阶段**（2026-11-18，分支 `m3-integrated-titlebar`）：
+  `WS_POPUP|WS_THICKFRAME|WS_MIN/MAXBOX|WS_SYSMENU` + `WM_NCCALCSIZE` 返回 0，
+  标题栏与 tab 条由主窗口自绘（`ui/tabbar.rs` + `ui/caption.rs`），
+  `WM_NCHITTEST` 出 `HTCAPTION`/`HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` 与缩放边框。
+  原计划放 M4，现提前；M4 只做主题化（配色/圆角半径/暗色）
 
 ### 4.3 布局
 - tab 条 + 可选书签栏 + Shell 视图填充剩余区域
@@ -92,7 +96,7 @@
   - M0：主窗口 + tab 条 + Shell 视图嵌入 + 配置文件热重载骨架（架构成立性验证）
   - M1：会话持久化 + 崩溃恢复
   - M2：书签栏
-  - M3：tab 拖拽分窗/合并
+  - M3：一体化标题栏（第一阶段，已完成）+ tab 拖拽分窗/合并（第二阶段）
   - M4：主题系统（含圆角/透明与降级）
   - M5：安装包（x64+x86）+ 更新检查
   - M6：文件夹打开接管（§7；redirect 默认推荐，associate 为高级可选项）
