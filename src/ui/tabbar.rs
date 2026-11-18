@@ -14,9 +14,9 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FillRgn, GetStockObject,
-    SelectObject, SetBkMode, SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_END_ELLIPSIS,
-    DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, TRANSPARENT,
+    CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+    FillRect, FillRgn, GetStockObject, SelectObject, SetBkMode, SetTextColor, HDC, HFONT, HGDIOBJ,
+    DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
 };
 
 use crate::config::Config;
@@ -240,7 +240,7 @@ impl TabBar {
                     bottom: TAB_BOTTOM,
                 };
                 let bg = if i == self.active { self.active_bg } else { self.inactive_bg };
-                fill_round(hdc, &tab_rc, bg, self.radius, true);
+                fill_tab(hdc, &tab_rc, bg, self.radius);
 
                 // Close (X) on the tab's right edge.
                 let cy = (tab_rc.top + tab_rc.bottom) / 2;
@@ -282,7 +282,7 @@ impl TabBar {
                 right: plus_x + PLUS_SIZE,
                 bottom: CENTER + PLUS_SIZE / 2,
             };
-            fill_round(hdc, &plus_rc, self.inactive_bg, self.radius, false);
+            fill_round(hdc, &plus_rc, self.inactive_bg, self.radius);
             let _ = SetTextColor(hdc, self.text_active);
             let _ = DrawTextW(
                 hdc,
@@ -318,20 +318,65 @@ fn dim(fg: COLORREF, bg: COLORREF) -> COLORREF {
     COLORREF(mix(fg_r, bg_r) | mix(fg_g, bg_g) << 8 | mix(fg_b, bg_b) << 16)
 }
 
-/// Rounded fill. `square_bottom` is the Chrome tab shape: rounding on the top
-/// corners only, the tab sits flush on the content area. The region is drawn
-/// taller than the rect and clipped by the band, which squares the bottom
-/// corners without a second region.
-unsafe fn fill_round(hdc: HDC, rc: &RECT, color: COLORREF, radius: i32, square_bottom: bool) {
+/// All four corners rounded (the "+" pill).
+unsafe fn fill_round(hdc: HDC, rc: &RECT, color: COLORREF, radius: i32) {
     let brush = CreateSolidBrush(color);
     if radius <= 0 {
         let _ = FillRect(hdc, rc, brush);
     } else {
-        let bottom = if square_bottom { rc.bottom + radius + 1 } else { rc.bottom + 1 };
-        let rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, bottom, radius * 2, radius * 2);
+        let rgn = CreateRoundRectRgn(
+            rc.left,
+            rc.top,
+            rc.right + 1,
+            rc.bottom + 1,
+            radius * 2,
+            radius * 2,
+        );
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(HGDIOBJ(rgn.0));
     }
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// Chrome tab shape: **two rounded top corners, two square bottom ones**, in a
+/// single region.
+///
+/// The previous trick — draw a rounded rect taller than the tab and let the
+/// band (or the Explorer child) clip the bottom rounding away — only looked
+/// right as long as something opaque sat directly below the tab. With a tab
+/// that does not touch the content edge (multi-row tabs, a future tab strip
+/// above a bookmark bar) the rounding would show up as two notches.
+///
+/// Instead: a round rect tall enough that its bottom rounding falls *below*
+/// the tab, intersected with the tab's own rect. What survives is the top
+/// rounding plus a straight cut at `rc.bottom`.
+unsafe fn fill_tab(hdc: HDC, rc: &RECT, color: COLORREF, radius: i32) {
+    let brush = CreateSolidBrush(color);
+    if radius <= 0 {
+        let _ = FillRect(hdc, rc, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+        return;
+    }
+    let rounded = CreateRoundRectRgn(
+        rc.left,
+        rc.top,
+        rc.right + 1,
+        rc.bottom + radius + 1, // bottom corners land below the tab
+        radius * 2,
+        radius * 2,
+    );
+    let cut = CreateRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1);
+    let shape = CreateRectRgn(0, 0, 0, 0);
+    // ERROR (0) / NULLREGION (1) / SIMPLEREGION (2) / COMPLEXREGION (3)
+    if CombineRgn(shape, rounded, cut, RGN_AND).0 > 1 {
+        let _ = FillRgn(hdc, shape, brush);
+    } else {
+        // Region ops failed (no memory): a square tab beats no tab at all.
+        let _ = FillRect(hdc, rc, brush);
+    }
+    let _ = DeleteObject(HGDIOBJ(rounded.0));
+    let _ = DeleteObject(HGDIOBJ(cut.0));
+    let _ = DeleteObject(HGDIOBJ(shape.0));
     let _ = DeleteObject(HGDIOBJ(brush.0));
 }
 
