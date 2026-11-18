@@ -15,16 +15,22 @@
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    FillRect, FillRgn, GetStockObject, SelectObject, SetBkMode, SetTextColor, HDC, HFONT, HGDIOBJ,
-    DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
+    FillRect, FillRgn, GetStockObject, IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode,
+    SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+    DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
 use crate::config::Config;
 use crate::ui::{caption, icon};
 
-pub const TAB_MIN_W: i32 = 90;
 pub const TAB_MAX_W: i32 = 190;
+/// Floor for the per-tab width. Tabs share whatever the fixed furniture leaves
+/// over — gutter, "+", window buttons — and shrink well below their label size
+/// rather than push the right end of the strip off-screen. 24px is about the
+/// narrowest tab that still holds a close X and a couple of characters; a
+/// browser starts scrolling at this point, we clip the last tab instead.
+pub const TAB_MIN_W: i32 = 24;
 /// Tabs stop this far above the band's bottom edge; the strip above keeps the
 /// rounded top corners off the window's own rounding and is the drag area.
 const TAB_TOP: i32 = 4;
@@ -189,6 +195,12 @@ impl TabBar {
     }
 
     /// Recompute tab widths for a new client width. Returns true on change.
+    ///
+    /// Tabs get exactly what the fixed furniture leaves over: gutter, "+",
+    /// its breathing room and the three caption buttons are subtracted first,
+    /// so the right end of the strip is always whole — measured 2026-11-18, a
+    /// dozen tabs at the old 90px floor pushed the "+" and the close box clean
+    /// off the end.
     pub fn fit(&mut self, width: i32) -> bool {
         let n = self.labels.len().max(1) as i32;
         let avail = width - GUTTER - PLUS_SIZE - 8 - caption::WIDTH - n * TAB_GAP;
@@ -198,6 +210,12 @@ impl TabBar {
         }
         self.tab_w = want;
         true
+    }
+
+    /// Close box: 16px on the tab's trailing edge, but never more than half the
+    /// tab — a 24px tab still has to answer "select" on its leading half.
+    fn close_w(&self) -> i32 {
+        CLOSE_BOX.min(self.tab_w / 2).max(8)
     }
 
     fn tab_x(&self, i: usize) -> i32 {
@@ -238,7 +256,7 @@ impl TabBar {
             return Hit::Band; // in the gap between tabs
         }
         // Close box occupies the tab's right edge.
-        let close_left = tab_left + self.tab_w - CLOSE_BOX - 4;
+        let close_left = tab_left + self.tab_w - self.close_w() - 4;
         if x >= close_left {
             Hit::Close(i as usize)
         } else {
@@ -277,6 +295,14 @@ impl TabBar {
             let old_font = SelectObject(hdc, HGDIOBJ(font.0));
             let _ = SetBkMode(hdc, TRANSPARENT);
 
+            // Overflow guard: however many tabs there are, they never paint
+            // over the "+" or the window buttons. `fit` keeps them inside
+            // unless the tab count is absurd; clipping is one call and turns
+            // that worst case into "last tab cut off" instead of "buttons
+            // gone", which is also what a browser looks like mid-scroll.
+            let saved = SaveDC(hdc);
+            let _ = IntersectClipRect(hdc, 0, 0, self.plus_x(), caption::HEIGHT);
+
             for (i, label) in self.labels.iter().enumerate() {
                 let x = self.tab_x(i);
                 let tab_rc = RECT {
@@ -302,7 +328,7 @@ impl TabBar {
                 // Close (X) on the tab's right edge.
                 let cy = (tab_rc.top + tab_rc.bottom) / 2;
                 let close_rc = RECT {
-                    left: tab_rc.right - CLOSE_BOX - 4,
+                    left: tab_rc.right - self.close_w() - 4,
                     top: cy - CLOSE_BOX / 2,
                     right: tab_rc.right - 4,
                     bottom: cy + CLOSE_BOX / 2,
@@ -316,11 +342,14 @@ impl TabBar {
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );
 
-                // Label, clipped to leave room for the X.
+                // Label, clipped to leave room for the X. The leading pad
+                // shrinks with the tab: 8px on a full-width tab, 4px on a
+                // 24px one, where every pixel goes to characters.
                 let mut wide = to_wide(label);
+                let pad = (self.tab_w / 6).clamp(4, 8);
                 let mut text_rc = RECT {
-                    left: tab_rc.left + 8,
-                    right: close_rc.left - 2,
+                    left: tab_rc.left + pad,
+                    right: (close_rc.left - 2).max(tab_rc.left + pad),
                     ..tab_rc
                 };
                 let _ = DrawTextW(
@@ -330,6 +359,8 @@ impl TabBar {
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
             }
+
+            let _ = RestoreDC(hdc, saved);
 
             // Trailing "+": its own pill so it reads as a button.
             let plus_x = self.plus_x();
