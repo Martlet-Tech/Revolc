@@ -2,6 +2,9 @@
 name = "revolc-bho"
 version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/Martlet-Tech/Revolc"
+description = "Explorer BHO that tells Revolc a folder window was created."
 
 [lib]
 crate-type = ["cdylib"]

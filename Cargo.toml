@@ -5,6 +5,9 @@ members = ["bho"]
 name = "revolc"
 version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/Martlet-Tech/Revolc"
+description = "Tabs for Windows Explorer — a native reimplementation of Clover."
 
 [dependencies]
 windows = { version = "0.58", features = [

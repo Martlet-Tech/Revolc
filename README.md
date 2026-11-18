@@ -10,6 +10,7 @@
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0f6cbd?style=flat-square">
   <img alt="language" src="https://img.shields.io/badge/Rust-native%20Win32-b7410e?style=flat-square">
   <img alt="status" src="https://img.shields.io/badge/status-daily%20usable-2ea44f?style=flat-square">
+  <img alt="license" src="https://img.shields.io/badge/license-MPL%202.0-2ea44f?style=flat-square">
 </p>
 
 ![Revolc 截图](assets/screenshot.png)
@@ -87,6 +88,10 @@ cargo build --release -p revolc-bho    # BHO（要单独编，注册才生效）
 ## 一句免责
 
 它接管的是系统 shell。装之前请读一遍文档，注册表记得备份。真出问题，`docs/registry/` 里有清干净的脚本。
+
+## 许可证
+
+[MPL-2.0](LICENSE)。一句话：**拿去用、塞进你自己的东西里都行，改了 Revolc 的代码把那几个文件还回来就行**。没有 CLA，提 PR 不需要签任何东西。
 
 ---
 
