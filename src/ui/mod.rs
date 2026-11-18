@@ -1260,7 +1260,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // gives native drag (`HTCAPTION`), native double-click maximize and
         // Win11 Snap Layouts (`HTMAXBUTTON`), all via DefWindowProc.
         WM_NCHITTEST => {
-            let app = app_from(hwnd);
+            // Hit tests can arrive before WM_CREATE has stored the App (and
+            // after WM_DESTROY cleared the pointer): never dereference null
+            // from the one message that fires on every single mouse move.
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            if ptr.is_null() {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            let app = &mut *ptr;
             let (sx, sy) = point_from_lparam(lp);
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);

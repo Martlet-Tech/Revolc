@@ -7,7 +7,9 @@
 
 use windows::core::{Interface as _, Result, VARIANT};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::Graphics::Gdi::{
+    CreateRectRgn, DeleteObject, InvalidateRect, SetWindowRgn, HGDIOBJ, HRGN,
+};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
@@ -160,6 +162,8 @@ impl Absorbed {
 
     /// Put the window back as a normal desktop window.
     pub unsafe fn restore(&self) {
+        // Undo clip_above_content: as a desktop window it needs its whole frame.
+        let _ = SetWindowRgn(self.top, HRGN::default(), true);
         if let Err(e) = SetParent(self.top, None) {
             tracing::error!(error = %e, top = ?self.top, "restore SetParent failed");
         }
@@ -206,20 +210,27 @@ impl Absorbed {
     pub fn place_client(&self, rect: RECT, m: Metrics) {
         let (nx, ny, nx2, ny2) = m.nc;
         let band = m.band;
+        let w = (rect.right - rect.left) + nx + nx2;
+        let h = (rect.bottom - rect.top) + ny + ny2 + band;
         unsafe {
             let _ = SetWindowPos(
                 self.top,
                 HWND_TOP,
                 rect.left - nx,
                 rect.top - ny - band,
-                (rect.right - rect.left) + nx + nx2,
-                (rect.bottom - rect.top) + ny + ny2 + band,
+                w,
+                h,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            // The padding above the content is only there to push the ribbon
+            // onto the view rect. It must not exist as a *window*, or it covers
+            // the host's caption strip (paint + hit test both).
+            clip_above_content(self.top, ny + band, w, h);
         }
         tracing::info!(
             top = ?self.top,
             band,
+            clip_top = ny + band,
             nc = ?(nx, ny, nx2, ny2),
             view = ?(rect.left, rect.top, rect.right, rect.bottom),
             "placed absorbed view"
@@ -304,6 +315,38 @@ impl Absorbed {
         if is_visible(self.top) {
             self.shown = true;
         }
+    }
+}
+
+/// Cut the part of an absorbed window that sits above the tab content out of
+/// its window region.
+///
+/// `place_client` deliberately makes the child **taller than the content** and
+/// pushes it up by `band` pixels, so Explorer's ribbon starts exactly on the
+/// view rect. That overhang lands on top of the host's caption strip — and a
+/// child window always wins over its parent's painting *and* hit testing, so
+/// the title bar turns into Explorer's unpainted black band and every click on
+/// it (tabs, `+`, min/max/close, drag) is delivered to Explorer instead. That
+/// is intermittent only because `band` is 0 until Explorer applies its own
+/// frame: measured 0 right after absorb, 31 a moment later.
+///
+/// A window region makes the overhang not part of the child at all, so those
+/// pixels and those clicks belong to the host again.
+unsafe fn clip_above_content(top: HWND, clip: i32, w: i32, h: i32) {
+    if clip <= 0 {
+        // No overhang: a leftover region from a previous placement would eat
+        // the ribbon, so clear it explicitly.
+        let _ = SetWindowRgn(top, HRGN::default(), true);
+        return;
+    }
+    let rgn = CreateRectRgn(0, clip, w, h);
+    if rgn.0.is_null() {
+        return;
+    }
+    // SetWindowRgn takes ownership of the region only when it succeeds.
+    if SetWindowRgn(top, rgn, true) == 0 {
+        let _ = DeleteObject(HGDIOBJ(rgn.0));
+        tracing::warn!(?top, clip, "SetWindowRgn failed, caption strip may be covered");
     }
 }
 
