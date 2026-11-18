@@ -76,8 +76,20 @@ pub struct Drag {
     /// Pointer offset inside the tab at the time the drag started, so the tab
     /// does not jump under the cursor.
     grab: i32,
-    /// Current left edge of the dragged tab, in client coordinates.
-    left: i32,
+    /// Left edge the pointer asks for, **before** the strip clamps it. The
+    /// clamp is a painting decision (the tab must stay on the band); using the
+    /// clamped value for hit-testing would make slot 0 unreachable — with the
+    /// left edge pinned at `GUTTER`, the tab's centre can never get past the
+    /// first tab's centre line, so "drag the second tab to the front" would
+    /// silently do nothing.
+    raw: i32,
+}
+
+impl Drag {
+    /// Where the tab is painted: same coordinate, pinned to the band.
+    fn left(&self, max_left: i32) -> i32 {
+        self.raw.clamp(GUTTER, max_left)
+    }
 }
 
 /// Tab strip state + painter.
@@ -231,7 +243,7 @@ impl TabBar {
             return;
         }
         let left = self.tab_x(i);
-        self.drag = Some(Drag { from: i, grab: x - left, left });
+        self.drag = Some(Drag { from: i, grab: x - left, raw: left });
         self.hover_tab = None;
     }
 
@@ -239,14 +251,12 @@ impl TabBar {
         self.drag
     }
 
-    /// Follow the pointer. The left edge is clamped to the strip so a drag that
-    /// leaves the window keeps the tab under the caption buttons' left edge
-    /// instead of flying off, which is also what makes the end positions
-    /// reachable without a capture-relative coordinate system.
+    /// Follow the pointer. The raw edge is kept unclamped so hit-testing stays
+    /// symmetric at both ends; `Drag::left` pins it back to the band for
+    /// painting.
     pub fn drag_to(&mut self, x: i32) {
         let Some(mut d) = self.drag else { return };
-        let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
-        d.left = (x - d.grab).clamp(GUTTER, max_left);
+        d.raw = x - d.grab;
         self.drag = Some(d);
     }
 
@@ -273,7 +283,7 @@ impl TabBar {
     /// pointer has not crossed a centre line yet).
     pub fn target(&self) -> Option<usize> {
         let d = self.drag?;
-        landing(d.left + self.tab_w / 2, self.tab_w, self.labels.len(), d.from)
+        landing(d.raw + self.tab_w / 2, self.tab_w, self.labels.len(), d.from)
     }
 
     /// Recompute tab widths for a new client width. Returns true on change.
@@ -396,7 +406,8 @@ impl TabBar {
             }
             if let Some(d) = self.drag {
                 if let Some(label) = self.labels.get(d.from) {
-                    self.paint_tab(hdc, d.from, d.left, label, true);
+                    let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
+                    self.paint_tab(hdc, d.from, d.left(max_left), label, true);
                 }
             }
 
@@ -635,6 +646,31 @@ mod tests {
         assert_eq!(landing(i32::MIN / 2, W, 3, 0), None);
         assert_eq!(landing(i32::MAX / 2, W, 3, 0), Some(2));
         assert_eq!(landing(tab0_mid, W, 3, 1), None);
+    }
+
+    /// Slot 0 must be reachable from the right, and slot n-1 from the left.
+    /// Regression: the drag used to clamp the tab's left edge at `GUTTER`
+    /// before hit-testing, so a dragged tab's centre could never get past the
+    /// first tab's centre — "drag #2 to #1" silently did nothing.
+    #[test]
+    fn both_end_slots_are_reachable() {
+        let tab0_mid = GUTTER + W / 2;
+        let last_mid = GUTTER + 2 * (W + TAB_GAP) + W / 2;
+        // Second tab, centre one pixel left of tab 0's centre line: it is now
+        // the first tab. Anything further left stays there.
+        assert_eq!(landing(tab0_mid - 1, W, 3, 1), Some(0));
+        assert_eq!(landing(GUTTER - W, W, 3, 1), Some(0));
+        // First tab, centre past the last tab's centre line.
+        assert_eq!(landing(last_mid + 1, W, 3, 0), Some(2));
+    }
+
+    /// The clamp is a painting rule; hit-testing must use the raw edge, or the
+    /// pinned left edge would cap how far left a tab can be recognised.
+    #[test]
+    fn painting_clamps_but_landing_does_not() {
+        let d = Drag { from: 1, grab: 0, raw: GUTTER - 40 };
+        assert_eq!(d.left(500), GUTTER, "painted inside the band");
+        assert_eq!(landing(d.raw + W / 2, W, 3, 1), Some(0), "but decided on raw");
     }
 
     #[test]
