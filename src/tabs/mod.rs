@@ -97,6 +97,26 @@ impl TabList {
         Some(removed)
     }
 
+    /// Move the tab at `from` so that it lands at `to`. The active tab stays
+    /// the active tab: its index follows the move instead of pointing at
+    /// whatever slid into its slot. Returns true when the order changed.
+    pub fn move_to(&mut self, from: usize, to: usize) -> bool {
+        let n = self.tabs.len();
+        if from >= n || to >= n || from == to {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if self.active == from {
+            self.active = to;
+        } else if from < self.active && to >= self.active {
+            self.active -= 1;
+        } else if from > self.active && to <= self.active {
+            self.active += 1;
+        }
+        true
+    }
+
     pub fn activate(&mut self, i: usize) -> bool {
         if i < self.tabs.len() {
             self.active = i;
@@ -160,5 +180,33 @@ mod tests {
         assert_eq!(t.active_index(), 1);
         t.cycle(false);
         assert_eq!(t.active_index(), 0);
+    }
+
+    #[test]
+    fn move_to_keeps_the_active_tab_active() {
+        let mut t = TabList::new();
+        t.push("a");
+        t.push("b");
+        t.push("c");
+        t.activate(0); // a
+        // Drag "a" to the end: it must still be the active tab afterwards.
+        assert!(t.move_to(0, 2));
+        assert_eq!(t.iter_all().map(|x| x.path.as_str()).collect::<Vec<_>>(), ["b", "c", "a"]);
+        assert_eq!(t.active_index(), 2);
+        assert_eq!(t.active().unwrap().path, "a");
+    }
+
+    #[test]
+    fn move_to_shifts_a_bystander_active_index() {
+        let mut t = TabList::new();
+        t.push("a");
+        t.push("b");
+        t.push("c");
+        t.activate(2); // c is active, someone else is dragged
+        assert!(t.move_to(0, 1)); // a passes b
+        assert_eq!(t.active_index(), 2);
+        assert_eq!(t.active().unwrap().path, "c");
+        assert!(!t.move_to(1, 1));
+        assert!(!t.move_to(0, 9));
     }
 }

@@ -61,6 +61,25 @@ pub enum Hit {
     Caption(caption::Button),
 }
 
+/// An in-band tab drag: the tab left its slot and follows the pointer.
+///
+/// The model never sees a "dragged index": the app reorders `TabList` the
+/// moment `target()` changes, so `from` always means "where the tab sits in
+/// the *current* order". Tabs are all the same width, which is what makes this
+/// cheap — reordering changes the labels in each slot but not a single slot
+/// coordinate, so the centre lines that decide the swap stay put and the drag
+/// cannot oscillate.
+#[derive(Clone, Copy, Debug)]
+pub struct Drag {
+    /// Index of the dragged tab in the current order.
+    pub from: usize,
+    /// Pointer offset inside the tab at the time the drag started, so the tab
+    /// does not jump under the cursor.
+    grab: i32,
+    /// Current left edge of the dragged tab, in client coordinates.
+    left: i32,
+}
+
 /// Tab strip state + painter.
 pub struct TabBar {
     /// Tab ids, parallel to `labels`. Callbacks report ids, not indices: the
@@ -82,6 +101,9 @@ pub struct TabBar {
     /// Index of the tab under the pointer. Independent of `hover`: a tab lives
     /// in the client area, the caption buttons do not.
     hover_tab: Option<usize>,
+    /// Set while a tab is being dragged inside the band (reorder only; pulling
+    /// a tab out into a new window is a later stage).
+    drag: Option<Drag>,
     maximized: bool,
     window_active: bool,
     caption_colors: caption::Colors,
@@ -103,6 +125,7 @@ impl TabBar {
             tab_w: TAB_MAX_W,
             hover: None,
             hover_tab: None,
+            drag: None,
             maximized: false,
             window_active: true,
             caption_colors: caption::Colors::new(
@@ -158,6 +181,11 @@ impl TabBar {
         // The tab that was under the pointer may be gone (closed, or the list
         // reordered); never carry a stale highlight into the next frame.
         self.hover_tab = self.hover_tab.filter(|i| *i < self.labels.len());
+        // Same for a drag over a tab that no longer exists (the dragged tab
+        // closed from under the capture, or a sweep reordered the rest).
+        if self.drag.map(|d| d.from >= self.labels.len()).unwrap_or(false) {
+            self.drag = None;
+        }
         self.restyle(cfg);
         self.fit(width);
     }
@@ -192,6 +220,60 @@ impl TabBar {
         }
         self.hover_tab = index;
         true
+    }
+
+    // ---- tab drag (reorder inside the band) -----------------------------
+
+    /// Start dragging tab `i`. `x` is the press point in client coords; the
+    /// offset inside the tab is kept so the tab does not snap to the cursor.
+    pub fn begin_drag(&mut self, i: usize, x: i32) {
+        if i >= self.labels.len() {
+            return;
+        }
+        let left = self.tab_x(i);
+        self.drag = Some(Drag { from: i, grab: x - left, left });
+        self.hover_tab = None;
+    }
+
+    pub fn drag(&self) -> Option<Drag> {
+        self.drag
+    }
+
+    /// Follow the pointer. The left edge is clamped to the strip so a drag that
+    /// leaves the window keeps the tab under the caption buttons' left edge
+    /// instead of flying off, which is also what makes the end positions
+    /// reachable without a capture-relative coordinate system.
+    pub fn drag_to(&mut self, x: i32) {
+        let Some(mut d) = self.drag else { return };
+        let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
+        d.left = (x - d.grab).clamp(GUTTER, max_left);
+        self.drag = Some(d);
+    }
+
+    /// Adopt a new (post-reorder) index for the tab being dragged.
+    pub fn set_drag_from(&mut self, i: usize) {
+        if let Some(d) = &mut self.drag {
+            d.from = i;
+        }
+    }
+
+    pub fn end_drag(&mut self) {
+        self.drag = None;
+    }
+
+    /// Where the dragged tab would land, decided by **centre lines** (the way
+    /// a browser does it): the tab changes place with its neighbour only once
+    /// its own centre has crossed that neighbour's centre.
+    ///
+    /// The loop yields an *insertion slot* (0..=n), which then has to be
+    /// corrected for the tab already occupying a slot: dragging within your own
+    /// slot resolves to `slot, slot + 1` and both mean "do not move".
+    ///
+    /// Returns None when there is nothing to decide (no drag, one tab, or the
+    /// pointer has not crossed a centre line yet).
+    pub fn target(&self) -> Option<usize> {
+        let d = self.drag?;
+        landing(d.left + self.tab_w / 2, self.tab_w, self.labels.len(), d.from)
     }
 
     /// Recompute tab widths for a new client width. Returns true on change.
@@ -304,60 +386,18 @@ impl TabBar {
             let _ = IntersectClipRect(hdc, 0, 0, self.plus_x(), caption::HEIGHT);
 
             for (i, label) in self.labels.iter().enumerate() {
-                let x = self.tab_x(i);
-                let tab_rc = RECT {
-                    left: x,
-                    top: TAB_TOP,
-                    right: x + self.tab_w,
-                    bottom: TAB_BOTTOM,
-                };
-                // Lightness ramp, darkest band to lightest tab:
-                // background < inactive < hover < active. The active tab is the
-                // brightest thing in the band so the eye lands on it first;
-                // hovering lifts a tab off the strip without pretending to be
-                // the selected one.
-                let bg = if i == self.active {
-                    self.active_bg
-                } else if self.hover_tab == Some(i) {
-                    self.hover_bg
-                } else {
-                    self.inactive_bg
-                };
-                fill_tab(hdc, &tab_rc, bg, self.radius);
-
-                // Close (X) on the tab's right edge.
-                let cy = (tab_rc.top + tab_rc.bottom) / 2;
-                let close_rc = RECT {
-                    left: tab_rc.right - self.close_w() - 4,
-                    top: cy - CLOSE_BOX / 2,
-                    right: tab_rc.right - 4,
-                    bottom: cy + CLOSE_BOX / 2,
-                };
-                let fg = if i == self.active { self.text_active } else { self.text };
-                let _ = SetTextColor(hdc, fg);
-                let _ = DrawTextW(
-                    hdc,
-                    &mut to_wide("\u{00D7}"), // ×
-                    &mut { RECT { ..close_rc } },
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
-
-                // Label, clipped to leave room for the X. The leading pad
-                // shrinks with the tab: 8px on a full-width tab, 4px on a
-                // 24px one, where every pixel goes to characters.
-                let mut wide = to_wide(label);
-                let pad = (self.tab_w / 6).clamp(4, 8);
-                let mut text_rc = RECT {
-                    left: tab_rc.left + pad,
-                    right: (close_rc.left - 2).max(tab_rc.left + pad),
-                    ..tab_rc
-                };
-                let _ = DrawTextW(
-                    hdc,
-                    &mut wide,
-                    &mut text_rc,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                );
+                // The dragged tab is painted last, on top: it overlaps its
+                // neighbours while it follows the cursor and must not be cut
+                // by whichever slot happens to come later in the loop.
+                if self.drag.map(|d| d.from == i).unwrap_or(false) {
+                    continue;
+                }
+                self.paint_tab(hdc, i, self.tab_x(i), label, false);
+            }
+            if let Some(d) = self.drag {
+                if let Some(label) = self.labels.get(d.from) {
+                    self.paint_tab(hdc, d.from, d.left, label, true);
+                }
             }
 
             let _ = RestoreDC(hdc, saved);
@@ -392,6 +432,91 @@ impl TabBar {
             );
         }
     }
+
+    /// One tab: body, close X, label. `dragged` means the pointer is holding
+    /// it, so it keeps the active fill (whatever slot is under the cursor does
+    /// not get the hover) and is painted above every other tab.
+    fn paint_tab(&self, hdc: HDC, i: usize, x: i32, label: &str, dragged: bool) {
+        unsafe {
+            let tab_rc = RECT {
+                left: x,
+                top: TAB_TOP,
+                right: x + self.tab_w,
+                bottom: TAB_BOTTOM,
+            };
+            // Lightness ramp, darkest band to lightest tab:
+            // background < inactive < hover < active. The active tab is the
+            // brightest thing in the band so the eye lands on it first;
+            // hovering lifts a tab off the strip without pretending to be
+            // the selected one.
+            let bg = if dragged || i == self.active {
+                self.active_bg
+            } else if self.hover_tab == Some(i) {
+                self.hover_bg
+            } else {
+                self.inactive_bg
+            };
+            fill_tab(hdc, &tab_rc, bg, self.radius);
+
+            // Close (X) on the tab's right edge.
+            let cy = (tab_rc.top + tab_rc.bottom) / 2;
+            let close_rc = RECT {
+                left: tab_rc.right - self.close_w() - 4,
+                top: cy - CLOSE_BOX / 2,
+                right: tab_rc.right - 4,
+                bottom: cy + CLOSE_BOX / 2,
+            };
+            let fg = if dragged || i == self.active { self.text_active } else { self.text };
+            let _ = SetTextColor(hdc, fg);
+            let _ = DrawTextW(
+                hdc,
+                &mut to_wide("\u{00D7}"), // ×
+                &mut { RECT { ..close_rc } },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            // Label, clipped to leave room for the X. The leading pad
+            // shrinks with the tab: 8px on a full-width tab, 4px on a
+            // 24px one, where every pixel goes to characters.
+            let mut wide = to_wide(label);
+            let pad = (self.tab_w / 6).clamp(4, 8);
+            let mut text_rc = RECT {
+                left: tab_rc.left + pad,
+                right: (close_rc.left - 2).max(tab_rc.left + pad),
+                ..tab_rc
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut text_rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+/// Centre-line landing rule, as pure geometry so it can be tested without a
+/// window. `center` is the dragged tab's centre; slot `i` occupies
+/// `GUTTER + i * (tab_w + TAB_GAP)`.
+///
+/// The scan produces an *insertion slot* (0..=n). A tab that has not moved
+/// resolves to its own slot or the one right after it, and the correction
+/// below folds both back to "no change" — without it, every drag would report
+/// a move on the first pixel.
+fn landing(center: i32, tab_w: i32, n: usize, from: usize) -> Option<usize> {
+    if n < 2 || from >= n {
+        return None;
+    }
+    let mid = |i: usize| GUTTER + i as i32 * (tab_w + TAB_GAP) + tab_w / 2;
+    let mut insert = n;
+    for i in 0..n {
+        if center < mid(i) {
+            insert = i;
+            break;
+        }
+    }
+    let to = if insert > from { insert - 1 } else { insert };
+    (to != from && to < n).then_some(to)
 }
 
 /// Blend towards the band background: the "window is inactive" glyph colour.
@@ -470,4 +595,51 @@ unsafe fn fill_tab(hdc: HDC, rc: &RECT, color: COLORREF, radius: i32) {
 
 fn to_wide(s: &str) -> Vec<u16> {
     windows::core::HSTRING::from(s).as_wide().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slot geometry used below: GUTTER 28, tab 100, gap 4 -> step 104,
+    /// centres at 78 / 182 / 286.
+    const W: i32 = 100;
+
+    #[test]
+    fn resting_in_your_own_slot_is_not_a_move() {
+        for from in 0..3 {
+            let center = GUTTER + from as i32 * (W + TAB_GAP) + W / 2;
+            assert_eq!(landing(center, W, 3, from), None, "from={from}");
+        }
+    }
+
+    #[test]
+    fn swaps_only_after_crossing_the_neighbour_centre() {
+        // Drag the first tab right: one pixel short of tab 1's centre line it
+        // must still sit at 0, and the moment it crosses, it is index 1.
+        let tab1_mid = GUTTER + (W + TAB_GAP) + W / 2;
+        assert_eq!(landing(tab1_mid - 1, W, 3, 0), None);
+        assert_eq!(landing(tab1_mid, W, 3, 0), Some(1));
+    }
+
+    #[test]
+    fn drags_both_ways_and_stops_at_the_ends() {
+        let tab0_mid = GUTTER + W / 2;
+        let tab1_mid = GUTTER + (W + TAB_GAP) + W / 2;
+        // Third tab dragged left: it stays put while its centre is still on
+        // tab 1's centre line, and swaps one pixel past it.
+        assert_eq!(landing(tab1_mid, W, 3, 2), None);
+        assert_eq!(landing(tab1_mid - 1, W, 3, 2), Some(1));
+        assert_eq!(landing(GUTTER, W, 3, 2), Some(0));
+        // First tab dragged past the ends clamps, it never goes out of range.
+        assert_eq!(landing(i32::MIN / 2, W, 3, 0), None);
+        assert_eq!(landing(i32::MAX / 2, W, 3, 0), Some(2));
+        assert_eq!(landing(tab0_mid, W, 3, 1), None);
+    }
+
+    #[test]
+    fn a_single_tab_never_lands_anywhere() {
+        assert_eq!(landing(GUTTER, W, 1, 0), None);
+        assert_eq!(landing(GUTTER, W, 3, 3), None);
+    }
 }

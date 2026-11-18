@@ -18,22 +18,24 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible,
-    IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
+    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindowVisible,
+    IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetTimer,
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL,
     HTCAPTION, HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
     SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY,
     WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK,
+    WM_CAPTURECHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT,
-    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
     WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
@@ -98,6 +100,16 @@ struct WindowArgs {
     initial_path: Option<String>,
 }
 
+/// A left button pressed on a tab, before the pointer has moved far enough to
+/// call it a drag. The tab is identified by id, not index: a sweep can reorder
+/// or remove tabs between the press and the first mouse move.
+#[derive(Clone, Copy)]
+struct TabPress {
+    id: u64,
+    /// Pointer x when the button went down (client coords).
+    x: i32,
+}
+
 pub(crate) struct App {
     cfg: Arc<ConfigHandle>,
     keymap: Vec<(Binding, Action)>,
@@ -150,6 +162,10 @@ pub(crate) struct App {
     /// run, and it is the only way to drop a hover that the cursor walked out
     /// of without a further hit test.
     hover_tracking: bool,
+    /// Left button went down on a tab and the pointer has not yet crossed the
+    /// system drag threshold. `None` once a click is dispatched or a drag
+    /// starts.
+    tab_press: Option<TabPress>,
 }
 
 pub struct MainWindow {
@@ -288,6 +304,7 @@ impl App {
             tabbar,
             main_hwnd: hwnd,
             hover_tracking: false,
+            tab_press: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -519,6 +536,12 @@ impl App {
     /// whether the point resolves to a client area (tabs) or a non-client one
     /// (caption buttons).
     fn update_hover(&mut self, x: i32, y: i32, width: i32) {
+        // While a tab is being dragged the highlight belongs to the tab in
+        // hand: letting the pointer repaint hover fills underneath it makes
+        // the strip flicker as the drag passes over each slot.
+        if self.tabbar.drag().is_some() {
+            return;
+        }
         let want = caption::hit(x, y, width);
         // A tab is a client-area target, a caption button a non-client one:
         // the two hovers are tracked separately and both repaint the band.
@@ -572,6 +595,100 @@ impl App {
     /// Index of the tab with `id`, if it still exists.
     fn index_of(&self, id: u64) -> Option<usize> {
         self.tabs.iter_all().position(|t| t.id == id)
+    }
+
+    // ---- tab drag: reorder inside the band -------------------------------
+
+    /// Left button went down on tab `i`. A browser activates a tab on press,
+    /// so a drag always carries the tab you were looking at; the drag itself
+    /// only starts once the pointer crosses the system threshold, otherwise
+    /// every click on a tab would nudge its neighbours.
+    fn begin_tab_press(&mut self, i: usize, x: i32) {
+        let Some(id) = self.tabbar.ids().get(i).copied() else {
+            return;
+        };
+        let Some(idx) = self.index_of(id) else {
+            return;
+        };
+        self.activate(idx);
+        self.tab_press = Some(TabPress { id, x });
+    }
+
+    /// Mouse moved while the left button is down. Returns true when the band
+    /// was repainted (i.e. the caller must not also handle hover).
+    fn tab_drag_track(&mut self, x: i32) -> bool {
+        if let Some(press) = self.tab_press {
+            // SM_CXDRAG is "how far can the pointer move before it is a drag"
+            // — the same constant user32 uses for its own drag detection, so
+            // the feel matches the rest of the shell.
+            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+            if (x - press.x).abs() < threshold {
+                return false;
+            }
+            self.tab_press = None;
+            let Some(i) = self.index_of(press.id) else {
+                return false;
+            };
+            // Grab from the press point, not from here: the tab must not jump
+            // under the cursor the moment the drag is recognised.
+            self.tabbar.begin_drag(i, press.x);
+            unsafe {
+                SetCapture(self.main_hwnd);
+            }
+        }
+        if self.tabbar.drag().is_none() {
+            return false;
+        }
+        self.tabbar.drag_to(x);
+        if let Some(to) = self.tabbar.target() {
+            let from = self.tabbar.drag().map(|d| d.from).unwrap_or(to);
+            self.move_tab(from, to);
+        }
+        self.invalidate_band();
+        true
+    }
+
+    /// Drop the dragged tab. Reorder inside the band only: pulling a tab out
+    /// into its own window is a later stage, so there is nothing to decide on
+    /// release — the model already holds the final order.
+    fn end_tab_drag(&mut self) {
+        self.tab_press = None;
+        if self.tabbar.drag().is_none() {
+            return;
+        }
+        self.tabbar.end_drag();
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.invalidate_band();
+    }
+
+    /// Move tab `from` to `to`, keeping tabs, views and the active index in
+    /// step. Everything that is keyed by tab index (`views`, the layout cache)
+    /// has to move with it or the wrong folder would answer for the tab.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if !self.tabs.move_to(from, to) {
+            return;
+        }
+        let view = self.views.remove(from);
+        self.views.insert(to, view);
+        // The drag holds a tab, not a slot: follow it.
+        self.tabbar.set_drag_from(to);
+        // `laid_out` is keyed by the active index. Retarget it instead of
+        // clearing it: tab slots are uniform, so a reorder moves no window —
+        // clearing the cache would cost one cross-process SetWindowPos on the
+        // next sweep tick for nothing.
+        if let Some(k) = self.laid_out.as_mut() {
+            if k.0 == from {
+                k.0 = to;
+            } else if from < k.0 && to >= k.0 {
+                k.0 -= 1;
+            } else if from > k.0 && to <= k.0 {
+                k.0 += 1;
+            }
+        }
+        self.sync_tabbar();
+        self.invalidate_band();
     }
 
     /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
@@ -1426,6 +1543,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
             let cr = app.client();
+            // While a tab is held the whole window answers HTCLIENT. The strip
+            // above the tabs answers HTCAPTION, so a drag that wanders up
+            // there would switch the capture to non-client and start emitting
+            // WM_NCMOUSEMOVE — the tab would freeze mid-air until the button
+            // was released.
+            if app.tabbar.drag().is_some() {
+                return LRESULT(HTCLIENT as isize);
+            }
             let hit = app.tabbar.hit(pt.x, pt.y, cr.right);
             // Caption buttons before the resize borders: they are painted on
             // top of the band and, at the right end, on top of the frame too —
@@ -1512,13 +1637,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
             match app.tabbar.hit(x, y, width) {
-                tabbar::Hit::Tab(i) => {
-                    if let Some(id) = app.tabbar.ids().get(i).copied() {
-                        if let Some(i) = app.index_of(id) {
-                            app.activate(i);
-                        }
-                    }
-                }
+                tabbar::Hit::Tab(i) => app.begin_tab_press(i, x),
                 tabbar::Hit::Close(i) => {
                     if let Some(id) = app.tabbar.ids().get(i).copied() {
                         if let Some(i) = app.index_of(id) {
@@ -1558,6 +1677,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if app.tabbar.hit(x, y, width) == tabbar::Hit::Band {
                 app.toggle_maximize();
             }
+            LRESULT(0)
+        }
+        // Tab drag: press is remembered by WM_LBUTTONDOWN, the threshold is
+        // crossed here, the reorder happens on the spot (the model is the
+        // truth; the strip only paints the tab under the cursor).
+        WM_MOUSEMOVE => {
+            let app = app_from(hwnd);
+            let (x, _y) = point_from_lparam(lp);
+            app.tab_drag_track(x);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            app_from(hwnd).end_tab_drag();
+            LRESULT(0)
+        }
+        // Capture stolen (Alt+Tab, a modal, another window grabbing the
+        // mouse): drop the drag instead of leaving a tab glued to the cursor.
+        WM_CAPTURECHANGED => {
+            app_from(hwnd).end_tab_drag();
             LRESULT(0)
         }
         // Middle click on a tab closes it (spec §3.1).
