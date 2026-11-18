@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
-    RedrawWindow, ScreenToClient, UpdateWindow, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, RDW_ALLCHILDREN,
+    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
+    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, UpdateWindow,
+    HBRUSH, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN,
     RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -21,18 +22,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindowVisible,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible,
     IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetTimer,
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL,
     HTCAPTION, HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, NCCALCSIZE_PARAMS,
-    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
+    HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDBLCLK,
     WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT,
-    WM_SETICON, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
+    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
 use crate::config::ConfigHandle;
@@ -1261,6 +1262,24 @@ fn short_label(path: &str) -> String {
         .to_string()
 }
 
+/// Monitor metrics for the window (work area included). `None` when the monitor
+/// of the window cannot be resolved; the caller then keeps DefWindowProc's
+/// defaults.
+unsafe fn monitor_info(hwnd: HWND) -> Option<MONITORINFO> {
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if mon.is_invalid() {
+        return None;
+    }
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+        return None;
+    }
+    Some(mi)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -1292,29 +1311,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             PostQuitMessage(0);
             LRESULT(0)
         }
-        // The window has no non-client area at all: the client rect *is* the
-        // window rect. Returning 0 (not calling DefWindowProc) is what removes
-        // the frame — the tab bar is the caption now.
-        WM_NCCALCSIZE => {
-            // lParam is NCCALCSIZE_PARAMS for wParam != 0, a bare RECT
-            // otherwise. Both describe "the proposed client rect"; we accept it
-            // untouched, which is exactly "client area == window rect".
-            if wp.0 != 0 {
-                // A maximized WS_THICKFRAME window is laid out with its
-                // invisible border hanging off-screen; without this inset the
-                // content would be clipped by that border on all four sides.
-                if IsZoomed(hwnd).as_bool() {
-                    let params = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
-                    let fx = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-                    let fy = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-                    params.rgrc[0].left += fx;
-                    params.rgrc[0].right -= fx;
-                    params.rgrc[0].top += fy;
-                    params.rgrc[0].bottom -= fy;
-                }
+        // Maximize to the **work area**, not to the monitor.
+        //
+        // The window is WS_POPUP (no WS_CAPTION) and DefWindowProc sizes a
+        // caption-less popup to the whole monitor, ignoring the taskbar:
+        // measured on a 1600x900 screen with a vertical 79px taskbar on the
+        // right, the zoomed rect came out as the monitor inflated by the
+        // resize frame (-7,-7..1607,907), i.e. the taskbar was buried under
+        // the window. Pinning size *and* origin to rcWork is the fix.
+        WM_GETMINMAXINFO => {
+            let mmi = &mut *(lp.0 as *mut MINMAXINFO);
+            if let Some(mi) = monitor_info(hwnd) {
+                // ptMaxPosition is monitor-relative.
+                mmi.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+                mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+                mmi.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+                mmi.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
             }
             LRESULT(0)
         }
+        // The window has no non-client area at all: the client rect *is* the
+        // window rect. Returning 0 (not calling DefWindowProc) is what removes
+        // the frame — the tab bar is the caption now.
+        //
+        // No maximized fixup here any more: WM_GETMINMAXINFO already pins the
+        // zoomed rect to rcWork, so no frame hangs off-screen (measured
+        // 0,0..1521,900 — exactly the work area). The 8px inset this arm used
+        // to apply would now leave an unpainted non-client strip all round.
+        WM_NCCALCSIZE => LRESULT(0),
         // Everything the pointer can hit in the caption band is answered here.
         //
         // This has to be the toplevel: a child window cannot produce a
