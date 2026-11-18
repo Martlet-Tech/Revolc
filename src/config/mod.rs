@@ -27,6 +27,10 @@ pub struct Takeover {
 pub struct Theme {
     pub tabbar_background: String,
     pub tab_active: String,
+    /// Under the pointer, not active. Sits between `tab_active` and
+    /// `tab_inactive` on the same ramp, so hovering reads as "almost the tab
+    /// you are about to pick" rather than as a separate state.
+    pub tab_hover: String,
     pub tab_inactive: String,
     pub tab_text: String,
     pub tab_text_active: String,
@@ -75,6 +79,7 @@ impl Default for Theme {
         Self {
             tabbar_background: "#2b2b2b".into(),
             tab_active: "#4a6984".into(),
+            tab_hover: "#41474d".into(),
             tab_inactive: "#3c3c3c".into(),
             tab_text: "#cccccc".into(),
             tab_text_active: "#ffffff".into(),
@@ -137,6 +142,7 @@ pub fn ensure_config_file(path: &PathBuf) {
 [theme]
 tabbar_background = "#2b2b2b"
 tab_active        = "#4a6984"
+tab_hover         = "#41474d"  # under the pointer, not active
 tab_inactive      = "#3c3c3c"
 tab_text          = "#cccccc"
 tab_text_active   = "#ffffff"

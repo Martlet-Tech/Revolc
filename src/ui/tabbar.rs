@@ -64,6 +64,7 @@ pub struct TabBar {
     active: usize,
     bg: COLORREF,
     active_bg: COLORREF,
+    hover_bg: COLORREF,
     inactive_bg: COLORREF,
     text: COLORREF,
     text_active: COLORREF,
@@ -72,6 +73,9 @@ pub struct TabBar {
     /// band instead of being stuck at one hard-coded size.
     tab_w: i32,
     hover: Option<caption::Button>,
+    /// Index of the tab under the pointer. Independent of `hover`: a tab lives
+    /// in the client area, the caption buttons do not.
+    hover_tab: Option<usize>,
     maximized: bool,
     window_active: bool,
     caption_colors: caption::Colors,
@@ -85,12 +89,14 @@ impl TabBar {
             active: 0,
             bg: COLORREF(0),
             active_bg: COLORREF(0),
+            hover_bg: COLORREF(0),
             inactive_bg: COLORREF(0),
             text: COLORREF(0),
             text_active: COLORREF(0),
             radius: 0,
             tab_w: TAB_MAX_W,
             hover: None,
+            hover_tab: None,
             maximized: false,
             window_active: true,
             caption_colors: caption::Colors::new(
@@ -112,6 +118,7 @@ impl TabBar {
         };
         self.bg = c(&|t| &t.tabbar_background);
         self.active_bg = c(&|t| &t.tab_active);
+        self.hover_bg = c(&|t| &t.tab_hover);
         self.inactive_bg = c(&|t| &t.tab_inactive);
         self.text = c(&|t| &t.tab_text);
         self.text_active = c(&|t| &t.tab_text_active);
@@ -142,6 +149,9 @@ impl TabBar {
         self.ids = ids.to_vec();
         self.labels = labels.to_vec();
         self.active = active;
+        // The tab that was under the pointer may be gone (closed, or the list
+        // reordered); never carry a stale highlight into the next frame.
+        self.hover_tab = self.hover_tab.filter(|i| *i < self.labels.len());
         self.restyle(cfg);
         self.fit(width);
     }
@@ -165,6 +175,17 @@ impl TabBar {
 
     pub fn hover(&self) -> Option<caption::Button> {
         self.hover
+    }
+
+    /// Which tab the pointer is over (driven from the same hit test as the
+    /// caption buttons). Returns true when the caller must repaint the band.
+    pub fn set_hover_tab(&mut self, index: Option<usize>) -> bool {
+        let index = index.filter(|i| *i < self.labels.len());
+        if self.hover_tab == index {
+            return false;
+        }
+        self.hover_tab = index;
+        true
     }
 
     /// Recompute tab widths for a new client width. Returns true on change.
@@ -264,7 +285,18 @@ impl TabBar {
                     right: x + self.tab_w,
                     bottom: TAB_BOTTOM,
                 };
-                let bg = if i == self.active { self.active_bg } else { self.inactive_bg };
+                // Lightness ramp, darkest band to lightest tab:
+                // background < inactive < hover < active. The active tab is the
+                // brightest thing in the band so the eye lands on it first;
+                // hovering lifts a tab off the strip without pretending to be
+                // the selected one.
+                let bg = if i == self.active {
+                    self.active_bg
+                } else if self.hover_tab == Some(i) {
+                    self.hover_bg
+                } else {
+                    self.inactive_bg
+                };
                 fill_tab(hdc, &tab_rc, bg, self.radius);
 
                 // Close (X) on the tab's right edge.

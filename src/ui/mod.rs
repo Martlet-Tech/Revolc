@@ -10,14 +10,15 @@ use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, UpdateWindow,
-    HBRUSH, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN,
-    RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
+    RedrawWindow, ScreenToClient, SelectObject, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -386,6 +387,44 @@ impl App {
         rc
     }
 
+    /// Paint the caption band into an off-screen bitmap, then blit it in one go.
+    ///
+    /// One band repaint is `FillRect(band, bg)` followed by N tab fills and
+    /// their labels. Straight on the window DC every one of those intermediate
+    /// states is on screen, so a strip repainted at pointer rate blinks as a
+    /// whole — measured while the pointer crossed the caption buttons: 59 of
+    /// 184 recorded frames caught a bare or half-drawn band, always in paint
+    /// order (background, then tab 1, then tab 2 …). Buffering costs one
+    /// BitBlt and makes the repaint rate invisible instead of fixing it one
+    /// message at a time.
+    fn paint_band(&self, hdc: HDC) {
+        let rc = self.client();
+        let w = rc.right.max(1);
+        let h = TABBAR_HEIGHT.min(rc.bottom.max(1));
+        unsafe {
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = if mem.is_invalid() {
+                HBITMAP::default()
+            } else {
+                CreateCompatibleBitmap(hdc, w, h)
+            };
+            if bmp.is_invalid() {
+                // No memory for a back buffer: a flashing band beats no band.
+                if !mem.is_invalid() {
+                    let _ = DeleteDC(mem);
+                }
+                self.tabbar.paint(hdc, w);
+                return;
+            }
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            self.tabbar.paint(mem, w);
+            let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+        }
+    }
+
     fn sync_tabbar(&mut self) {
         let ids: Vec<u64> = self.tabs.iter_all().map(|t| t.id).collect();
         let labels: Vec<String> = self
@@ -474,17 +513,34 @@ impl App {
     /// (caption buttons).
     fn update_hover(&mut self, x: i32, y: i32, width: i32) {
         let want = caption::hit(x, y, width);
+        // A tab is a client-area target, a caption button a non-client one:
+        // the two hovers are tracked separately and both repaint the band.
+        // The close X belongs to its tab: without that, sliding onto the X
+        // dropped the tab's hover fill and the tab flickered.
+        let over_tab = match self.tabbar.hit(x, y, width) {
+            tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => Some(i),
+            _ => None,
+        };
         let maximized = self.is_maximized();
         let active = self.active;
-        if self.tabbar.set_chrome(want, maximized, active) {
+        let mut dirty = self.tabbar.set_chrome(want, maximized, active);
+        if self.tabbar.set_hover_tab(over_tab) {
+            dirty = true;
+        }
+        if dirty {
             self.invalidate_band();
         }
-        if want.is_some() && !self.hover_tracking {
+        if (want.is_some() || over_tab.is_some()) && !self.hover_tracking {
             self.hover_tracking = true;
             unsafe {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE | TME_NONCLIENT,
+                    // Client tracking only: the caption buttons answer HTCLIENT
+                    // (see WM_NCHITTEST), and on a window whose whole frame was
+                    // handed back by WM_NCCALCSIZE there is no non-client area
+                    // to leave — TME_NONCLIENT would fire a leave immediately,
+                    // clearing the hover right after it was set.
+                    dwFlags: TME_LEAVE,
                     hwndTrack: self.main_hwnd,
                     dwHoverTime: 0,
                 };
@@ -497,7 +553,11 @@ impl App {
         self.hover_tracking = false;
         let maximized = self.is_maximized();
         let active = self.active;
-        if self.tabbar.set_chrome(None, maximized, active) {
+        let mut dirty = self.tabbar.set_chrome(None, maximized, active);
+        if self.tabbar.set_hover_tab(None) {
+            dirty = true;
+        }
+        if dirty {
             self.invalidate_band();
         }
     }
@@ -1359,6 +1419,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
             let cr = app.client();
+            let hit = app.tabbar.hit(pt.x, pt.y, cr.right);
+            // Caption buttons before the resize borders: they are painted on
+            // top of the band and, at the right end, on top of the frame too —
+            // the last 6px of the right edge and the last 4px of the top edge
+            // cut straight through the min/max/close rects. Answering the
+            // border first makes a pointer gliding along the top of the strip
+            // alternate "resize" / "button" every pixel, and every crossing
+            // drops the hover and repaints the whole strip.
+            //
+            // Caption buttons stay CLIENT on purpose: reporting HTMAXBUTTON
+            // hands the button to the shell, which pops the Win11 Snap Layouts
+            // flyout on top of it — the flyout lands in the wrong place (a
+            // window with no non-client area gives it no anchor), eats the
+            // click and leaves a blank white box behind. Measured 2026-11-18:
+            // min/max stopped working, white artifact on press. Own the
+            // clicks, own the behaviour.
+            if let tabbar::Hit::Caption(_) = hit {
+                app.update_hover(pt.x, pt.y, cr.right);
+                return LRESULT(HTCLIENT as isize);
+            }
             // Resize borders are ours to answer now that there is no
             // non-client area left. Skipped while maximized: the frame hangs
             // off-screen there, so the screen edge must not answer "resize".
@@ -1381,22 +1461,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     _ => None,
                 };
                 if let Some(code) = code {
-                    app.update_hover(-1, -1, cr.right);
+                    // The pointer is on the frame, not on a button or a tab:
+                    // feeding the real point keeps the hover honest without a
+                    // special "no hit" coordinate.
+                    app.update_hover(pt.x, pt.y, cr.right);
                     return LRESULT(code as isize);
                 }
             }
             // Hover tracking rides on the hit test: every mouse move gets one,
             // whether the point ends up client or non-client.
             app.update_hover(pt.x, pt.y, cr.right);
-            match app.tabbar.hit(pt.x, pt.y, cr.right) {
-                // Caption buttons stay CLIENT on purpose: reporting
-                // HTMAXBUTTON hands the button to the shell, which pops the
-                // Win11 Snap Layouts flyout on top of it — the flyout lands in
-                // the wrong place (a window with no non-client area gives it no
-                // anchor), eats the click and leaves a blank white box behind.
-                // Measured 2026-11-18: min/max stopped working, white artifact
-                // on press. Own the clicks, own the behaviour.
-                tabbar::Hit::Caption(_) => LRESULT(HTCLIENT as isize),
+            match hit {
                 // Empty strip = caption. Below the band there must be no
                 // HTCAPTION: while a tab is still reserved there is no child
                 // covering the content, and the whole window would drag.
@@ -1499,7 +1574,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            app.tabbar.paint(hdc, app.client().right);
+            app.paint_band(hdc);
             app.paint_frame(hdc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
