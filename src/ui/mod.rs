@@ -34,11 +34,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE,
     SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMOUSELEAVE, WM_PAINT, WM_SETICON,
-    WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
-    WNDCLASSEXW,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
+    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMOUSELEAVE, WM_PAINT,
+    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
 use crate::config::ConfigHandle;
@@ -408,7 +407,14 @@ unsafe extern "system" fn tabbar_wndproc(
         | WM_NCMOUSELEAVE
         | WM_NCLBUTTONDOWN
         | WM_CAPTURECHANGED => {
-            if parent.0.is_null() { LRESULT(0) } else { SendMessageW(parent, msg, wp, lp) }
+            if parent.0.is_null() {
+                LRESULT(0)
+            } else {
+                if msg == WM_LBUTTONDOWN || msg == WM_NCLBUTTONDOWN {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(parent);
+                }
+                SendMessageW(parent, msg, wp, lp)
+            }
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -582,6 +588,7 @@ impl App {
             }
             // Visible and not minimized: do nothing at all.
         }
+        self.sync_tabbar_window();
     }
 
     /// Where the absorbed Explorer window goes: inside the hairline frame.
@@ -784,18 +791,23 @@ impl App {
         }
     }
 
-    /// Create the owned strip. Registered once; each frame gets its own HWND.
+    /// Create the owned strip. It is a top-level popup owned by the frame, not
+    /// a sibling child: a foreign Explorer pane can raise itself among the
+    /// frame's children, but it can never get above an owned popup.
     fn create_tabbar_window(&mut self) {
         ensure_tabbar_class();
         let rc = self.client();
+        let mut origin = POINT { x: 0, y: 0 };
         unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
             let hwnd = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE,
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE
+                    | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
                 TABBAR_CLASS,
                 None,
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                0,
-                0,
+                WS_POPUP | WS_CLIPSIBLINGS,
+                origin.x,
+                origin.y,
                 rc.right,
                 TABBAR_HEIGHT,
                 self.main_hwnd,
@@ -803,9 +815,36 @@ impl App {
                 windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default(),
                 None,
             )
-            .expect("create owned tab bar window");
+            .expect("create owned tab bar popup");
             self.tabbar_hwnd = hwnd;
-            self.raise_tabbar();
+            self.sync_tabbar_window();
+        }
+    }
+
+    /// Keep the popup glued to the frame's top-left, sized to its client width,
+    /// above the frame, and hidden whenever the frame is hidden.
+    fn sync_tabbar_window(&self) {
+        if self.tabbar_hwnd.0.is_null() {
+            return;
+        }
+        let rc = self.client();
+        let mut origin = POINT { x: 0, y: 0 };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
+            let visible = IsWindowVisible(self.main_hwnd).as_bool();
+            let _ = ShowWindow(
+                self.tabbar_hwnd,
+                if visible { SW_SHOW } else { SW_HIDE },
+            );
+            let _ = SetWindowPos(
+                self.tabbar_hwnd,
+                HWND_TOP,
+                origin.x,
+                origin.y,
+                rc.right,
+                TABBAR_HEIGHT,
+                SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -1208,6 +1247,7 @@ impl App {
                 unsafe {
                     let _ = ShowWindow(self.main_hwnd, SW_HIDE);
                 }
+                self.sync_tabbar_window();
                 return;
             }
             unsafe {
@@ -1431,6 +1471,7 @@ impl App {
                 unsafe {
                     let _ = ShowWindow(self.main_hwnd, SW_HIDE);
                 }
+                self.sync_tabbar_window();
                 return;
             }
             tracing::info!("last tab closed, closing window");
@@ -1542,17 +1583,7 @@ impl App {
         // HWND_TOP shuffle against the absorbed Explorer child is gone with it).
         self.tabbar.fit(rc.right);
         if !self.tabbar_hwnd.0.is_null() {
-            unsafe {
-                let _ = SetWindowPos(
-                    self.tabbar_hwnd,
-                    HWND_TOP,
-                    0,
-                    0,
-                    rc.right,
-                    TABBAR_HEIGHT,
-                    SWP_NOACTIVATE,
-                );
-            }
+            self.sync_tabbar_window();
             self.invalidate_band();
         }
         self.laid_out = None;
@@ -2126,8 +2157,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_MOVE => {
+            app_from(hwnd).sync_tabbar_window();
+            LRESULT(0)
+        }
         WM_SIZE => {
             let app = app_from(hwnd);
+            app.sync_tabbar_window();
             app.layout();
             app.dump_layout("WM_SIZE");
             // Maximize state drives the restore glyph in the caption buttons.
