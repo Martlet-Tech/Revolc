@@ -36,7 +36,7 @@ use windows::Win32::UI::Controls::{LVM_HITTEST, LVHITTESTINFO};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowExW, GetClassNameW, GetWindowThreadProcessId,
+    EnumChildWindows, EnumWindows, FindWindowExW, GetClassNameW, GetParent, GetWindowThreadProcessId,
     SendMessageW, SetTimer, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY,
 };
 
@@ -95,22 +95,26 @@ fn scan() {
 }
 
 unsafe extern "system" fn enum_top(top: HWND, _lp: LPARAM) -> BOOL {
-    inspect_frame(top);
+    inspect_window(top);
     let _ = EnumChildWindows(top, Some(enum_child), LPARAM(0));
     BOOL(1) // keep enumerating
 }
 
 unsafe extern "system" fn enum_child(child: HWND, _lp: LPARAM) -> BOOL {
-    inspect_frame(child);
+    inspect_window(child);
     BOOL(1) // keep enumerating
 }
 
-/// If `hwnd` is a folder frame owned by our process, try to attach.
-unsafe fn inspect_frame(hwnd: HWND) {
+/// If `hwnd` is the shell's file-list view owned by our process, attach.
+///
+/// `EnumChildWindows` visits *every* descendant already, so no depth-limited
+/// `FindWindowExW` search: the DefView sits 4 levels deep
+/// (`CabinetWClass -> ShellTabWindowClass -> DirectUIHWND -> SHELLDLL_DefView`).
+unsafe fn inspect_window(hwnd: HWND) {
     let mut buf = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut buf).max(0) as usize;
     let class = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
-    if class != "CabinetWClass" && class != "ExploreWClass" {
+    if class != "SHELLDLL_DefView" {
         return;
     }
 
@@ -121,16 +125,30 @@ unsafe fn inspect_frame(hwnd: HWND) {
         return;
     }
 
-    attach_on_frame(hwnd, &class);
+    attach_on_defview(hwnd);
 }
 
-unsafe fn attach_on_frame(frame: HWND, class: &str) {
-    // Win10: SHELLDLL_DefView is a descendant of the CabinetWClass frame.
-    let defview = find_descendant(frame, w!("SHELLDLL_DefView"));
-    if defview.0.is_null() {
-        crate::bho_log(&format!("dblclick: no DefView under {class} {:?}", frame.0));
-        return;
+/// Walk up from the DefView to find the command target: the
+/// `ShellTabWindowClass` ancestor when present, else the closest
+/// `CabinetWClass` ancestor.
+unsafe fn command_target_for(defview: HWND) -> Option<HWND> {
+    let mut cur = GetParent(defview).unwrap_or_default();
+    let mut fallback = None;
+    while !cur.0.is_null() {
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(cur, &mut buf).max(0) as usize;
+        let class = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+        match class.as_str() {
+            "ShellTabWindowClass" => return Some(cur),
+            "CabinetWClass" | "ExploreWClass" => fallback = Some(cur),
+            _ => {}
+        }
+        cur = GetParent(cur).unwrap_or_default();
     }
+    fallback
+}
+
+unsafe fn attach_on_defview(defview: HWND) {
 
     // Clover 0x18000e250: SysListView32 first, DirectUIHWND as fallback.
     let (view, syslist) = {
@@ -151,10 +169,9 @@ unsafe fn attach_on_frame(frame: HWND, class: &str) {
     };
 
     // Command target, mirroring Clover: ShellTabWindowClass when present,
-    // else the DefView itself.
-    let target = {
-        let tab = find_descendant(frame, w!("ShellTabWindowClass"));
-        if tab.0.is_null() { defview } else { tab }
+    // else the frame ancestor.
+    let Some(target) = command_target_for(defview) else {
+        return;
     };
 
     let set = ATTACHED.get_or_init(|| Mutex::new(HashSet::new()));
@@ -180,11 +197,11 @@ unsafe fn attach_on_frame(frame: HWND, class: &str) {
     );
     if ok.as_bool() {
         crate::bho_log(&format!(
-            "dblclick: SUBCLASSED {}={:?} target={:?} frame={:?}",
+            "dblclick: SUBCLASSED {}={:?} target={:?} defview={:?}",
             if syslist { "SysListView32" } else { "DirectUIHWND" },
             view.0,
             target.0,
-            frame.0
+            defview.0
         ));
     } else {
         // Roll back so a later scan can retry.
