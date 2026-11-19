@@ -50,8 +50,8 @@ const DBLCLICK_SLACK: i32 = 5;
 /// Per-view state, leaked as the subclass `dwRefData`. Lives on Explorer's
 /// UI thread only.
 struct Ctx {
-    /// Where `WM_COMMAND 0xA022` goes: `ShellTabWindowClass` when present,
-    /// else the DefView itself.
+    /// Where `WM_COMMAND 0xA022` goes: the `ShellTabWindowClass` ancestor
+    /// when present, else the `CabinetWClass` ancestor.
     target: HWND,
     /// The subclassed view window (SysListView32 or DirectUIHWND).
     view: HWND,
@@ -149,7 +149,6 @@ unsafe fn command_target_for(defview: HWND) -> Option<HWND> {
 }
 
 unsafe fn attach_on_defview(defview: HWND) {
-
     // Clover 0x18000e250: SysListView32 first, DirectUIHWND as fallback.
     let (view, syslist) = {
         let lv = find_descendant(defview, w!("SysListView32"));
@@ -284,9 +283,13 @@ unsafe extern "system" fn listview_subclass(
     refdata: usize,
 ) -> LRESULT {
     if msg == WM_NCDESTROY {
-        // DefSubclassProc handles subclass teardown; drop our context here.
+        // DefSubclassProc handles subclass teardown; drop our context here
+        // and forget the HWND so a recycled handle can be re-subclassed.
         if refdata != 0 {
             drop(Box::from_raw(refdata as *mut Ctx));
+        }
+        if let Ok(mut guard) = ATTACHED.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+            guard.remove(&(hwnd.0 as isize));
         }
         return DefSubclassProc(hwnd, msg, wp, lp);
     }
@@ -331,9 +334,7 @@ unsafe extern "system" fn listview_subclass(
         let x = (lp.0 as u32 & 0xffff) as i16 as i32;
         let y = ((lp.0 as u64 >> 16) & 0xffff) as i16 as i32;
         let pt = POINT { x, y };
-        if ctx.syslist {
-            // nothing extra to init
-        } else {
+        if !ctx.syslist {
             unsafe { ensure_uia(ctx) };
         }
         if unsafe { point_on_empty_space(ctx, pt) } {

@@ -12,11 +12,10 @@ mod dblclick;
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, WPARAM};
-use windows::core::{implement, w, GUID, IUnknown, Interface, HRESULT, HSTRING, PCWSTR, Ref};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, LPARAM, WPARAM};
+use windows::core::{implement, w, GUID, IUnknown, Interface, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
-use windows::Win32::UI::Shell::IWebBrowser2;
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE,
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -24,7 +23,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetAncestor, GetClassNameW, PostMessageW, RegisterWindowMessageW, GA_ROOT,
+    FindWindowW, PostMessageW, RegisterWindowMessageW,
 };
 
 /// Our COM object CLSID (also the BHO key leaf).
@@ -179,7 +178,7 @@ extern "system" fn DllGetClassObject(
             return CLASS_E_CLASSNOTAVAILABLE;
         }
         let factory: IClassFactory = BhoFactory.into();
-        unsafe { factory.query(riid, ppv) }.ok().into()
+        factory.query(riid, ppv).ok().into()
     }
 }
 
