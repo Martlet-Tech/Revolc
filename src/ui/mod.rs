@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
     ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE,
-    SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, WM_CAPTURECHANGED,
+    SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMOUSELEAVE, WM_PAINT,
@@ -773,24 +773,6 @@ impl App {
         }
     }
 
-    /// Bring our strip above every absorbed pane. No SWP_NOZORDER on purpose.
-    fn raise_tabbar(&self) {
-        if self.tabbar_hwnd.0.is_null() {
-            return;
-        }
-        unsafe {
-            let _ = SetWindowPos(
-                self.tabbar_hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-    }
-
     /// Create the owned strip. It is a top-level popup owned by the frame, not
     /// a sibling child: a foreign Explorer pane can raise itself among the
     /// frame's children, but it can never get above an owned popup.
@@ -822,7 +804,9 @@ impl App {
     }
 
     /// Keep the popup glued to the frame's top-left, sized to its client width,
-    /// above the frame, and hidden whenever the frame is hidden.
+    /// and hidden whenever the frame is hidden. SWP_NOZORDER is essential: the
+    /// popup is a top-level owned window, so raising it here would drag its
+    /// owner above the other window and make two frames fight over Z order.
     fn sync_tabbar_window(&self) {
         if self.tabbar_hwnd.0.is_null() {
             return;
@@ -843,7 +827,7 @@ impl App {
                 origin.y,
                 rc.right,
                 TABBAR_HEIGHT,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
     }
@@ -1495,7 +1479,6 @@ impl App {
         // not shown yet becomes visible exactly where the tab expects it.
         self.laid_out = None;
         self.place_active();
-        self.raise_tabbar();
         // Show FIRST, hide others second. The old ascending loop hid j<i
         // before showing j==i, so switching to a tab on the right left one
         // frame with no visible child at all — the host then erased the whole
@@ -1513,7 +1496,6 @@ impl App {
             }
         }
         self.redraw_all();
-        self.raise_tabbar();
         self.refresh_band();
         // Keyboard focus has to be handed to the other process explicitly, or
         // the address bar takes clicks but no keystrokes. A window adopted
@@ -1599,7 +1581,6 @@ impl App {
         }
         self.laid_out = None;
         self.place_active();
-        self.raise_tabbar();
         // The strip must be painted **now**, synchronously: leaving it to the
         // message queue is what produced the black rectangle right of the tabs
         // after a maximize (host already grown and erased, band not yet drawn).
@@ -1739,9 +1720,9 @@ impl App {
         for top in hide {
             host::force_visible(top, false);
         }
-        // Explorer's own ShowWindow can raise a pane above us; put the strip
-        // back on top in the same tick.
-        self.raise_tabbar();
+        // No re-raise here: the strip is a top-level owned popup, so an
+        // Explorer child pane can never cover it, and raising it every sweep
+        // would drag this frame above the other one (Z-order fight).
         for slot in self.views.iter_mut() {
             if let Some(v) = slot {
                 v.mark_shown();
