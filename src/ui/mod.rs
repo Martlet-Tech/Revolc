@@ -24,19 +24,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect,
+    DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
     IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
-    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE, SW_SHOWMAXIMIZED,
-    SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_KEYDOWN, WM_CAPTURECHANGED,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
+    ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE,
+    SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT, WM_SETICON, WM_SIZE, WM_TIMER,
-    MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME, WNDCLASSEXW,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMOUSELEAVE, WM_PAINT, WM_SETICON,
+    WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    WNDCLASSEXW,
 };
 
 use crate::config::ConfigHandle;
@@ -65,6 +67,10 @@ const TABBAR_HEIGHT: i32 = caption::HEIGHT;
 /// inset by this much, otherwise the child window paints over the frame.
 const WINDOW_BORDER: i32 = 1;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
+/// Owned sibling of every absorbed Explorer pane. Painted and hit-tested by
+/// us, and always raised above those panes, so a foreign process can never
+/// erase our title bar again.
+const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -186,6 +192,9 @@ pub(crate) struct App {
     last_client: (i32, i32),
     /// The title bar: painted here, hit-tested here (see ui/tabbar.rs).
     tabbar: tabbar::TabBar,
+    /// Real child window that owns the strip's pixels and hits. Kept above
+    /// every Explorer pane so their overhang cannot cover it.
+    tabbar_hwnd: HWND,
     main_hwnd: HWND,
     /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
     /// run, and it is the only way to drop a hover that the cursor walked out
@@ -325,6 +334,86 @@ fn ensure_class(hinstance: windows::Win32::Foundation::HINSTANCE) -> windows::co
     Err(err)
 }
 
+/// Class for the owned strip. Registered once per process, same tolerate-
+/// already-exists rule as the main class (multiple windows are normal now).
+fn ensure_tabbar_class() {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(tabbar_wndproc),
+        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        lpszClassName: TABBAR_CLASS,
+        style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return;
+    }
+    let err = windows::core::Error::from_win32();
+    if (err.code().0 as u32 & 0xffff) != 1410 {
+        tracing::warn!(error = %err, "register tab bar class failed");
+    }
+}
+
+/// The owned strip's window procedure. Painting stays here; every input and
+/// hit-test message is forwarded to the frame, which already knows how to
+/// turn a client coordinate into a tab / button / drag action. Because the
+/// strip is a sibling above the Explorer panes, nothing foreign can paint
+/// over it or steal its clicks.
+unsafe extern "system" fn tabbar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    let parent = GetParent(hwnd).unwrap_or_default();
+    let app = if parent.0.is_null() {
+        None
+    } else {
+        app_opt(parent)
+    };
+    match msg {
+        WM_PAINT => {
+            let Some(app) = app else { return DefWindowProcW(hwnd, msg, wp, lp) };
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            app.paint_band(hdc);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => LRESULT(0),
+        WM_NCHITTEST => {
+            // Let the frame decide: resize borders, caption drag, tabs and
+            // buttons all already implemented there.
+            if parent.0.is_null() {
+                LRESULT(HTCLIENT as isize)
+            } else {
+                SendMessageW(parent, WM_NCHITTEST, wp, lp)
+            }
+        }
+        WM_MOUSEMOVE => {
+            if let Some(app) = app {
+                let (x, y) = point_from_lparam(lp);
+                app.update_hover(x, y, app.client().right);
+            }
+            if parent.0.is_null() { LRESULT(0) } else { SendMessageW(parent, msg, wp, lp) }
+        }
+        WM_LBUTTONDOWN
+        | WM_LBUTTONUP
+        | WM_LBUTTONDBLCLK
+        | WM_MBUTTONUP
+        | WM_MOUSELEAVE
+        | WM_NCMOUSELEAVE
+        | WM_NCLBUTTONDOWN
+        | WM_CAPTURECHANGED => {
+            if parent.0.is_null() { LRESULT(0) } else { SendMessageW(parent, msg, wp, lp) }
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
 /// The one message loop, shared by every window in the process.
 ///
 /// `TranslateAcceleratorW` posts WM_COMMAND to the HWND it is given, so the
@@ -439,6 +528,7 @@ impl App {
             laid_out: None,
             last_client: (0, 0),
             tabbar,
+            tabbar_hwnd: HWND::default(),
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
@@ -656,7 +746,66 @@ impl App {
         let rc = self.client();
         let band = RECT { left: 0, top: 0, right: rc.right, bottom: TABBAR_HEIGHT };
         unsafe {
-            let _ = InvalidateRect(self.main_hwnd, Some(&band), false);
+            // With WS_CLIPCHILDREN the parent no longer owns these pixels:
+            // invalidate the window that actually paints them.
+            let target = if self.tabbar_hwnd.0.is_null() { self.main_hwnd } else { self.tabbar_hwnd };
+            let _ = InvalidateRect(target, Some(&band), false);
+        }
+    }
+
+    /// Repaint the strip synchronously on the window that owns its pixels.
+    fn refresh_band(&self) {
+        self.invalidate_band();
+        unsafe {
+            let target = if self.tabbar_hwnd.0.is_null() {
+                self.main_hwnd
+            } else {
+                self.tabbar_hwnd
+            };
+            let _ = UpdateWindow(target);
+        }
+    }
+
+    /// Bring our strip above every absorbed pane. No SWP_NOZORDER on purpose.
+    fn raise_tabbar(&self) {
+        if self.tabbar_hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.tabbar_hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Create the owned strip. Registered once; each frame gets its own HWND.
+    fn create_tabbar_window(&mut self) {
+        ensure_tabbar_class();
+        let rc = self.client();
+        unsafe {
+            let hwnd = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE,
+                TABBAR_CLASS,
+                None,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                0,
+                0,
+                rc.right,
+                TABBAR_HEIGHT,
+                self.main_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .expect("create owned tab bar window");
+            self.tabbar_hwnd = hwnd;
+            self.raise_tabbar();
         }
     }
 
@@ -709,7 +858,11 @@ impl App {
                     // to leave — TME_NONCLIENT would fire a leave immediately,
                     // clearing the hover right after it was set.
                     dwFlags: TME_LEAVE,
-                    hwndTrack: self.main_hwnd,
+                    hwndTrack: if self.tabbar_hwnd.0.is_null() {
+                        self.main_hwnd
+                    } else {
+                        self.tabbar_hwnd
+                    },
                     dwHoverTime: 0,
                 };
                 let _ = TrackMouseEvent(&mut tme);
@@ -1301,12 +1454,15 @@ impl App {
         // not shown yet becomes visible exactly where the tab expects it.
         self.laid_out = None;
         self.place_active();
+        self.raise_tabbar();
         for (j, slot) in self.views.iter_mut().enumerate() {
             if let Some(v) = slot {
                 v.set_visible(j == i);
             }
         }
         self.redraw_all();
+        self.raise_tabbar();
+        self.refresh_band();
         // Keyboard focus has to be handed to the other process explicitly, or
         // the address bar takes clicks but no keystrokes. A window adopted
         // before Explorer showed it cannot take focus yet: the sweep retries
@@ -1385,12 +1541,28 @@ impl App {
         // own WM_PAINT, so there is no child to move or raise any more (the old
         // HWND_TOP shuffle against the absorbed Explorer child is gone with it).
         self.tabbar.fit(rc.right);
+        if !self.tabbar_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.tabbar_hwnd,
+                    HWND_TOP,
+                    0,
+                    0,
+                    rc.right,
+                    TABBAR_HEIGHT,
+                    SWP_NOACTIVATE,
+                );
+            }
+            self.invalidate_band();
+        }
         self.laid_out = None;
         self.place_active();
+        self.raise_tabbar();
         // The strip must be painted **now**, synchronously: leaving it to the
         // message queue is what produced the black rectangle right of the tabs
         // after a maximize (host already grown and erased, band not yet drawn).
         self.redraw_all();
+        self.refresh_band();
     }
 
     /// Resize the active view, skipping the call when nothing changed.
@@ -1525,6 +1697,9 @@ impl App {
         for top in hide {
             host::force_visible(top, false);
         }
+        // Explorer's own ShowWindow can raise a pane above us; put the strip
+        // back on top in the same tick.
+        self.raise_tabbar();
         for slot in self.views.iter_mut() {
             if let Some(v) = slot {
                 v.mark_shown();
@@ -1670,6 +1845,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let args = Box::from_raw((*cs).lpCreateParams as *mut WindowArgs);
             let app = App::build(hwnd, args);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
+            let app = app_from(hwnd);
+            app.create_tabbar_window();
+            app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which
             // only exists once it is set explicitly. Both come from the same .ico.
