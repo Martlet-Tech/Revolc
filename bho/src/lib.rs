@@ -8,6 +8,8 @@
 //!
 //! Per-user registration (HKCU) so takeover never needs admin rights.
 
+mod dblclick;
+
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, WPARAM};
@@ -75,6 +77,11 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
             // so anything slow here delays every folder window. Disk logging
             // is opt-in (see bho_log).
             notify_revolc();
+            // Arm the double-click-on-empty-space scanner. A synchronous
+            // first attempt catches windows whose file-list already exists;
+            // the timer retries for views created later on the UI thread.
+            // Neither path touches the site object.
+            dblclick::arm();
             bho_log("SetSite (notify only)");
         }
         Ok(())
