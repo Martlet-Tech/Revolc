@@ -35,7 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
-    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCMOUSELEAVE, WM_PAINT,
+    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCMOUSELEAVE, WM_PAINT,
     WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
@@ -406,6 +407,7 @@ unsafe extern "system" fn tabbar_wndproc(
         | WM_MOUSELEAVE
         | WM_NCMOUSELEAVE
         | WM_NCLBUTTONDOWN
+        | WM_NCLBUTTONDBLCLK
         | WM_CAPTURECHANGED => {
             if parent.0.is_null() {
                 LRESULT(0)
@@ -2101,6 +2103,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let width = app.client().right;
             if app.tabbar.hit(x, y, width) == tabbar::Hit::Band {
                 app.toggle_maximize();
+            }
+            LRESULT(0)
+        }
+        // The empty strip answers HTCAPTION, so a double-click there arrives as
+        // WM_NCLBUTTONDBLCLK (never WM_LBUTTONDBLCLK). The owned tab-bar popup
+        // forwards it here; toggle maximize/restore exactly like a real title
+        // bar. wParam carries the hit code, lp a *screen* point.
+        WM_NCLBUTTONDBLCLK => {
+            let app = app_from(hwnd);
+            if wp.0 == HTCAPTION as usize {
+                let (sx, sy) = point_from_lparam(lp);
+                let mut pt = POINT { x: sx, y: sy };
+                unsafe {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                }
+                if pt.y < TABBAR_HEIGHT
+                    && app.tabbar.hit(pt.x, pt.y, app.client().right) == tabbar::Hit::Band
+                {
+                    app.toggle_maximize();
+                }
             }
             LRESULT(0)
         }
