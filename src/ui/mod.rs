@@ -63,9 +63,18 @@ fn absorb_msg() -> u32 {
 }
 
 const TABBAR_HEIGHT: i32 = caption::HEIGHT;
-/// Hairline between the window and whatever is behind it. The Explorer view is
-/// inset by this much, otherwise the child window paints over the frame.
-const WINDOW_BORDER: i32 = 1;
+/// Frame between the window edge and the Explorer view. The view is inset by
+/// this much so a bare strip of *our* window is left along the left, right and
+/// bottom edges — that is the only place WM_NCHITTEST reaches us (a pointer on
+/// the child pane gets HTCLIENT from the child, never a resize code from us).
+/// 1px was invisible and unreachable; 8px reads as a frame and is comfortable
+/// to grab. Painted by `paint_frame`, hit-tested by the BORDER arm below.
+/// Maximized windows use `border()` = 0 instead, to stay flush with rcWork.
+const WINDOW_BORDER: i32 = 8;
+/// Top resize strip stays thinner than `TABBAR_HEIGHT`: the tab strip needs its
+/// own top rows for tabs, and `TAB_TOP` starts at 4. Growing this past TAB_TOP
+/// would steal the top edge of every tab for resizing.
+const TOP_BORDER: i32 = 4;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// Owned sibling of every absorbed Explorer pane. Painted and hit-tested by
 /// us, and always raised above those panes, so a foreign process can never
@@ -615,8 +624,8 @@ impl App {
         }
     }
 
-    /// 1px frame around the client. The band is ours, and the view is inset, so
-    /// nothing covers it.
+    /// Frame around the client. The band is ours, and the view is inset, so
+    /// nothing covers it. Doubles as the resize-grab strip.
     fn paint_frame(&self, hdc: HDC) {
         let b = self.border();
         if b == 0 {
@@ -2002,12 +2011,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // non-client area left. Skipped while maximized: the frame hangs
             // off-screen there, so the screen edge must not answer "resize".
             if !app.is_maximized() {
-                const BORDER: i32 = 6;
-                const TOP_BORDER: i32 = 4;
-                let left = pt.x < BORDER;
-                let right = pt.x >= cr.right - BORDER;
+                // Same inset as the painted/inset frame: the child pane is
+                // pushed in by WINDOW_BORDER, so these pixels are genuinely
+                // ours and the resize code reaches us. TOP_BORDER is thinner
+                // so it stays above the tabs (TAB_TOP = 4).
+                let border = WINDOW_BORDER;
+                let left = pt.x < border;
+                let right = pt.x >= cr.right - border;
                 let top = pt.y < TOP_BORDER;
-                let bottom = pt.y >= cr.bottom - BORDER;
+                let bottom = pt.y >= cr.bottom - border;
                 let code = match (left, right, top, bottom) {
                     (true, _, true, _) => Some(HTTOPLEFT),
                     (_, true, true, _) => Some(HTTOPRIGHT),
