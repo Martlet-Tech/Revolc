@@ -4,6 +4,7 @@ pub mod icon;
 pub mod tabbar;
 pub mod tray;
 
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,21 +23,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindowVisible,
+    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
+    DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
     IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, ACCEL,
-    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HACCEL,
-    HTCAPTION, HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY,
-    WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_CAPTURECHANGED,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT,
-    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE, SW_SHOWMAXIMIZED,
+    SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_KEYDOWN, WM_CAPTURECHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MBUTTONUP, WM_NCACTIVATE, WM_NCCALCSIZE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCMOUSELEAVE, WM_PAINT, WM_SETICON, WM_SIZE, WM_TIMER,
+    MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME, WNDCLASSEXW,
 };
 
 use crate::config::ConfigHandle;
@@ -65,6 +65,19 @@ const TABBAR_HEIGHT: i32 = caption::HEIGHT;
 /// inset by this much, otherwise the child window paints over the frame.
 const WINDOW_BORDER: i32 = 1;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
+
+/// The window the user is working in right now (0 = none yet).
+///
+/// Everything here runs on one UI thread, but the stray-window sweep runs
+/// **per window**. Without a shared answer to "whose folder is this", every
+/// window's timer sees the same `CabinetWClass` and the first one to fire wins
+/// — which is the "it opened in some other window" complaint. The winner is
+/// therefore the window the user last activated, not the fastest timer.
+static LAST_ACTIVE: AtomicIsize = AtomicIsize::new(0);
+
+/// Windows alive in this process. Closing the last one is what quits the
+/// loop; closing any other one is just closing a window.
+static LIVE_WINDOWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Stray-window sweep. The BHO notify is a hint, not a guarantee: SetSite
 /// fires before the frame is shown and some folder windows never notify at
@@ -98,6 +111,13 @@ const MAX_TABS: usize = 40;
 struct WindowArgs {
     cfg: Arc<ConfigHandle>,
     initial_path: Option<String>,
+    /// Not a preference: the tray icon must exist once per process, so exactly
+    /// one window may add it (a second registration would either fail or show
+    /// two clovers in the notification area).
+    tray: bool,
+    /// Built per window by the creator; the loop translates with the table of
+    /// whichever window owns the focused control, so this cannot be shared.
+    accel: HACCEL,
 }
 
 /// A left button pressed on a tab, before the pointer has moved far enough to
@@ -113,6 +133,15 @@ struct TabPress {
 pub(crate) struct App {
     cfg: Arc<ConfigHandle>,
     keymap: Vec<(Binding, Action)>,
+    /// Accelerator table for **this** window. `TranslateAcceleratorW` posts the
+    /// resulting WM_COMMAND to the HWND it is handed, so the table cannot live
+    /// on the frame: with two windows, the second one's Ctrl+T would be
+    /// delivered to the first one's tab list.
+    accel: HACCEL,
+    /// This window owns the tray icon, so in redirect mode it is the one that
+    /// hides instead of closing. A second window has no tray entry to come
+    /// back from — hiding it would strand its absorbed Explorer windows.
+    owns_tray: bool,
     tabs: TabList,
     views: Vec<Option<Absorbed>>,
     /// HWNDs we deliberately left on the desktop (closed tabs), with the
@@ -170,35 +199,48 @@ pub(crate) struct App {
 
 pub struct MainWindow {
     hwnd: HWND,
-    accel: HACCEL,
 }
 
 impl MainWindow {
+    /// The window created by `app::run`. It owns the tray icon, the console-ctrl
+    /// target and the `--shutdown` mailbox (`FindWindowW("RevolcMain")`).
     pub fn new(cfg: Arc<ConfigHandle>, initial_path: Option<String>) -> windows::core::Result<Self> {
+        Self::create(cfg, initial_path, true)
+    }
+
+    /// Another window on the same UI thread, from the tray menu.
+    pub fn spawn_extra(cfg: Arc<ConfigHandle>) -> windows::core::Result<Self> {
+        Self::create(cfg, None, false)
+    }
+
+    fn create(
+        cfg: Arc<ConfigHandle>,
+        initial_path: Option<String>,
+        tray: bool,
+    ) -> windows::core::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
-            let wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance.into(),
-                hCursor: LoadCursorW(None, IDC_ARROW)?,
-                // Class icons: what the title bar and Alt-Tab read before the
-                // window has painted or handled WM_SETICON.
-                hIcon: icon::big(),
-                hIconSm: icon::small(),
-                lpszClassName: CLASS_NAME,
-                // CS_DBLCLKS: double-click on the empty strip toggles maximize,
-                // which only works if the class receives WM_LBUTTONDBLCLK.
-                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-                hbrBackground: HBRUSH(std::ptr::null_mut()),
-                ..Default::default()
-            };
-            let atom = RegisterClassExW(&wc);
-            if atom == 0 {
-                return Err(windows::core::Error::from_win32());
-            }
+            ensure_class(hinstance.into())?;
 
-            let args = Box::into_raw(Box::new(WindowArgs { cfg, initial_path }));
+            // Accelerator table from the event-driven keymap
+            // (event-driven, no GetAsyncKeyState polling). Built before the
+            // window so WM_CREATE can hand it to the per-window App.
+            let mut accels: Vec<ACCEL> = Vec::new();
+            for (i, (b, _)) in events::default_keymap().iter().enumerate() {
+                accels.push(ACCEL {
+                    fVirt: windows::Win32::UI::WindowsAndMessaging::ACCEL_VIRT_FLAGS(b.fvirt()),
+                    key: b.vk,
+                    cmd: (i as u16) + 1,
+                });
+            }
+            let accel = CreateAcceleratorTableW(&accels)?;
+
+            let args = Box::into_raw(Box::new(WindowArgs {
+                cfg,
+                initial_path,
+                tray,
+                accel,
+            }));
 
             let hwnd = CreateWindowExW(
                 Default::default(),
@@ -238,43 +280,136 @@ impl MainWindow {
                 hwnd, m, windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW, None,
             );
 
-            // Accelerator table from the event-driven keymap
-            // (event-driven, no GetAsyncKeyState polling).
-            let mut accels: Vec<ACCEL> = Vec::new();
-            for (i, (b, _)) in events::default_keymap().iter().enumerate() {
-                accels.push(ACCEL {
-                    fVirt: windows::Win32::UI::WindowsAndMessaging::ACCEL_VIRT_FLAGS(b.fvirt()),
-                    key: b.vk,
-                    cmd: (i as u16) + 1,
-                });
-            }
-            let accel = CreateAcceleratorTableW(&accels)?;
-
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
 
-            Ok(Self { hwnd, accel })
+            LIVE_WINDOWS.fetch_add(1, Ordering::SeqCst);
+            Ok(Self { hwnd })
         }
     }
 
     pub fn hwnd_raw(&self) -> usize {
         self.hwnd.0 as usize
     }
+}
 
-    pub fn run_message_loop(&self) -> i32 {
-        unsafe {
-            let mut msg = MSG::default();
-            loop {
-                if GetMessageW(&mut msg, None, 0, 0).as_bool() == false {
-                    return msg.wParam.0 as i32;
-                }
-                if TranslateAcceleratorW(self.hwnd, self.accel, &msg) != 0 {
-                    continue;
-                }
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+/// Register the window class, once.
+///
+/// `RegisterClassExW` fails with `ERROR_CLASS_ALREADY_EXISTS` for the second
+/// window; treating that as fatal is what kept this process single-window.
+fn ensure_class(hinstance: windows::Win32::Foundation::HINSTANCE) -> windows::core::Result<()> {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(wndproc),
+        hInstance: hinstance,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        // Class icons: what the title bar and Alt-Tab read before the window
+        // has painted or handled WM_SETICON.
+        hIcon: icon::big(),
+        hIconSm: icon::small(),
+        lpszClassName: CLASS_NAME,
+        // CS_DBLCLKS: double-click on the empty strip toggles maximize, which
+        // only works if the class receives WM_LBUTTONDBLCLK.
+        style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return Ok(());
+    }
+    let err = windows::core::Error::from_win32();
+    // 1410 = ERROR_CLASS_ALREADY_EXISTS. The class is per module, so this only
+    // means "a window of ours was created before".
+    if (err.code().0 as u32 & 0xffff) == 1410 {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// The one message loop, shared by every window in the process.
+///
+/// `TranslateAcceleratorW` posts WM_COMMAND to the HWND it is given, so the
+/// old "always translate against the first window" meant Ctrl+T pressed in a
+/// second window edited the first window's tabs. Resolve the owner per message
+/// instead: keyboard messages carry the *focused* HWND, which is very often an
+/// absorbed Explorer child — `GetAncestor(GA_ROOT)` walks back to our frame.
+pub fn run_message_loop() -> i32 {
+    unsafe {
+        let mut msg = MSG::default();
+        loop {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                return msg.wParam.0 as i32;
             }
+            if let Some(owner) = owner_window(msg.hwnd) {
+                if let Some(app) = app_opt(owner) {
+                    if TranslateAcceleratorW(owner, app.accel, &msg) != 0 {
+                        continue;
+                    }
+                }
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
+}
+
+/// Owning Revolc frame of a (possibly deeply nested, possibly cross-process)
+/// window.
+fn owner_window(hwnd: HWND) -> Option<HWND> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        app_opt(root).is_some().then_some(root)
+    }
+}
+
+/// Every top-level window of ours, in enumeration order.
+fn our_windows() -> Vec<HWND> {
+    let mut ours: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_ours),
+            LPARAM(&mut ours as *mut Vec<HWND> as isize),
+        );
+    }
+    ours
+}
+
+/// Is anything of ours on screen? Asked by a tray-resident window to decide
+/// whether it is still the only thing working on the desktop.
+fn any_visible_window() -> bool {
+    our_windows()
+        .iter()
+        .any(|h| unsafe { IsWindowVisible(*h).as_bool() })
+}
+
+/// Destroy every window of ours, leaving the loop to quit on the last
+/// `WM_DESTROY`. Used by `WM_APP_QUIT` (tray 退出 / `--shutdown` / Ctrl+C):
+/// with several windows open, quitting must not leave orphans behind.
+fn close_all_windows() {
+    // Collected first: destroying while enumerating skips windows.
+    for h in our_windows() {
+        unsafe {
+            let _ = DestroyWindow(h);
+        }
+    }
+}
+
+unsafe extern "system" fn enum_ours(hwnd: HWND, lp: LPARAM) -> windows::Win32::Foundation::BOOL {
+    let out = &mut *(lp.0 as *mut Vec<HWND>);
+    if app_opt(hwnd).is_some() {
+        out.push(hwnd);
+    }
+    windows::Win32::Foundation::BOOL(1)
+}
+
+unsafe fn app_opt(hwnd: HWND) -> Option<&'static mut App> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    (!ptr.is_null()).then(|| &mut *ptr)
 }
 
 unsafe fn app_from(hwnd: HWND) -> &'static mut App {
@@ -288,6 +423,8 @@ impl App {
         let mut app = Box::new(App {
             cfg: args.cfg,
             keymap: events::default_keymap(),
+            accel: args.accel,
+            owns_tray: args.tray,
             tabs: TabList::new(),
             views: Vec::new(),
             excluded: Vec::new(),
@@ -307,8 +444,9 @@ impl App {
             tab_press: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
+        let owns_tray = args.tray;
         app.new_tab(first);
-        if app.cfg.get().takeover.mode == "redirect" {
+        if owns_tray && app.cfg.get().takeover.mode == "redirect" {
             tray::add(hwnd);
             // Startup is a burst too: we just spawned Explorer.
             app.arm_burst();
@@ -987,6 +1125,53 @@ impl App {
             .unwrap_or_else(home_dir)
     }
 
+    /// May this window adopt a folder window that just appeared?
+    ///
+    /// "Put it in the window I was just using" is a process-wide question, and
+    /// every window's sweep asks it independently. `LAST_ACTIVE` answers it.
+    /// The escape clauses matter just as much as the answer: a tray-resident
+    /// window must not keep intercepting (it would pop itself up under the
+    /// cursor while the user works in another window), but it must when it is
+    /// the only thing left — that is what "resident takeover" means.
+    fn may_adopt(&self) -> bool {
+        // A reserved tab is a folder *we* spawned; nobody else may take it.
+        if self.views.iter().any(|v| v.is_none()) {
+            return true;
+        }
+        let last = LAST_ACTIVE.load(Ordering::SeqCst);
+        let me = self.main_hwnd.0 as isize;
+        let (last_usable, me_visible) = unsafe {
+            let other = HWND(last as *mut _);
+            (
+                last != 0 && IsWindow(other).as_bool() && IsWindowVisible(other).as_bool(),
+                IsWindowVisible(self.main_hwnd).as_bool(),
+            )
+        };
+        if last_usable && last != me {
+            return false;
+        }
+        // Visible (a minimised frame still counts: absorbing restores it, which
+        // is the behaviour single-window has always had), or the last one
+        // standing.
+        me_visible || !any_visible_window()
+    }
+
+    /// A second window on this UI thread, from the tray menu.
+    ///
+    /// No message loop, no thread: the new window joins the one already
+    /// running, which is what keeps `AttachThreadInput`, the sweep tables and
+    /// `WM_CAPTURECHANGED` behaving exactly as they do with one window.
+    pub(crate) fn spawn_window(&mut self) {
+        match MainWindow::spawn_extra(self.cfg.clone()) {
+            Ok(w) => unsafe {
+                // The user is about to work *here*; without this the batch
+                // still in flight would be routed to the previous window.
+                let _ = SetForegroundWindow(w.hwnd);
+            },
+            Err(e) => tracing::error!(error = %e, "extra window creation failed"),
+        }
+    }
+
     /// Absorb every desktop folder window Revolc doesn't own yet.
     fn sweep(&mut self) {
         if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
@@ -1006,7 +1191,14 @@ impl App {
         // the old visible-only rule: an unrelated hidden CabinetWClass is
         // none of our business.
         let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_none());
-        let strays = host::stray_folder_windows(&self.known_tops(), &excluded, expecting);
+        // Every window runs this timer. Only the one the user last touched may
+        // adopt — otherwise the destination of "open this folder" is decided by
+        // whichever timer fired first, which reads as a random window.
+        let strays = if self.may_adopt() {
+            host::stray_folder_windows(&self.known_tops(), &excluded, expecting)
+        } else {
+            Vec::new()
+        };
         if !strays.is_empty() {
             tracing::info!(
                 count = strays.len(),
@@ -1079,16 +1271,16 @@ impl App {
         self.tabs.remove(i);
         self.views.remove(i);
         if self.tabs.is_empty() {
-            // spec §7: in redirect mode stay resident in the tray so takeover
-            // keeps working; otherwise exit.
-            if self.cfg.get().takeover.mode == "redirect" {
+            // spec §7: in redirect mode the resident window stays in the tray
+            // so takeover keeps working; otherwise exit.
+            if self.owns_tray && self.cfg.get().takeover.mode == "redirect" {
                 tracing::info!("last tab closed, hiding to tray (redirect mode)");
                 unsafe {
                     let _ = ShowWindow(self.main_hwnd, SW_HIDE);
                 }
                 return;
             }
-            tracing::info!("last tab closed, exiting");
+            tracing::info!("last tab closed, closing window");
             unsafe {
                 let _ = DestroyWindow(self.main_hwnd);
             }
@@ -1135,6 +1327,13 @@ impl App {
     /// our window is the active window, and detached otherwise: merged queues
     /// also share hangs, so a stuck Explorer would freeze Revolc too.
     fn sync_input_queue(&mut self) {
+        // AttachThreadInput is per *thread*, not per window. With two windows
+        // open, the one that just lost focus must not detach the queue the
+        // other one is using — and the activation order between them is not
+        // guaranteed, so "am I the last activated" is the only stable test.
+        if !self.active && LAST_ACTIVE.load(Ordering::SeqCst) != self.main_hwnd.0 as isize {
+            return;
+        }
         let want = if self.active {
             self.views
                 .get(self.tabs.active_index())
@@ -1492,8 +1691,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             app_from(hwnd).release_all();
-            PostQuitMessage(0);
+            // One window closing is not the end of the session any more: the
+            // loop quits when the *last* window is gone (tray-resident mode
+            // survives on the remaining ones).
+            let left = LIVE_WINDOWS
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
+                .unwrap_or(0);
+            if LAST_ACTIVE.load(Ordering::SeqCst) == hwnd.0 as isize {
+                LAST_ACTIVE.store(0, Ordering::SeqCst);
+            }
+            if left <= 1 {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            // Free the per-window App and its accelerator table. Windows can
+            // be spawned and closed repeatedly now, so a leaked Box per window
+            // would be an actual leak rather than a one-off.
+            let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            if ptr != 0 {
+                let app = Box::from_raw(ptr as *mut App);
+                if !app.accel.is_invalid() {
+                    let _ = DestroyAcceleratorTable(app.accel);
+                }
+                drop(app);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         // Maximize to the **work area**, not to the monitor.
         //
@@ -1779,11 +2003,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
-            // redirect mode: closing the window means "hide to the tray" —
-            // the takeover keeps running (Clover semantics). Real exit lives
-            // in the tray menu and in WM_APP_QUIT (--shutdown).
+            // redirect mode: closing the *resident* window means "hide to the
+            // tray" — the takeover keeps running (Clover semantics). Real exit
+            // lives in the tray menu and in WM_APP_QUIT (--shutdown). Extra
+            // windows have no tray entry, so they close like any other window.
             let app = app_from(hwnd);
-            if app.cfg.get().takeover.mode == "redirect" {
+            if app.owns_tray && app.cfg.get().takeover.mode == "redirect" {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
@@ -1793,9 +2018,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         m if m == WM_APP_QUIT => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
+            // Every window, not just this one: 退出 in the tray menu means the
+            // process is gone, and the last WM_DESTROY posts the quit. Take the
+            // icon out first — Windows would clean it up on hover, but that
+            // leaves a dead clover in the notification area until then.
+            tray::remove(hwnd);
+            close_all_windows();
             LRESULT(0)
         }
         // WM_ENDSESSION (logoff/shutdown): restore absorbed windows NOW —
@@ -1813,6 +2041,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             // low word: WA_INACTIVE(0) / WA_ACTIVE(1) / WA_CLICKACTIVE(2)
             app.active = (wp.0 & 0xffff) as u32 != 0;
+            if app.active {
+                // Who gets the next stray folder window: this one.
+                LAST_ACTIVE.store(hwnd.0 as isize, Ordering::SeqCst);
+            }
             app.sync_input_queue();
             app.sync_chrome();
             if app.active {

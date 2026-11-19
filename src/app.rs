@@ -99,9 +99,10 @@ pub fn run(initial_path: Option<String>) -> i32 {
         }
     }
 
-    let code = window.run_message_loop();
+    let code = ui::run_message_loop();
 
     drop(watcher);
+    drop(window);
     code
 }
 

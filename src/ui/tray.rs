@@ -3,19 +3,20 @@
 //! Minimal: our icon, right-click menu, left click to bring the window back.
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenuEx, MF_STRING,
-    TPM_RETURNCMD, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+    AppendMenuW, CreatePopupMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
+    TrackPopupMenuEx, MF_STRING, TPM_RETURNCMD, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 pub const WM_APP_TRAY: u32 = 0x8004;
 const TRAY_ID: u32 = 1;
 const CMD_OPEN: usize = 1;
 const CMD_EXIT: usize = 2;
+const CMD_NEW_WINDOW: usize = 3;
 
 /// Add the tray icon. Returns false on failure (non-fatal).
 pub fn add(hwnd: HWND) -> bool {
@@ -76,6 +77,7 @@ pub unsafe fn on_tray_message(hwnd: HWND, lp: LPARAM, app: &mut crate::ui::App) 
     // Right-click: context menu.
     let menu = CreatePopupMenu().ok()?;
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("打开 Revolc"));
+    let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_WINDOW, w!("新建窗口"));
     let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("退出"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
@@ -86,9 +88,14 @@ pub unsafe fn on_tray_message(hwnd: HWND, lp: LPARAM, app: &mut crate::ui::App) 
             app.open_main();
             Some(LRESULT(0))
         }
+        CMD_NEW_WINDOW => {
+            app.spawn_window();
+            Some(LRESULT(0))
+        }
         CMD_EXIT => {
-            remove(hwnd);
-            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            // Destroy every window through the shared quit path; killing just
+            // this one would leave the others running with no tray icon.
+            let _ = PostMessageW(hwnd, crate::ui::WM_APP_QUIT, WPARAM(0), LPARAM(0));
             Some(LRESULT(0))
         }
         _ => Some(LRESULT(0)),
