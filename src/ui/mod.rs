@@ -2237,6 +2237,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
+                // The tab strip is an owned top-level popup, not a child of the
+                // frame: hiding the owner does not hide it. Without this the
+                // strip stays painted on the desktop after clicking X.
+                app.sync_tabbar_window();
                 tracing::info!("main window hidden to tray (redirect mode)");
                 return LRESULT(0);
             }
