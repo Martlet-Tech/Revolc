@@ -1496,9 +1496,20 @@ impl App {
         self.laid_out = None;
         self.place_active();
         self.raise_tabbar();
+        // Show FIRST, hide others second. The old ascending loop hid j<i
+        // before showing j==i, so switching to a tab on the right left one
+        // frame with no visible child at all — the host then erased the whole
+        // client to the tab-bar background (the green flash). Switching left
+        // happened to show the lower-index target before hiding the old pane,
+        // which is why the bug was direction-dependent.
+        if let Some(v) = self.views.get_mut(i).and_then(|slot| slot.as_mut()) {
+            v.set_visible(true);
+        }
         for (j, slot) in self.views.iter_mut().enumerate() {
-            if let Some(v) = slot {
-                v.set_visible(j == i);
+            if j != i {
+                if let Some(v) = slot {
+                    v.set_visible(false);
+                }
             }
         }
         self.redraw_all();
