@@ -1129,8 +1129,9 @@ impl App {
         });
         let Some(i) = idx else {
             // Window may not be absorbed yet (BHO fires during creation), or
-            // belongs to another Revolc window — both are normal.
-            tracing::debug!(?hwnd, ?path, "BHO navigation: no matching tab in this window");
+            // belongs to another Revolc window — both are normal. INFO so a
+            // hand-test can tell "arrived but unmatched" from "never sent".
+            tracing::info!(?hwnd, ?path, "BHO navigation: no matching tab in this window");
             return;
         };
         let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
@@ -2787,6 +2788,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !cds.is_null() && (*cds).dwData == NAV_COPYDATA_TAG {
                 let len = (*cds).cbData as usize;
                 let ptr = (*cds).lpData as *const u8;
+                tracing::info!(len, "WM_COPYDATA nav received");
                 if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
                     let payload = std::slice::from_raw_parts(ptr, len);
                     if let Ok(text) = std::str::from_utf8(payload) {

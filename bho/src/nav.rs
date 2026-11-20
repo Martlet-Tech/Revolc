@@ -89,15 +89,18 @@ fn send_navigation(hwnd: isize, url: &str) {
         lpData: bytes.as_mut_ptr() as *mut core::ffi::c_void,
     };
     unsafe {
+        let mut sent = 0usize;
         let _ = EnumWindows(
             Some(send_nav_window),
-            windows::Win32::Foundation::LPARAM(&mut cds as *mut COPYDATASTRUCT as isize),
+            windows::Win32::Foundation::LPARAM(&mut (&mut cds, &mut sent) as *mut (_, &mut usize)
+                as isize),
         );
+        crate::bho_log(&format!("[nav] sent to {sent} RevolcMain windows hwnd={hwnd:#x} url={url:?}"));
     }
 }
 
 unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
-    let cds = &*(lp.0 as *const COPYDATASTRUCT);
+    let (cds, sent) = &mut *(lp.0 as *mut (*mut COPYDATASTRUCT, usize));
     let mut cls = [0u16; 64];
     let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut cls);
     if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "RevolcMain" {
@@ -106,11 +109,12 @@ unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Founda
             hwnd,
             WM_COPYDATA,
             windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(cds as *const COPYDATASTRUCT as isize),
+            windows::Win32::Foundation::LPARAM(*cds as *const COPYDATASTRUCT as isize),
             SMTO_ABORTIFHUNG,
             200,
             Some(&mut r),
         );
+        *sent += 1;
     }
     windows::Win32::Foundation::BOOL(1)
 }
