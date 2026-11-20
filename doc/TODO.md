@@ -21,9 +21,17 @@
 
 4. ~~M1 会话持久化~~ / ~~M2 书签栏~~：**缓办**（2026-11-18 决定先做 M3）。
 4b. **标签右键菜单（2026-11-20 分支 `feat/tab-context-menu`）**：
-   - ✅ 一期（commit `f175501`）：菜单骨架 + 在新窗口打开 / 关闭 / 关其他 / 关右侧 / 右侧新建。
-   - ✅ 二期：收藏栏 UI 空壳（`[bookmarks] enabled` 开关，热重载；独立 owned popup，
-     `view_rect` 下推 FE）。**本轮交此步，等手测**。
+   - ✅ 一期（`f175501`）：菜单骨架 + 在新窗口打开 / 关闭 / 关其他 / 关右侧 / 右侧新建。
+   - ✅ 二期（`694371f`）：收藏栏 UI 空壳（`[bookmarks] enabled` 开关，热重载；独立 owned popup）。
+   - ✅ 2.5（`5879be7`~`2dc9f91`）：**BHO 导航事件推送**——DWebBrowserEvents2 订阅 +
+     WM_COPYDATA 推送 + **label 匹配**。踩坑记录（重要）：
+     ①DISPID 250=BeforeNavigate2，NavigateComplete2=**252**，DocumentComplete=**259**；
+     ②窗口被 SetParent 吸收后 `get_HWND` 返回宿主 RevolcMain（父链无 CabinetWClass）——
+     HWND/pid 匹配均不可靠（pid 理论 1:1 但手测仍偶发失配）；
+     ③**tab label（窗口标题）是唯一从未出错的实时信号** → 推送 URL 尾段 == label 配对，
+     歧义取活动 tab，label 滞后由 sweep 重放缓存兜底；
+     ④SetSite 期间禁止调用 site 方法（订阅全部延迟到 timer 回调）。
+     `[bookmarks].enabled` → tray 启动时写/删 `bho.nav` 标记驱动订阅。
    - ⬜ 三期：加入收藏菜单项 + 书签模型 + 持久化（`bookmarks.json`）。
    - ⬜ 四期：固定标签页(pin)。
    **「重新打开关闭的标签页」明确不做**（浏览器式 reopen 需要 close stack：在 `close_tab`
