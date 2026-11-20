@@ -126,6 +126,13 @@ impl TabList {
         }
     }
 
+    /// Drop every tab (window close confirmed). Active resets; the id counter
+    /// keeps going so ids stay unique for the life of the process.
+    pub fn clear(&mut self) {
+        self.tabs.clear();
+        self.active = 0;
+    }
+
     pub fn cycle(&mut self, forward: bool) {
         if self.tabs.is_empty() {
             return;

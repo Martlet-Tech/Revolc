@@ -86,6 +86,15 @@ pub fn run(initial_path: Option<String>) -> i32 {
         }
     };
 
+    // Redirect + tray: the hidden resident keeps the session (and the tray
+    // icon) alive after the last window closes — docs/双进程架构设计.md
+    // Phase 1. Failure is non-fatal: takeover just dies with the windows.
+    if cfg.get().takeover.mode == "redirect" && cfg.get().tray.enabled {
+        if let Err(e) = ui::resident::create(cfg.clone()) {
+            tracing::error!(error = %e, "resident window creation failed");
+        }
+    }
+
     let watcher = spawn_config_watcher(cfg.clone(), window.hwnd_raw());
     takeover::ensure_bho_registered(&cfg.get().takeover.mode);
 

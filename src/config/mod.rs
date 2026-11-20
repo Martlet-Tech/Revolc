@@ -13,6 +13,21 @@ pub struct Config {
     pub theme: Theme,
     pub behavior: Behavior,
     pub takeover: Takeover,
+    pub tray: Tray,
+}
+
+/// Tray icon (Phase 1 of docs/双进程架构设计.md). Read at startup only:
+/// changing `enabled` requires a restart until the tray becomes its own exe.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Tray {
+    pub enabled: bool,
+}
+
+impl Default for Tray {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +80,7 @@ impl Default for Config {
             theme: Theme::default(),
             behavior: Behavior::default(),
             takeover: Takeover::default(),
+            tray: Tray::default(),
         }
     }
 }
