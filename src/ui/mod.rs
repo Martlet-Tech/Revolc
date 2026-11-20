@@ -1202,7 +1202,7 @@ impl App {
         self.nav_cache
             .retain(|(p, _, t)| p != &pid && t.elapsed() < Self::NAV_CACHE_TTL);
         self.nav_cache.push((pid, path.clone(), Instant::now()));
-        tracing::info!(?pid, ?path, "BHO push cached (no label/pid match yet)");
+        tracing::debug!(?pid, ?path, "BHO push cached (no label/pid match yet)");
     }
 
     /// Reconcile cached pushes whose tab label has caught up with the push's
@@ -1481,7 +1481,7 @@ impl App {
                 tracing::info!(?top, ?pid, path = ?cached, "absorb: seeding path from BHO cache");
                 self.tabs.set_path(idx, cached);
             } else {
-                let store = host::read_folder_path(top, 1, false).unwrap_or_default();
+                let store = host::read_folder_path(top, 1).unwrap_or_default();
                 if !store.is_empty() {
                     self.tabs.set_path(idx, store);
                 }
@@ -1693,7 +1693,7 @@ impl App {
                 continue;
             }
             self.path_done.push(top.0 as isize);
-            if let Some(p) = host::read_folder_path(top, 1, false) {
+            if let Some(p) = host::read_folder_path(top, 1) {
                 self.tabs.set_path(i, p);
             }
         }
@@ -2890,7 +2890,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !cds.is_null() && (*cds).dwData == NAV_COPYDATA_TAG {
                 let len = (*cds).cbData as usize;
                 let ptr = (*cds).lpData as *const u8;
-                tracing::info!(len, "WM_COPYDATA nav received");
+                tracing::debug!(len, "WM_COPYDATA nav received");
                 if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
                     let payload = std::slice::from_raw_parts(ptr, len);
                     if let Ok(text) = std::str::from_utf8(payload) {

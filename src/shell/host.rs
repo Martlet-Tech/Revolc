@@ -459,68 +459,38 @@ pub fn is_absorbed(top: HWND, host: HWND) -> bool {
 /// time for the user — hence "between", not "after each": the old loop slept
 /// 50ms even after its last attempt, i.e. every call paid a full frame stall
 /// for nothing.
-/// Read the live folder path of `top` via IShellWindows.
 ///
-/// `diagnose` prints every enumerated browser (HWND, pid, LocationURL) so a
-/// single hand-test can show *why* a match failed — navigation tracking turns
-/// it on. SetParent re-parents the CabinetWClass under our frame, which is why
-/// neither the old parent check nor a naive HWND compare is reliable: fall
-/// back to matching the owning explorer.exe process id.
-pub fn read_folder_path(top: HWND, retries: usize, diagnose: bool) -> Option<String> {
+/// Fallback only: the BHO navigation push (see bho/src/nav.rs) is the primary
+/// source of live paths now. This reader is blind to re-parented windows, so
+/// absorb uses it only when no push ever arrived (Revolc started after the
+/// window did). The reverse-IsChild match is intentionally absent — it
+/// cross-wired every tab to the first shell window (2026-11-20).
+pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
     unsafe {
         let top_pid = GetWindowThreadProcessId(top, None);
-        let svc: IShellWindows =
-            match CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER) {
-                Ok(s) => s,
-                Err(e) => {
-                    if diagnose {
-                        tracing::warn!(error = %e, "read_folder_path: CoCreateInstance failed");
-                    }
-                    return None;
-                }
-            };
+        let svc: IShellWindows = CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER)
+            .ok()?;
         for attempt in 0..retries.max(1) {
             let count = svc.Count().unwrap_or(0);
-            if diagnose {
-                tracing::info!(?top, top_pid, count, attempt, "read_folder_path: enumerating");
-            }
             for i in 0..count {
                 let Ok(dispatch) = svc.Item(&VARIANT::from(i)) else { continue };
                 let Ok(browser) = dispatch.cast::<IWebBrowser2>() else { continue };
                 let Ok(whwnd) = browser.HWND() else { continue };
                 let hwnd = HWND(whwnd.0 as *mut _);
                 let bpid = GetWindowThreadProcessId(hwnd, None);
-                let url = browser.LocationURL().map(|u| u.to_string()).unwrap_or_default();
-                let path = file_url_to_path(&url);
                 let hwnd_match = hwnd.0 == top.0 || IsChild(top, hwnd).as_bool();
-                // NO `IsChild(hwnd, top)` here: the reverse direction matches
-                // our own frame (or sibling absorbed windows' ancestors) to
-                // any top, which cross-wired every tab to the first shell
-                // window (observed 2026-11-20 04:35: "MATCH p=C:\Users\zt"
-                // for a tab showing something else entirely).
                 let pid_match = top_pid != 0 && top_pid == bpid;
-                if diagnose {
-                    tracing::info!(
-                        ?hwnd, bpid, ?url, ?path, hwnd_match, pid_match,
-                        "read_folder_path: browser"
-                    );
-                }
                 if !hwnd_match && !pid_match {
                     continue;
                 }
-                if let Some(p) = path {
-                    if diagnose {
-                        tracing::info!(?top, ?p, hwnd_match, pid_match, "read_folder_path: MATCH");
-                    }
+                let url = browser.LocationURL().map(|u| u.to_string()).unwrap_or_default();
+                if let Some(p) = file_url_to_path(&url) {
                     return Some(p);
                 }
             }
             if attempt + 1 < retries {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-        }
-        if diagnose {
-            tracing::warn!(?top, top_pid, "read_folder_path: NO MATCH");
         }
         None
     }
