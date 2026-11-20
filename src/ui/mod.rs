@@ -14,10 +14,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    RedrawWindow, ScreenToClient, SelectObject, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-    RDW_UPDATENOW, SRCCOPY,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
+    InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, SRCCOPY, TRANSPARENT, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
@@ -33,7 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
+    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL,
+    HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
     ICON_BIG, ICON_SMALL, IDC_ARROW, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
     SW_MINIMIZE, SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, TPM_RETURNCMD,
@@ -86,6 +88,10 @@ const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// us, and always raised above those panes, so a foreign process can never
 /// erase our title bar again.
 const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
+/// Owned popup for the bookmark bar, sitting between the tab strip and the
+/// absorbed Explorer pane (feat/tab-context-menu phase 2).
+const BOOKMARK_CLASS: PCWSTR = w!("RevolcOwnedBookmarkBar");
+const BOOKMARK_HEIGHT: i32 = 28;
 /// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
 /// with accelerators (which use 1..=keymap.len()).
 const CMD_TAB_NEW_WINDOW: usize = 0x8001;
@@ -298,6 +304,8 @@ pub(crate) struct App {
     /// Real child window that owns the strip's pixels and hits. Kept above
     /// every Explorer pane so their overhang cannot cover it.
     tabbar_hwnd: HWND,
+    /// Owned bookmark-bar popup below the tab strip (may be null when disabled).
+    bookmarkbar_hwnd: HWND,
     main_hwnd: HWND,
     /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
     /// run, and it is the only way to drop a hover that the cursor walked out
@@ -451,6 +459,30 @@ fn ensure_tabbar_class() {
     }
 }
 
+/// Class for the bookmark bar popup. Same tolerates-already-exists rule.
+fn ensure_bookmark_class() {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(bookmark_wndproc),
+        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        lpszClassName: BOOKMARK_CLASS,
+        // No CS_HREDRAW/VREDRAW: SetWindowPos in every sync would otherwise
+        // invalidate the whole strip on each move/resize. Content is static
+        // in phase 2; phase 3 will double-buffer it when items go in.
+        style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return;
+    }
+    let err = windows::core::Error::from_win32();
+    if (err.code().0 as u32 & 0xffff) != 1410 {
+        tracing::warn!(error = %err, "register bookmark bar class failed");
+    }
+}
+
 /// The owned strip's window procedure. Painting stays here; every input and
 /// hit-test message is forwarded to the frame, which already knows how to
 /// turn a client coordinate into a tab / button / drag action. Because the
@@ -511,6 +543,60 @@ unsafe extern "system" fn tabbar_wndproc(
                 if msg == WM_LBUTTONDOWN || msg == WM_NCLBUTTONDOWN {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(parent);
                 }
+                SendMessageW(parent, msg, wp, lp)
+            }
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Bookmark bar popup. Phase 2 is UI-only: paint a placeholder strip; clicks
+/// are forwarded to the frame but do nothing until phase 3 wires in items.
+unsafe extern "system" fn bookmark_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    let parent = GetParent(hwnd).unwrap_or_default();
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let cfg = app_opt(parent).map(|a| a.cfg.clone());
+            let (r, g, b) = cfg
+                .as_ref()
+                .map(|c| c.get().color(|t| &t.bookmark_bar_background))
+                .unwrap_or((0x20, 0x20, 0x20));
+            let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
+            let _ = FillRect(hdc, &rc, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+
+            // Placeholder caption. Phase 3 replaces this with real bookmarks.
+            let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
+            let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
+            let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
+            let _ = SetTextColor(hdc, COLORREF((tb as u32) << 16 | (tg as u32) << 8 | tr as u32));
+            let mut text = RECT { left: 10, top: 0, right: rc.right - 10, bottom: rc.bottom };
+            let mut label: Vec<u16> = "收藏夹".encode_utf16().chain(Some(0)).collect();
+            let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            let _ = SelectObject(hdc, old_font);
+
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => LRESULT(0),
+        // Clicks/hover belong to the frame until phase 3 gives items meaning.
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE => {
+            if parent.0.is_null() {
+                LRESULT(0)
+            } else {
                 SendMessageW(parent, msg, wp, lp)
             }
         }
@@ -600,6 +686,7 @@ impl App {
             last_client: (0, 0),
             tabbar,
             tabbar_hwnd: HWND::default(),
+            bookmarkbar_hwnd: HWND::default(),
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
@@ -635,15 +722,17 @@ impl App {
         self.sync_tabbar_window();
     }
 
-    /// Where the absorbed Explorer window goes: inside the hairline frame.
+    /// Where the absorbed Explorer window goes: inside the hairline frame,
+    /// below the tab strip and the (optional) bookmark bar.
     fn view_rect(&self) -> RECT {
         let rc = self.client();
         let b = self.border();
+        let top = TABBAR_HEIGHT + self.bookmark_height();
         RECT {
             left: b,
-            top: TABBAR_HEIGHT,
+            top,
             right: (rc.right - b).max(b),
-            bottom: (rc.bottom - b).max(TABBAR_HEIGHT),
+            bottom: (rc.bottom - b).max(top),
         }
     }
 
@@ -871,6 +960,74 @@ impl App {
                 origin.y,
                 rc.right,
                 TABBAR_HEIGHT,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+        // Keep the second overlay in step with show/hide and moves.
+        self.sync_bookmarkbar_window();
+    }
+
+    /// Bookmark bar height: 0 when disabled, so the Explorer view starts right
+    /// under the tab strip. Read from config each call for hot reload.
+    fn bookmark_height(&self) -> i32 {
+        if self.cfg.get().bookmarks.enabled {
+            BOOKMARK_HEIGHT
+        } else {
+            0
+        }
+    }
+
+    /// Create the bookmark-bar popup just below the tab strip. Created once
+    /// (like the strip); `[bookmarks].enabled` only toggles its visibility via
+    /// `sync_bookmarkbar_window`, so it can be hot-reloaded.
+    fn create_bookmarkbar_window(&mut self) {
+        ensure_bookmark_class();
+        let rc = self.client();
+        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
+            let hwnd = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE
+                    | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+                BOOKMARK_CLASS,
+                None,
+                WS_POPUP | WS_CLIPSIBLINGS,
+                origin.x,
+                origin.y,
+                rc.right,
+                BOOKMARK_HEIGHT,
+                self.main_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .expect("create owned bookmark bar popup");
+            self.bookmarkbar_hwnd = hwnd;
+            self.sync_bookmarkbar_window();
+        }
+    }
+
+    /// Glue the bookmark popup under the strip, hide it with the frame or when
+    /// disabled. SWP_NOZORDER for the same reason as the tab strip.
+    fn sync_bookmarkbar_window(&self) {
+        let hwnd = self.bookmarkbar_hwnd;
+        if hwnd.0.is_null() {
+            return;
+        }
+        let rc = self.client();
+        let enabled = self.cfg.get().bookmarks.enabled;
+        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
+            let visible = IsWindowVisible(self.main_hwnd).as_bool() && enabled;
+            let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                origin.x,
+                origin.y,
+                rc.right,
+                BOOKMARK_HEIGHT,
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
@@ -2043,6 +2200,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
             app.create_tabbar_window();
+            app.create_bookmarkbar_window();
             app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which
@@ -2515,7 +2673,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == WM_APP_CONFIG_CHANGED => {
-            app_from(hwnd).sync_tabbar();
+            let app = app_from(hwnd);
+            app.sync_tabbar();
+            // [bookmarks].enabled may have flipped: re-sync the popup and
+            // re-lay out so the Explorer view starts below/above it.
+            app.sync_bookmarkbar_window();
+            if !app.bookmarkbar_hwnd.0.is_null() {
+                let _ = InvalidateRect(app.bookmarkbar_hwnd, None, true);
+            }
+            app.laid_out = None;
+            app.layout();
             LRESULT(0)
         }
         m if m == WM_TIMER && wp.0 == SWEEP_TIMER_ID => {
