@@ -1328,7 +1328,7 @@ impl App {
         // retries for nothing: resolve it on a later sweep instead.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
         if need_path && visible {
-            let store = host::read_folder_path(top, 1).unwrap_or_default();
+            let store = host::read_folder_path(top, 1, false).unwrap_or_default();
             if !store.is_empty() {
                 self.tabs.set_path(idx, store);
             }
@@ -1503,15 +1503,46 @@ impl App {
     /// say "此电脑" after the user navigates away from "zt".
     fn refresh_labels(&mut self) -> bool {
         let mut changed = false;
+        // Collect first: track_navigation needs &mut self, so we cannot call
+        // it while `views` / `tabs` are borrowed in the loop body.
+        let mut navigated: Vec<(usize, HWND, String)> = Vec::new();
         for (i, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot {
                 let title = host::window_title(v.top);
-                if !title.is_empty() && self.tabs.set_label(i, title) {
+                if !title.is_empty() && self.tabs.set_label(i, title.clone()) {
                     changed = true;
+                    navigated.push((i, v.top, title));
                 }
             }
         }
+        for (i, top, title) in navigated {
+            // A changed Explorer title almost always means the user navigated.
+            // Capture the live folder now so Tab.path stops being a stale
+            // snapshot of where the tab was opened.
+            self.track_navigation(i, top, &title);
+        }
         changed
+    }
+
+    /// Navigation tracking (feat/tab-context-menu): when a tab's window title
+    /// changes, read its live folder path and write it back to Tab.path, with
+    /// a log line so navigation is observable. Uses the diagnosing reader so
+    /// a failure also records why (IShellWindows enumeration + pid match).
+    fn track_navigation(&mut self, i: usize, top: HWND, title: &str) {
+        let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+        match host::read_folder_path(top, 1, true) {
+            Some(path) if path != old => {
+                tracing::info!(tab = i, ?old, new = ?path, title, "tab navigated");
+                self.tabs.set_path(i, path);
+            }
+            Some(_) => {
+                tracing::debug!(tab = i, ?old, title, "tab title changed, path unchanged");
+            }
+            None => {
+                tracing::warn!(tab = i, ?old, title, ?top,
+                    "tab title changed but live path unreadable; Tab.path stays stale");
+            }
+        }
     }
 
     /// Fill in the folder path of tabs that were absorbed before their window
@@ -1532,7 +1563,7 @@ impl App {
                 continue;
             }
             self.path_done.push(top.0 as isize);
-            if let Some(p) = host::read_folder_path(top, 1) {
+            if let Some(p) = host::read_folder_path(top, 1, false) {
                 self.tabs.set_path(i, p);
             }
         }
@@ -1544,10 +1575,21 @@ impl App {
     /// the tab was opened with; the user may have navigated since. Used by the
     /// context menu (which can target a non-active tab) and by `+` / shortcuts.
     fn folder_path_of(&self, i: usize) -> String {
+        let label = self.tabs.get(i).map(|t| t.label.clone()).unwrap_or_default();
+        let stored = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
         if let Some(v) = self.views.get(i).and_then(|s| s.as_ref()) {
-            if let Some(p) = host::read_folder_path(v.top, 1) {
+            if let Some(p) = host::read_folder_path(v.top, 1, true) {
+                if p != stored {
+                    tracing::info!(tab = i, ?label, live = ?p, ?stored,
+                        "folder_path_of: live path differs from stored (navigated since open)");
+                }
                 return p;
             }
+            tracing::warn!(tab = i, ?label, ?stored, top = ?v.top,
+                "folder_path_of: live read FAILED, falling back to stored path");
+        } else {
+            tracing::warn!(tab = i, ?label, ?stored,
+                "folder_path_of: no view for tab, falling back to stored path");
         }
         self.tabs
             .get(i)
