@@ -20,9 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
-};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -117,11 +115,14 @@ fn ledger() -> Option<&'static Ledger> {
 struct SweepLock(HANDLE);
 
 impl SweepLock {
+    /// Try, never wait. Sweeps are frequent (15ms burst / 200ms idle); a
+    /// contended tick can simply be skipped. Blocking the UI thread here
+    /// would freeze dragging while another process is mid-SetParent.
     fn acquire() -> Option<Self> {
         unsafe {
             let h = CreateMutexW(None, false, w!("Local\\RevolcSweepLock")).ok()?;
-            // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80.
-            let r = WaitForSingleObject(h, INFINITE).0;
+            // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80, WAIT_TIMEOUT = 0x102.
+            let r = WaitForSingleObject(h, 0).0;
             if r == 0 || r == 0x80 {
                 Some(Self(h))
             } else {
@@ -1381,7 +1382,7 @@ impl App {
         // whole enumerate+adopt section across processes; the loser sees the
         // window already re-parented and skips it.
         let Some(_sweep_lock) = SweepLock::acquire() else {
-            tracing::warn!("sweep lock unavailable, skipping tick");
+            // Another window is mid-absorb; next tick sees the settled state.
             return;
         };
         self.sweeping = true;
@@ -1588,15 +1589,13 @@ impl App {
     /// our window is the active window, and detached otherwise: merged queues
     /// also share hangs, so a stuck Explorer would freeze Revolc too.
     fn sync_input_queue(&mut self) {
-        // AttachThreadInput is per *thread*, not per window. With two windows
-        // open, the one that just lost focus must not detach the queue the
-        // other one is using — and the activation order between them is not
-        // guaranteed, so "am I the last activated" is the only stable test.
-        if !self.active
-            && ledger().and_then(|l| l.last_active()) != Some(self.main_hwnd)
-        {
-            return;
-        }
+        // One process = one window = one UI thread now. The Phase 1 guard
+        // ("did *this* window lose focus?") used a process-local LAST_ACTIVE;
+        // in Phase 2 the shared ledger already points at the *new* window by
+        // the time WM_ACTIVATE(WA_INACTIVE) arrives, so it returned early and
+        // never detached — three windows stayed attached to three Explorer
+        // input queues: drag stuttered and taskbar clicks stopped switching.
+        // Each process owns only its own attachment; always tear it down.
         let want = if self.active {
             self.views
                 .get(self.tabs.active_index())

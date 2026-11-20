@@ -26,14 +26,41 @@ const BHO_CLSID_PATH: &str =
 const BHO_CLSID_REG_PATH: &str =
     "Software\\Classes\\CLSID\\{9F1C4E8B-6A2D-4E7B-8C13-5D04F7A2B916}";
 
-/// Ensure the BHO DLL is registered (idempotent). The DLL ships next to
-/// revolc.exe as revolc_bho.dll. With mode != "redirect" the BHO is fully
-/// unregistered (HKLM + HKCU) so system Explorer is 100% pristine.
+/// `%APPDATA%\revolc\disabled`. The BHO checks this at SetSite and does
+/// nothing when present. HKLM keys are expensive to remove (UAC every time),
+/// so "stop takeover" is now a one-file switch; full registry cleanup stays
+/// in `docs/registry/` for people who want it.
+fn disabled_marker() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("revolc").join("disabled"))
+}
+
+pub fn set_disabled(disabled: bool) {
+    let Some(path) = disabled_marker() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if disabled {
+        if std::fs::write(&path, b"1").is_ok() {
+            tracing::info!("BHO disabled by marker (HKLM registration left in place)");
+        }
+    } else if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        tracing::info!("BHO enabled (disabled marker removed)");
+    }
+}
+
+/// Ensure the BHO DLL is registered (idempotent). The DLL ships next to the
+/// exe as revolc_bho.dll. With mode != "redirect" the BHO is *disabled* via a
+/// marker and HKCU keys are wiped; HKLM is deliberately left alone so leaving
+/// takeover never prompts for UAC.
 pub fn ensure_bho_registered(mode: &str) {
     if mode != "redirect" {
         unregister_bho();
         return;
     }
+    set_disabled(false);
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -94,6 +121,7 @@ pub fn ensure_bho_registered(mode: &str) {
 }
 
 fn unregister_bho() {
+    set_disabled(true);
     // Always wipe the HKCU registration, even if the DLL is missing or
     // unregistering fails: stale keys make Explorer load a dead DLL into
     // every folder window (observed 2026-11-17).
@@ -125,11 +153,12 @@ fn unregister_bho() {
         }
         let _ = FreeLibrary(module);
     }
+    // HKLM is intentionally NOT unregistered here. Doing so requires
+    // elevation on every session end (UAC prompt) and the BHO is inert
+    // thanks to the disabled marker. `docs/registry/` has the full cleanup.
     if hklm_bho_present() {
-        tracing::warn!("HKLM BHO key present, requesting elevation for unregister");
-        elevate(&dll, "/u /s");
+        tracing::info!("HKLM BHO key left registered but disabled; see docs/registry to remove");
     }
-    tracing::info!("takeover fully disabled, system Explorer pristine");
 }
 
 fn hklm_bho_present() -> bool {

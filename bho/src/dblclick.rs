@@ -72,6 +72,9 @@ static TIMER_ARMED: OnceLock<()> = OnceLock::new();
 /// Called from `SetSite`. Schedule the scan once; Explorer's UI thread has a
 /// message loop, so the timer callback will run there.
 pub fn arm() {
+    if crate::revolc_disabled() {
+        return;
+    }
     crate::bho_log("dblclick: arm()");
     // Synchronous first pass: catch file lists already up.
     scan();
@@ -86,6 +89,9 @@ unsafe extern "system" fn timer_proc(_hwnd: HWND, _msg: u32, _id: usize, _tick: 
 }
 
 fn scan() {
+    if crate::revolc_disabled() {
+        return;
+    }
     unsafe {
         // Walk every top-level window, then recurse into children. Revolc
         // re-parents absorbed frames under its own window (WS_CHILD), so

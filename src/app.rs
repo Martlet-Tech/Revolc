@@ -45,6 +45,11 @@ pub fn run(initial_path: Option<String>) -> i32 {
     }
 
     let cfg = Arc::new(ConfigHandle::new(config::config_path()));
+    // Without the optional tray, this window process still needs the BHO to
+    // notify it. Clear a stale "disabled" marker left by a previous exit.
+    if cfg.get().takeover.mode == "redirect" {
+        revolc_common::takeover::set_disabled(false);
+    }
 
     let window = match MainWindow::new(cfg.clone(), initial_path) {
         Ok(w) => w,

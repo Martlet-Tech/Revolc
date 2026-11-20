@@ -73,6 +73,10 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
         // crashes). BHO reports "a shell window was created"; Revolc
         // discovers the new window itself via IShellWindows (out-of-proc).
         if psite.is_some() {
+            if revolc_disabled() {
+                bho_log("SetSite skipped (takeover disabled)");
+                return Ok(());
+            }
             // Notify FIRST: SetSite runs on Explorer's window-creation path,
             // so anything slow here delays every folder window. Disk logging
             // is opt-in (see bho_log).
@@ -101,8 +105,17 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
     }
 }
 
-/// Post the Explorer top-level HWND to the Revolc main window.
-/// Revolc not running → no-op (pure BHO, zero side effects).
+/// `%APPDATA%\revolc\disabled` is written by the tray/window when takeover is
+/// stopped. The BHO stays registered in HKLM but becomes a complete no-op —
+/// no notify, no Explorer subclassing — so leaving Revolc never needs a UAC
+/// prompt just to unregister.
+pub(crate) fn revolc_disabled() -> bool {
+    std::env::var_os("APPDATA")
+        .map(|d| std::path::Path::new(&d).join("revolc").join("disabled").exists())
+        .unwrap_or(false)
+}
+
+/// Optional disk logging (off by default; `%APPDATA%\revolc\bho.debug`).
 fn bho_log(msg: &str) {
     // Off by default: logging opens/writes a file on Explorer's
     // window-creation thread, which stalls every folder window and made
