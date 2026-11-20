@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "notify",
+ "revolc-common",
  "serde",
  "toml",
  "tracing",
@@ -292,6 +293,29 @@ version = "0.1.0"
 dependencies = [
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "revolc-common"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows",
+]
+
+[[package]]
+name = "revolc-tray"
+version = "0.1.0"
+dependencies = [
+ "notify",
+ "revolc-common",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

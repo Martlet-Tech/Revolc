@@ -36,7 +36,7 @@
 
 - 文件夹在标签里打开，不再糊一屏窗口
 - `Ctrl+T` 新建、`Ctrl+W` 关闭、中键点掉、拖动标签重排
-- 窗口关了不退出，缩进托盘继续接管
+- 窗口 X = 真关；托盘只是可选的快捷遥控器，不装也能用
 - **接管的是真实的 Explorer 窗口**
 
 最后一条是重点。Revolc 不是自绘一个"像资源管理器"的文件列表——你看到的 Ribbon、地址栏、右键菜单、预览窗格、详情列，以及系统里装的所有 shell 扩展，**全都是原生组件**。所以它不会慢，也不会有"这个右键菜单怎么少了一半功能"的尴尬。
@@ -46,7 +46,7 @@
 |  | Clover | Revolc |
 |---|---|---|
 | 技术栈 | 内嵌一整份 Chromium（2011 年的） | Rust + 原生 Win32，没有浏览器内核 |
-| 体积 | 几十 MB，外加一串子进程 | 一个 exe（约 2 MB）+ 一个很小的 BHO DLL |
+| 体积 | 几十 MB，外加一串子进程 | `revolc.exe`（每窗口一进程）+ 可选 `revolc-tray.exe` + 一个很小的 BHO DLL |
 | 接管方式 | 注入进程、装 hook、子类化窗口 | BHO 只发一条消息，主程序自己把窗口搬进来 |
 | 退出后 | 卸载 / 注销 | 注销 BHO，系统 100% 原样 |
 | 标题栏 | Chromium 自绘 | 一体化标题栏，标签条本身就是标题栏 |
@@ -73,9 +73,14 @@
 需要 Rust + MSVC 工具链和 Windows SDK：
 
 ```bash
-cargo build --release                  # 主程序
-cargo build --release -p revolc-bho    # BHO（要单独编，注册才生效）
+cargo build --release                       # 主程序（revolc.exe）
+cargo build --release -p revolc-tray        # 可选托盘（revolc-tray.exe）
+cargo build --release -p revolc-bho         # BHO（要单独编，注册才生效）
 ```
+
+托盘负责 BHO 注册、窗口列表、前台记账；不启动它时，双击文件夹仍会被已有的
+`revolc.exe` 窗口接管，只是没有托盘快捷入口。退出请走托盘「退出接管」或
+`revolc.exe --shutdown` / `revolc-tray.exe --shutdown`。
 
 注册方式、排错清单、这一路上踩过的坑，都写在 [`docs/交接文档.md`](docs/交接文档.md) 里——那份文档比我诚实。
 
