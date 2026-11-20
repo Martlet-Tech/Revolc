@@ -102,7 +102,7 @@
   - M5：安装包（x64+x86）+ 更新检查
   - M6：文件夹打开接管（§7；redirect 默认推荐，associate 为高级可选项）
 
-## 7. 系统文件夹打开接管（可选模块，机制调查见 doc/Takeover_Research.md）
+## 7. 系统文件夹打开接管（可选模块，机制调查见 docs/Takeover_Research.md）
 
 > 目标：复刻 Clover 的核心体验——"系统任何方式打开文件夹，打开的都是本程序"，
 > 且开关完全可控、**绝不允许弄坏系统 Explorer 或要求重启**。
@@ -125,7 +125,7 @@
 - 本程序崩溃/退出时，系统 Explorer 的任何行为不受影响（红线：接管模块的可失败性
   必须只表现为"不再接管"，绝不表现为"系统打不开文件夹"）
 
-### 7.3 硬验收标准（M6，机制分析见 doc/Takeover_Research.md §3）
+### 7.3 硬验收标准（M6，机制分析见 docs/Takeover_Research.md §3）
 
 浏览器"打开所在文件夹"（`SHOpenFolderAndSelectItems`，不走文件夹关联）必须
 调起本程序并选中文件——QTTabBar 类纯关联方案做不到，这是与 Clover 对齐的
