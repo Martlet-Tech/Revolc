@@ -20,6 +20,23 @@
 ## P1 — 里程碑主线
 
 4. ~~M1 会话持久化~~ / ~~M2 书签栏~~：**缓办**（2026-11-18 决定先做 M3）。
+4b. **标签右键菜单（2026-11-20 分支 `feat/tab-context-menu`）**：
+   - ✅ 一期（`f175501`）：菜单骨架 + 在新窗口打开 / 关闭 / 关其他 / 关右侧 / 右侧新建。
+   - ✅ 二期（`694371f`）：收藏栏 UI 空壳（`[bookmarks] enabled` 开关，热重载；独立 owned popup）。
+   - ✅ 2.5（`5879be7`~`2dc9f91`）：**BHO 导航事件推送**——DWebBrowserEvents2 订阅 +
+     WM_COPYDATA 推送 + **label 匹配**。踩坑记录（重要）：
+     ①DISPID 250=BeforeNavigate2，NavigateComplete2=**252**，DocumentComplete=**259**；
+     ②窗口被 SetParent 吸收后 `get_HWND` 返回宿主 RevolcMain（父链无 CabinetWClass）——
+     HWND/pid 匹配均不可靠（pid 理论 1:1 但手测仍偶发失配）；
+     ③**tab label（窗口标题）是唯一从未出错的实时信号** → 推送 URL 尾段 == label 配对，
+     歧义取活动 tab，label 滞后由 sweep 重放缓存兜底；
+     ④SetSite 期间禁止调用 site 方法（订阅全部延迟到 timer 回调）。
+     `[bookmarks].enabled` → tray 启动时写/删 `bho.nav` 标记驱动订阅。
+   - ⬜ 三期：加入收藏菜单项 + 书签模型 + 持久化（`bookmarks.json`）。
+   - ⬜ 四期：固定标签页(pin)。
+   **「重新打开关闭的标签页」明确不做**（浏览器式 reopen 需要 close stack：在 `close_tab`
+   里存 path+label，还得跟 discard/reserve 竞态协调；当前 `Tab` 被直接丢弃，无此基础设施）。
+   若日后要做：见 `src/tabs/mod.rs::Tab` 与 `src/ui/mod.rs::close_tab`。
 5. **M3 第一阶段（已做，分支 `m3-integrated-titlebar`）：Chrome 式一体化标题栏**
    —— 窗口去掉 `WS_CAPTION`，`WM_NCCALCSIZE` 返回 0（客户区 = 窗口矩形），
    标题栏由主窗口自绘（`ui/caption.rs` 三个按钮 + `ui/tabbar.rs` 标签条），

@@ -92,6 +92,19 @@ fn main() {
     // touch the registry (it may be launched while another window is closing).
     if cfg.get().takeover.mode == "redirect" {
         ensure_bho_registered("redirect");
+        // Navigation tracking (tab context menu) is gated by a marker file the
+        // BHO checks at window creation: `[bookmarks] enabled` drives it, so
+        // the config stays the single source of truth (hot-reloaded by the
+        // window's watcher only restarts windows; the marker persists).
+        let marker = std::env::var_os("APPDATA")
+            .map(|d| std::path::Path::new(&d).join("revolc").join("bho.nav"));
+        if let Some(m) = marker {
+            if cfg.get().bookmarks.enabled {
+                let _ = std::fs::write(&m, b"");
+            } else {
+                let _ = std::fs::remove_file(&m);
+            }
+        }
     } else {
         ensure_bho_registered("off");
     }

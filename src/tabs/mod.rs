@@ -39,6 +39,7 @@ impl TabList {
         self.active
     }
 
+    #[allow(dead_code)] // used by tests; runtime callers prefer get(index_of(id))
     pub fn active(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -79,6 +80,17 @@ impl TabList {
             }
             _ => false,
         }
+    }
+
+    /// Insert a new tab after `after` (clamped to the end) and activate it.
+    /// Returns the new tab's id.
+    pub fn insert_after(&mut self, after: usize, path: impl Into<String>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let at = (after + 1).min(self.tabs.len());
+        self.tabs.insert(at, Tab { id, path: path.into(), label: String::new() });
+        self.active = at;
+        id
     }
 
     /// Remove a tab; adjust active index. Returns removed tab.
@@ -158,6 +170,22 @@ mod tests {
         assert_eq!(t.active_index(), 1);
         assert_eq!(t.active().unwrap().id, b);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn insert_after_activates_new_tab() {
+        let mut t = TabList::new();
+        t.push("a"); // 0
+        t.push("b"); // 1
+        t.activate(0);
+        let id = t.insert_after(0, "x");
+        assert_eq!(t.iter_all().map(|x| x.path.as_str()).collect::<Vec<_>>(), ["a", "x", "b"]);
+        assert_eq!(t.active_index(), 1);
+        assert_eq!(t.active().unwrap().id, id);
+        // Clamp to end when the anchor is the last tab.
+        let _ = t.insert_after(2, "y");
+        assert_eq!(t.active_index(), 3);
+        assert_eq!(t.iter_all().last().unwrap().path, "y");
     }
 
     #[test]

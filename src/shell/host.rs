@@ -18,7 +18,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsWindow, IsWindowVisible,
+    GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsChild, IsWindow, IsWindowVisible,
     SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
@@ -459,23 +459,33 @@ pub fn is_absorbed(top: HWND, host: HWND) -> bool {
 /// time for the user — hence "between", not "after each": the old loop slept
 /// 50ms even after its last attempt, i.e. every call paid a full frame stall
 /// for nothing.
+///
+/// Fallback only: the BHO navigation push (see bho/src/nav.rs) is the primary
+/// source of live paths now. This reader is blind to re-parented windows, so
+/// absorb uses it only when no push ever arrived (Revolc started after the
+/// window did). The reverse-IsChild match is intentionally absent — it
+/// cross-wired every tab to the first shell window (2026-11-20).
 pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
     unsafe {
-        let svc: IShellWindows =
-            CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER).ok()?;
+        let top_pid = GetWindowThreadProcessId(top, None);
+        let svc: IShellWindows = CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER)
+            .ok()?;
         for attempt in 0..retries.max(1) {
             let count = svc.Count().unwrap_or(0);
             for i in 0..count {
                 let Ok(dispatch) = svc.Item(&VARIANT::from(i)) else { continue };
                 let Ok(browser) = dispatch.cast::<IWebBrowser2>() else { continue };
                 let Ok(whwnd) = browser.HWND() else { continue };
-                if GetAncestor(HWND(whwnd.0 as *mut _), GA_PARENT).0 != top.0 {
+                let hwnd = HWND(whwnd.0 as *mut _);
+                let bpid = GetWindowThreadProcessId(hwnd, None);
+                let hwnd_match = hwnd.0 == top.0 || IsChild(top, hwnd).as_bool();
+                let pid_match = top_pid != 0 && top_pid == bpid;
+                if !hwnd_match && !pid_match {
                     continue;
                 }
-                if let Ok(url) = browser.LocationURL() {
-                    if let Some(p) = file_url_to_path(&url.to_string()) {
-                        return Some(p);
-                    }
+                let url = browser.LocationURL().map(|u| u.to_string()).unwrap_or_default();
+                if let Some(p) = file_url_to_path(&url) {
+                    return Some(p);
                 }
             }
             if attempt + 1 < retries {
@@ -746,9 +756,20 @@ pub fn focus_into(host: HWND, top: HWND, already_attached: bool) {
     }
 }
 
-/// "file:///D:/dir%20name" -> "D:\dir name"
-fn file_url_to_path(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("file:///")?;
+/// Convert an Explorer `LocationURL` into a filesystem path.
+///   "file:///D:/dir%20name"          -> "D:\dir name"
+///   "file://server/share/dir"        -> "\\server\share\dir"  (UNC)
+/// Percent-decoding is byte-wise; a UTF-8 path is a run of %XX bytes that
+/// `String::from_utf8` reassembles into the original Chinese characters.
+pub fn file_url_to_path(url: &str) -> Option<String> {
+    let (rest, unc) = if let Some(r) = url.strip_prefix("file:///") {
+        (r, false)
+    } else if let Some(r) = url.strip_prefix("file://") {
+        // file://host/share -> UNC \\host\share
+        (r, true)
+    } else {
+        return None; // shell: / virtual locations
+    };
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -762,9 +783,15 @@ fn file_url_to_path(url: &str) -> Option<String> {
             i += 1;
         }
     }
-    let path = String::from_utf8(out).ok()?.replace('/', "\\");
+    let mut path = String::from_utf8(out).ok()?.replace('/', "\\");
+    if unc {
+        // file://192.168.5.5/share/dir -> \\192.168.5.5\share\dir
+        path.insert_str(0, "\\\\");
+    }
     let b = path.as_bytes();
-    if b.len() < 3 || b[1] != b':' {
+    let valid_drive = b.len() >= 3 && b[1] == b':';
+    let valid_unc = path.starts_with("\\\\") && path.len() > 2;
+    if !valid_drive && !valid_unc {
         return None; // virtual locations (This PC etc.) — not real folders
     }
     Some(path)
@@ -789,5 +816,32 @@ pub fn spawn_explorer(path: &str) {
     match std::process::Command::new("explorer.exe").arg(&normalized).spawn() {
         Ok(_) => tracing::info!(path, "explorer spawned for absorb"),
         Err(e) => tracing::error!(error = %e, path, "spawn explorer failed"),
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::file_url_to_path;
+
+    #[test]
+    fn local_path_with_space() {
+        assert_eq!(
+            file_url_to_path("file:///D:/_Work_Of_Mine/261119%20%E9%A1%B9%E7%9B%AE%E6%8A%A5%E4%BB%B7"),
+            Some("D:\\_Work_Of_Mine\\261119 项目报价".into())
+        );
+    }
+
+    #[test]
+    fn unc_path() {
+        assert_eq!(
+            file_url_to_path("file://192.168.5.5/共享服务/展盒"),
+            Some("\\\\192.168.5.5\\共享服务\\展盒".into())
+        );
+    }
+
+    #[test]
+    fn virtual_location_rejected() {
+        assert_eq!(file_url_to_path("shell:MyComputerFolder"), None);
+        assert_eq!(file_url_to_path("about:blank"), None);
     }
 }

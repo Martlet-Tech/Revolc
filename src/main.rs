@@ -13,9 +13,35 @@ use std::time::Instant;
 
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::FileSystem::GetFileAttributesW;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClassNameW, PostMessageW,
 };
+
+/// The startup argument becomes the first tab's folder. Reject anything that
+/// is not an existing path — `revolc.exe Explorer` used to spawn a literal
+/// "Explorer" folder (TODO P0-2). A missing/invalid arg simply falls back to
+/// the home directory in `MainWindow::create`.
+fn valid_startup_path(arg: Option<String>) -> Option<String> {
+    let arg = arg?;
+    if arg.is_empty() {
+        return None;
+    }
+    let wide: Vec<u16> = arg.encode_utf16().chain(Some(0)).collect();
+    let attrs = unsafe { GetFileAttributesW(windows::core::PCWSTR(wide.as_ptr())) };
+    // INVALID_FILE_ATTRIBUTES = u32::MAX means the path does not exist.
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        tracing::warn!(?arg, "startup path does not exist, ignoring");
+        return None;
+    }
+    if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        tracing::warn!(?arg, "startup path is not a directory, ignoring");
+        return None;
+    }
+    Some(arg)
+}
 
 use revolc_common::messages::WM_APP_QUIT;
 
@@ -66,7 +92,7 @@ fn main() {
     if args.iter().any(|a| a == "--shutdown") {
         std::process::exit(shutdown_running());
     }
-    let initial_path = args.first().cloned();
+    let initial_path = valid_startup_path(args.first().cloned());
     tracing::info!(?initial_path, "starting");
 
     let exit_code = app::run(initial_path);

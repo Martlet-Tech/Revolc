@@ -14,6 +14,21 @@ pub struct Config {
     pub behavior: Behavior,
     pub takeover: Takeover,
     pub tray: Tray,
+    pub bookmarks: Bookmarks,
+}
+
+/// Bookmark bar (phase 2 of feat/tab-context-menu). UI shell only for now —
+/// items arrive in phase 3 together with "add to bookmarks" and persistence.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Bookmarks {
+    pub enabled: bool,
+}
+
+impl Default for Bookmarks {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Tray icon (Phase 1 of docs/双进程架构设计.md). Read at startup only:
@@ -59,6 +74,8 @@ pub struct Theme {
     /// pasted straight onto the desktop. Its width is a compile-time constant
     /// (`ui::WINDOW_BORDER`); this sets only the colour.
     pub window_border: String,
+    /// Background of the bookmark bar under the tab strip.
+    pub bookmark_bar_background: String,
     /// Corner radius in px; 0 = square (Win7 fallback also forces 0)
     pub tab_radius: i32,
 }
@@ -81,6 +98,7 @@ impl Default for Config {
             behavior: Behavior::default(),
             takeover: Takeover::default(),
             tray: Tray::default(),
+            bookmarks: Bookmarks::default(),
         }
     }
 }
@@ -104,6 +122,7 @@ impl Default for Theme {
             caption_hover: "#3d3d3d".into(),
             caption_close_hover: "#c42b1c".into(),
             window_border: "#151515".into(),
+            bookmark_bar_background: "#202020".into(),
             tab_radius: 6,
         }
     }
@@ -180,6 +199,11 @@ mode = "off"             # "off" | "redirect"
 
 [tray]
 enabled = true           # revolc-tray.exe 是否注册/运行（改后需重启 tray）
+
+[bookmarks]
+enabled = true           # 标签栏下方的收藏栏（热重载即时生效）
+
+# theme.bookmark_bar_background 可覆盖收藏栏底色（默认 #202020）
 "##;
     let _ = std::fs::write(path, default);
     tracing::info!(?path, "wrote default config");

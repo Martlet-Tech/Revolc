@@ -14,11 +14,13 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    RedrawWindow, ScreenToClient, SelectObject, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-    RDW_UPDATENOW, SRCCOPY,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
+    InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, SRCCOPY, TRANSPARENT, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -26,20 +28,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
-    GetMessageW, GetClassNameW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
-    IsZoomed, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    AppendMenuW, CreateAcceleratorTableW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyAcceleratorTable, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetAncestor, GetClientRect, GetParent, GetMessageW, GetClassNameW, GetSystemMetrics,
+    GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
+    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL,
+    HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
-    ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE,
-    SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, WM_CAPTURECHANGED,
+    ICON_BIG, ICON_SMALL, IDC_ARROW, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_MINIMIZE, SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, TPM_RETURNCMD,
+    WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE, WM_PAINT,
+    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA, GetWindowThreadProcessId,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -56,6 +61,9 @@ pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher threa
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
 /// handler and `--shutdown` post this) need their own message.
 pub const WM_APP_QUIT: u32 = 0x8010;
+/// WM_COPYDATA tag from the BHO for navigation events ("RNAV"). Payload is
+/// UTF-8 "HWND<TAB>url"; must match NAV_COPYDATA_TAG in bho/src/nav.rs.
+const NAV_COPYDATA_TAG: usize = 0x524E4156;
 /// wParam = Explorer top-level HWND. Sent by the BHO via the registered
 /// window message "RevolcAbsorbExplorer" (system-assigned id, identical
 /// in every process of the session).
@@ -84,6 +92,17 @@ const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// us, and always raised above those panes, so a foreign process can never
 /// erase our title bar again.
 const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
+/// Owned popup for the bookmark bar, sitting between the tab strip and the
+/// absorbed Explorer pane (feat/tab-context-menu phase 2).
+const BOOKMARK_CLASS: PCWSTR = w!("RevolcOwnedBookmarkBar");
+const BOOKMARK_HEIGHT: i32 = 28;
+/// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
+/// with accelerators (which use 1..=keymap.len()).
+const CMD_TAB_NEW_WINDOW: usize = 0x8001;
+const CMD_TAB_CLOSE: usize = 0x8002;
+const CMD_TAB_CLOSE_OTHERS: usize = 0x8003;
+const CMD_TAB_CLOSE_RIGHT: usize = 0x8004;
+const CMD_TAB_NEW_AFTER: usize = 0x8005;
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -272,6 +291,12 @@ pub(crate) struct App {
     /// window was absorbed. We spawned that window; adopting it later would
     /// make the closed tab reappear. Matched by title, with a timestamp.
     discard: Vec<(String, Instant)>,
+    /// BHO navigation pushes for windows this process has not absorbed yet.
+    /// Explorer fires NavigateComplete2 the moment a new folder window
+    /// navigates — long before our sweep absorbs it — so the initial path of
+    /// every tab arrives here. Consumed by `absorb_window`; expires with the
+    /// entry TTL so vanished windows do not accumulate.
+    nav_cache: Vec<(isize, String, Instant)>,
     /// (tab index, l, t, r, b, measured placement metrics) of the last
     /// geometry pushed to an absorbed window. Guards enforce_views() against
     /// re-issuing a cross-process SetWindowPos on every 200ms tick — but the
@@ -289,6 +314,8 @@ pub(crate) struct App {
     /// Real child window that owns the strip's pixels and hits. Kept above
     /// every Explorer pane so their overhang cannot cover it.
     tabbar_hwnd: HWND,
+    /// Owned bookmark-bar popup below the tab strip (may be null when disabled).
+    bookmarkbar_hwnd: HWND,
     main_hwnd: HWND,
     /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
     /// run, and it is the only way to drop a hover that the cursor walked out
@@ -442,6 +469,30 @@ fn ensure_tabbar_class() {
     }
 }
 
+/// Class for the bookmark bar popup. Same tolerates-already-exists rule.
+fn ensure_bookmark_class() {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(bookmark_wndproc),
+        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        lpszClassName: BOOKMARK_CLASS,
+        // No CS_HREDRAW/VREDRAW: SetWindowPos in every sync would otherwise
+        // invalidate the whole strip on each move/resize. Content is static
+        // in phase 2; phase 3 will double-buffer it when items go in.
+        style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return;
+    }
+    let err = windows::core::Error::from_win32();
+    if (err.code().0 as u32 & 0xffff) != 1410 {
+        tracing::warn!(error = %err, "register bookmark bar class failed");
+    }
+}
+
 /// The owned strip's window procedure. Painting stays here; every input and
 /// hit-test message is forwarded to the frame, which already knows how to
 /// turn a client coordinate into a tab / button / drag action. Because the
@@ -490,6 +541,7 @@ unsafe extern "system" fn tabbar_wndproc(
         | WM_LBUTTONUP
         | WM_LBUTTONDBLCLK
         | WM_MBUTTONUP
+        | WM_RBUTTONUP
         | WM_MOUSELEAVE
         | WM_NCMOUSELEAVE
         | WM_NCLBUTTONDOWN
@@ -501,6 +553,60 @@ unsafe extern "system" fn tabbar_wndproc(
                 if msg == WM_LBUTTONDOWN || msg == WM_NCLBUTTONDOWN {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(parent);
                 }
+                SendMessageW(parent, msg, wp, lp)
+            }
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Bookmark bar popup. Phase 2 is UI-only: paint a placeholder strip; clicks
+/// are forwarded to the frame but do nothing until phase 3 wires in items.
+unsafe extern "system" fn bookmark_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    let parent = GetParent(hwnd).unwrap_or_default();
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let cfg = app_opt(parent).map(|a| a.cfg.clone());
+            let (r, g, b) = cfg
+                .as_ref()
+                .map(|c| c.get().color(|t| &t.bookmark_bar_background))
+                .unwrap_or((0x20, 0x20, 0x20));
+            let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
+            let _ = FillRect(hdc, &rc, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+
+            // Placeholder caption. Phase 3 replaces this with real bookmarks.
+            let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
+            let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
+            let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
+            let _ = SetTextColor(hdc, COLORREF((tb as u32) << 16 | (tg as u32) << 8 | tr as u32));
+            let mut text = RECT { left: 10, top: 0, right: rc.right - 10, bottom: rc.bottom };
+            let mut label: Vec<u16> = "收藏夹".encode_utf16().chain(Some(0)).collect();
+            let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            let _ = SelectObject(hdc, old_font);
+
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => LRESULT(0),
+        // Clicks/hover belong to the frame until phase 3 gives items meaning.
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE => {
+            if parent.0.is_null() {
+                LRESULT(0)
+            } else {
                 SendMessageW(parent, msg, wp, lp)
             }
         }
@@ -586,10 +692,12 @@ impl App {
             path_done: Vec::new(),
             reserve_deadline: None,
             discard: Vec::new(),
+            nav_cache: Vec::new(),
             laid_out: None,
             last_client: (0, 0),
             tabbar,
             tabbar_hwnd: HWND::default(),
+            bookmarkbar_hwnd: HWND::default(),
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
@@ -625,15 +733,17 @@ impl App {
         self.sync_tabbar_window();
     }
 
-    /// Where the absorbed Explorer window goes: inside the hairline frame.
+    /// Where the absorbed Explorer window goes: inside the hairline frame,
+    /// below the tab strip and the (optional) bookmark bar.
     fn view_rect(&self) -> RECT {
         let rc = self.client();
         let b = self.border();
+        let top = TABBAR_HEIGHT + self.bookmark_height();
         RECT {
             left: b,
-            top: TABBAR_HEIGHT,
+            top,
             right: (rc.right - b).max(b),
-            bottom: (rc.bottom - b).max(TABBAR_HEIGHT),
+            bottom: (rc.bottom - b).max(top),
         }
     }
 
@@ -864,6 +974,74 @@ impl App {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
+        // Keep the second overlay in step with show/hide and moves.
+        self.sync_bookmarkbar_window();
+    }
+
+    /// Bookmark bar height: 0 when disabled, so the Explorer view starts right
+    /// under the tab strip. Read from config each call for hot reload.
+    fn bookmark_height(&self) -> i32 {
+        if self.cfg.get().bookmarks.enabled {
+            BOOKMARK_HEIGHT
+        } else {
+            0
+        }
+    }
+
+    /// Create the bookmark-bar popup just below the tab strip. Created once
+    /// (like the strip); `[bookmarks].enabled` only toggles its visibility via
+    /// `sync_bookmarkbar_window`, so it can be hot-reloaded.
+    fn create_bookmarkbar_window(&mut self) {
+        ensure_bookmark_class();
+        let rc = self.client();
+        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
+            let hwnd = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE
+                    | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+                BOOKMARK_CLASS,
+                None,
+                WS_POPUP | WS_CLIPSIBLINGS,
+                origin.x,
+                origin.y,
+                rc.right,
+                BOOKMARK_HEIGHT,
+                self.main_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .expect("create owned bookmark bar popup");
+            self.bookmarkbar_hwnd = hwnd;
+            self.sync_bookmarkbar_window();
+        }
+    }
+
+    /// Glue the bookmark popup under the strip, hide it with the frame or when
+    /// disabled. SWP_NOZORDER for the same reason as the tab strip.
+    fn sync_bookmarkbar_window(&self) {
+        let hwnd = self.bookmarkbar_hwnd;
+        if hwnd.0.is_null() {
+            return;
+        }
+        let rc = self.client();
+        let enabled = self.cfg.get().bookmarks.enabled;
+        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut origin);
+            let visible = IsWindowVisible(self.main_hwnd).as_bool() && enabled;
+            let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                origin.x,
+                origin.y,
+                rc.right,
+                BOOKMARK_HEIGHT,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
     }
 
     /// Pull maximize/active state into the strip (glyphs depend on both).
@@ -943,6 +1121,136 @@ impl App {
     /// Index of the tab with `id`, if it still exists.
     fn index_of(&self, id: u64) -> Option<usize> {
         self.tabs.iter_all().position(|t| t.id == id)
+    }
+
+    /// Event-driven navigation from the BHO: `hwnd` is the CabinetWClass the
+    /// BHO saw navigate; find the tab holding that exact window and update its
+    /// path. Matching by HWND (not URL) keeps same-folder tabs independent.
+    fn on_explorer_navigated(&mut self, pid: isize, _hwnd: isize, url: &str) {
+        let Some(path) = host::file_url_to_path(url) else {
+            tracing::debug!(?url, "BHO navigation: non-filesystem URL, ignored");
+            return;
+        };
+        // Match the push to a tab by LABEL — the Explorer window title IS the
+        // current folder name and is the one signal that never lies: HWND is
+        // rewritten by re-parenting (get_HWND returns RevolcMain), while the
+        // pid match proved flaky in hand tests. The push's URL tail segment
+        // (".../Downloads" -> "Downloads") equals the tab label of the
+        // navigating window. Ambiguity (two tabs on same-named folders) is
+        // resolved in favour of the ACTIVE tab; no match -> cache and replay
+        // on the next sweep tick, when refresh_labels has caught up.
+        if let Some(i) = self.tab_by_label_tail(&path) {
+            let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+            if old != path {
+                tracing::info!(tab = i, ?old, new = ?path, "tab navigated (BHO event)");
+                self.tabs.set_path(i, path);
+            }
+            return;
+        }
+        // pid fallback (kept as a second opinion; label may lag one sweep).
+        let idx = self.views.iter().position(|v| {
+            v.as_ref().map(|v| unsafe { GetWindowThreadProcessId(v.top, None) as isize } == pid)
+                .unwrap_or(false)
+        });
+        let Some(i) = idx else {
+            self.cache_nav(pid, path);
+            return;
+        };
+        let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+        if old != path {
+            tracing::info!(tab = i, ?pid, ?old, new = ?path, "tab navigated (BHO event, pid)");
+            self.tabs.set_path(i, path);
+        }
+    }
+
+    /// Last path segment as a folder name ("D:\a\b" -> "b", "D:\" -> "").
+    fn label_tail(path: &str) -> &str {
+        path.trim_end_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+    }
+
+    /// The tab whose label equals `path`'s tail segment. One exact match wins;
+    /// several matches resolve to the active tab (the user navigated in the
+    /// tab they are looking at); zero or unresolvable -> None.
+    fn tab_by_label_tail(&self, path: &str) -> Option<usize> {
+        let want = Self::label_tail(path);
+        if want.is_empty() {
+            return None;
+        }
+        let hits: Vec<usize> = self
+            .tabs
+            .iter_all()
+            .enumerate()
+            .filter(|(i, t)| t.label == want && self.views.get(*i).map(|v| v.is_some()).unwrap_or(false))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.len() {
+            1 => hits.first().copied(),
+            _ if hits.contains(&self.tabs.active_index()) => Some(self.tabs.active_index()),
+            _ => None,
+        }
+    }
+
+    /// TTL for cached navigation pushes that could not be matched yet.
+    const NAV_CACHE_TTL: Duration = Duration::from_secs(60);
+
+    /// Store the latest unmatched BHO push. Keyed by explorer pid; consumed
+    /// by label replay (sweep), absorb seeding, and folder_path_of.
+    fn cache_nav(&mut self, pid: isize, path: String) {
+        self.nav_cache
+            .retain(|(p, _, t)| p != &pid && t.elapsed() < Self::NAV_CACHE_TTL);
+        self.nav_cache.push((pid, path.clone(), Instant::now()));
+        tracing::debug!(?pid, ?path, "BHO push cached (no label/pid match yet)");
+    }
+
+    /// Reconcile cached pushes whose tab label has caught up with the push's
+    /// folder name. Runs every sweep: the label lags the navigation by up to
+    /// one tick, so a push that matched nothing on arrival matches here once
+    /// refresh_labels has run.
+    fn replay_nav_cache(&mut self) {
+        let mut expired: Vec<usize> = Vec::new();
+        for (idx, (_, path, t)) in self.nav_cache.iter().enumerate() {
+            if t.elapsed() >= Self::NAV_CACHE_TTL {
+                expired.push(idx);
+                continue;
+            }
+            if let Some(i) = self.tab_by_label_tail(path) {
+                let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+                if old != *path {
+                    tracing::info!(tab = i, ?old, new = ?path, "tab navigated (BHO replay)");
+                    self.tabs.set_path(i, path.clone());
+                }
+                expired.push(idx);
+            }
+        }
+        for idx in expired.into_iter().rev() {
+            self.nav_cache.remove(idx);
+        }
+    }
+
+    /// The cached push for a just-absorbed window, by pid (absorb seeding).
+    /// Consumes the entry.
+    fn take_cached_nav(&mut self, pid: isize) -> Option<String> {
+        let idx = self
+            .nav_cache
+            .iter()
+            .position(|(p, _, t)| *p == pid && t.elapsed() < Self::NAV_CACHE_TTL)?;
+        let (_, path, _) = self.nav_cache.remove(idx);
+        Some(path)
+    }
+
+    /// Right-click moment: consume any cached push that matches THIS tab's
+    /// label, before falling back to the stored path. Labels are the only
+    /// always-correct live signal, and the label-matching replay may not have
+    /// run yet when the menu fires.
+    fn take_cached_nav_by_label(&mut self, label: &str) -> Option<String> {
+        let idx = self.nav_cache.iter().position(|(_, path, t)| {
+            t.elapsed() < Self::NAV_CACHE_TTL && Self::label_tail(path) == label && !label.is_empty()
+        })?;
+        let (_, path, _) = self.nav_cache.remove(idx);
+        Some(path)
     }
 
     // ---- tab drag: reorder inside the band -------------------------------
@@ -1042,14 +1350,69 @@ impl App {
     /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
     /// notify or on the next fast sweep tick, whichever comes first.
     fn new_tab(&mut self, path: String) {
+        let at = self.tabs.len();
         self.tabs.push(path.clone());
-        self.views.push(None);
-        // Start (or restart) the "its window must arrive" clock.
+        self.views.insert(at, None);
+        self.launch_tab_view(at, path);
+    }
+
+    /// Context menu "new tab to the right": insert after `after` and open it.
+    fn new_tab_after(&mut self, after: usize, path: String) {
+        let at = (after + 1).min(self.tabs.len());
+        self.tabs.insert_after(after, path.clone());
+        self.views.insert(at, None);
+        self.launch_tab_view(at, path);
+    }
+
+    /// Shared tail of new_tab / new_tab_after: arm the reserve clock, show and
+    /// activate the new tab, then spawn the Explorer window to absorb.
+    fn launch_tab_view(&mut self, at: usize, path: String) {
         self.reserve_deadline = Some(Instant::now() + RESERVE_TTL);
         self.sync_tabbar();
-        self.activate(self.tabs.active_index());
+        self.activate(at);
         self.arm_burst();
         host::spawn_explorer(&path);
+    }
+
+    /// Context menu "open in new window": MOVE the tab — close it here, then
+    /// launch a fresh revolc.exe with the tab's *live* folder as startup path.
+    /// The new process absorbs its own Explorer window. Keep the close after
+    /// the spawn: if this is the last tab, close_tab destroys this window and
+    /// we must have captured the path and started the replacement first.
+    fn move_tab_to_new_window(&mut self, i: usize) {
+        let path = self.folder_path_of(i);
+        let exe = std::env::current_exe().unwrap_or_default();
+        match std::process::Command::new(exe).arg(&path).spawn() {
+            Ok(_) => {
+                tracing::info!(?path, tab = i, "moved tab to new window");
+                self.close_tab(i);
+            }
+            Err(e) => {
+                // Spawn failed: leave the tab where it is — never lose it.
+                tracing::error!(error = %e, ?path, "failed to spawn new window, tab kept");
+            }
+        }
+    }
+
+    /// Close every tab except `keep`. Iterate in reverse so removing a tab
+    /// never shifts the index of one we have not visited yet.
+    fn close_other_tabs(&mut self, keep: usize) {
+        if keep >= self.tabs.len() {
+            return;
+        }
+        for i in (0..self.tabs.len()).rev() {
+            if i != keep {
+                self.close_tab(i);
+            }
+        }
+    }
+
+    /// Close every tab to the right of `i` (again, reverse order).
+    fn close_tabs_to_right(&mut self, i: usize) {
+        let start = i + 1;
+        for j in (start..self.tabs.len()).rev() {
+            self.close_tab(j);
+        }
     }
 
     /// Attach an Explorer window to the first reserved (view-less) tab,
@@ -1096,7 +1459,8 @@ impl App {
         // (that is the whole point — see stray_folder_windows). Everything
         // below that needs a *live, navigated* browser is therefore deferred.
         let visible = host::is_visible(top);
-        tracing::info!(?top, idx, visible, "absorbed into tab");
+        let absorbed_pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
+        tracing::info!(?top, idx, visible, pid = absorbed_pid, "absorbed into tab");
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
         // When we spawned the window ourselves the tab already carries the
@@ -1106,9 +1470,21 @@ impl App {
         // retries for nothing: resolve it on a later sweep instead.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
         if need_path && visible {
-            let store = host::read_folder_path(top, 1).unwrap_or_default();
-            if !store.is_empty() {
-                self.tabs.set_path(idx, store);
+            // Preferred source: the BHO pushed this window's initial folder
+            // URL before we absorbed it (cached by on_explorer_navigated).
+            // That read happens INSIDE Explorer and is exact; the IShellWindows
+            // fallback below is cross-process and blind to re-parented
+            // windows, so it only runs when no push ever arrived (e.g. Revolc
+            // started after the window did).
+            let pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
+            if let Some(cached) = self.take_cached_nav(pid) {
+                tracing::info!(?top, ?pid, path = ?cached, "absorb: seeding path from BHO cache");
+                self.tabs.set_path(idx, cached);
+            } else {
+                let store = host::read_folder_path(top, 1).unwrap_or_default();
+                if !store.is_empty() {
+                    self.tabs.set_path(idx, store);
+                }
             }
         }
         // Display text comes from the window title so it follows navigation.
@@ -1279,6 +1655,13 @@ impl App {
     /// foreign window returns its cached caption (no WM_GETTEXT round-trip),
     /// so one pass over all tabs is microseconds. This is what makes a tab
     /// say "此电脑" after the user navigates away from "zt".
+    ///
+    /// Path tracking is NOT here: `Tab.path` is updated by the BHO's
+    /// NavigateComplete2/DocumentComplete push (WM_COPYDATA, see
+    /// `on_explorer_navigated`), which is event-driven and reads the URL
+    /// inside the Explorer process. A title change no longer triggers an
+    /// IShellWindows read — that reader cannot see re-parented windows and
+    /// cross-wired tabs to whichever shell window matched first.
     fn refresh_labels(&mut self) -> bool {
         let mut changed = false;
         for (i, slot) in self.views.iter().enumerate() {
@@ -1318,19 +1701,36 @@ impl App {
         self.path_done.retain(|h| known.contains(h));
     }
 
-    /// Folder the active tab is actually showing right now. `Tab::path` is
-    /// only what the tab was opened with; the user may have navigated since.
-    fn active_folder_path(&self) -> String {
-        if let Some(v) = self.views.get(self.tabs.active_index()).and_then(|s| s.as_ref()) {
-            if let Some(p) = host::read_folder_path(v.top, 1) {
-                return p;
-            }
+    /// Folder a tab is actually showing right now. `Tab::path` is only what
+    /// the tab was opened with; the user may have navigated since. Used by the
+    /// context menu (which can target a non-active tab) and by `+` / shortcuts.
+    /// The tab's live folder. `Tab.path` is kept fresh by the BHO's
+    /// navigation push (see `on_explorer_navigated`) — reading IShellWindows
+    /// here was REMOVED on purpose: it cannot see re-parented windows and
+    /// cross-wired tabs to whichever shell window matched first (the original
+    /// "new window opens the wrong folder" bug).
+    fn folder_path_of(&mut self, i: usize) -> String {
+        // Right-click is a synchronization point: consume any cached BHO push
+        // whose folder name equals this tab's label BEFORE falling back to the
+        // stored path — the sweep replay may not have run yet.
+        let label = self.tabs.get(i).map(|t| t.label.clone()).unwrap_or_default();
+        if let Some(cached) = self.take_cached_nav_by_label(&label) {
+            tracing::info!(tab = i, ?label, path = ?cached, "folder_path_of: consumed cached push");
+            self.tabs.set_path(i, cached);
+        }
+        let stored = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+        if stored.is_empty() {
+            tracing::warn!(tab = i, "folder_path_of: Tab.path empty (no BHO push seen yet)");
         }
         self.tabs
-            .active()
+            .get(i)
             .map(|t| t.path.clone())
             .filter(|p| !p.is_empty())
             .unwrap_or_else(home_dir)
+    }
+
+    fn active_folder_path(&mut self) -> String {
+        self.folder_path_of(self.tabs.active_index())
     }
 
     /// May this window adopt a folder window that just appeared?
@@ -1433,6 +1833,7 @@ impl App {
         if self.refresh_labels() {
             self.sync_tabbar();
         }
+        self.replay_nav_cache();
         self.resolve_pending_paths();
         self.enforce_views();
 
@@ -1892,6 +2293,43 @@ fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
 
 /// x/y out of a mouse message's lParam, sign-extended (screen coords can be
 /// negative on a monitor to the left of the primary).
+/// Build and show the tab context menu. Returns the chosen command id, or 0.
+///
+/// `TrackPopupMenuEx` runs a modal loop that dispatches other messages to this
+/// window, so the caller must NOT hold an `&mut App` across it (re-entrant
+/// `app_from` would alias). Collect the target first, drop the borrow, show the
+/// menu, then re-acquire the app to dispatch.
+unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usize {
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+
+    if has_tab {
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_WINDOW, w!("在新窗口打开此标签页(&N)"));
+        // (moves the tab: closes it here + opens the same folder in a new window)
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("在右侧新建标签页(&A)"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE, w!("关闭标签页(&C)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_OTHERS, w!("关闭其他标签页(&O)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_RIGHT, w!("关闭右侧标签页(&R)"));
+    } else {
+        // Bare strip: still offer a new tab, nothing tab-specific.
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("新建标签页(&A)"));
+    }
+
+    // A menu owned by another window does not dismiss on outside click unless
+    // that window is foreground first (classic TrackPopupMenu gotcha).
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenuEx(
+        menu,
+        TPM_RETURNCMD.0,
+        screen.x,
+        screen.y,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    cmd.0 as usize
+}
+
 fn point_from_lparam(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 as u16) as i16 as i32;
     let y = ((lp.0 >> 16) as u16) as i16 as i32;
@@ -1945,6 +2383,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
             app.create_tabbar_window();
+            app.create_bookmarkbar_window();
             app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which
@@ -2230,6 +2669,69 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        // Tab context menu. lp comes from the owned strip, whose client origin
+        // equals the frame's, so the same coords drive `TabBar::hit`. The strip
+        // forwards WM_RBUTTONUP here; resolving the tab by stable id keeps the
+        // target correct even if a sweep reorders views while the menu is up.
+        WM_RBUTTONUP => {
+            let (x, y) = point_from_lparam(lp);
+            // Phase 1: gather target + screen point, then DROP the app borrow.
+            let (hit_index, screen) = {
+                let app = app_from(hwnd);
+                let width = app.client().right;
+                let idx = match app.tabbar.hit(x, y, width) {
+                    tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
+                        .tabbar
+                        .ids()
+                        .get(i)
+                        .copied()
+                        .and_then(|id| app.index_of(id)),
+                    _ => None,
+                };
+                let mut pt = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                (idx, pt)
+            };
+            // Phase 2: modal loop — no &mut App alive here.
+            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some());
+            // Phase 3: re-acquire and dispatch.
+            if cmd != 0 {
+                let app = app_from(hwnd);
+                // Re-resolve by id in case the list shifted during the loop.
+                let idx = hit_index;
+                match cmd {
+                    CMD_TAB_NEW_WINDOW => {
+                        if let Some(i) = idx {
+                            app.move_tab_to_new_window(i);
+                        }
+                    }
+                    CMD_TAB_NEW_AFTER => {
+                        let path = idx
+                            .map(|i| app.folder_path_of(i))
+                            .unwrap_or_else(|| app.active_folder_path());
+                        let anchor = idx.unwrap_or_else(|| app.tabs.len().saturating_sub(1));
+                        app.new_tab_after(anchor, path);
+                    }
+                    CMD_TAB_CLOSE => {
+                        if let Some(i) = idx {
+                            app.close_tab(i);
+                        }
+                    }
+                    CMD_TAB_CLOSE_OTHERS => {
+                        if let Some(i) = idx {
+                            app.close_other_tabs(i);
+                        }
+                    }
+                    CMD_TAB_CLOSE_RIGHT => {
+                        if let Some(i) = idx {
+                            app.close_tabs_to_right(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
         // The caption band is the only part of the client we paint; every other
         // pixel belongs to the absorbed Explorer child (WS_CLIPCHILDREN keeps
         // the two apart).
@@ -2354,7 +2856,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == WM_APP_CONFIG_CHANGED => {
-            app_from(hwnd).sync_tabbar();
+            let app = app_from(hwnd);
+            app.sync_tabbar();
+            // [bookmarks].enabled may have flipped: re-sync the popup and
+            // re-lay out so the Explorer view starts below/above it.
+            app.sync_bookmarkbar_window();
+            if !app.bookmarkbar_hwnd.0.is_null() {
+                let _ = InvalidateRect(app.bookmarkbar_hwnd, None, true);
+            }
+            app.laid_out = None;
+            app.layout();
             LRESULT(0)
         }
         m if m == WM_TIMER && wp.0 == SWEEP_TIMER_ID => {
@@ -2370,6 +2881,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.on_notify();
             }
             LRESULT(0)
+        }
+        WM_COPYDATA => {
+            // Event-driven navigation from the BHO. Payload: "HWND\turl" UTF-8.
+            // Validate the tag and length; a random WM_COPYDATA from another
+            // app must never touch our tabs.
+            let cds = lp.0 as *const COPYDATASTRUCT;
+            if !cds.is_null() && (*cds).dwData == NAV_COPYDATA_TAG {
+                let len = (*cds).cbData as usize;
+                let ptr = (*cds).lpData as *const u8;
+                tracing::debug!(len, "WM_COPYDATA nav received");
+                if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
+                    let payload = std::slice::from_raw_parts(ptr, len);
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        // "explorer_pid\tbrowser_hwnd\turl"
+                        if let Some((pid_str, rest)) = text.split_once('\t') {
+                            if let Some((hwnd_str, url)) = rest.split_once('\t') {
+                                if let (Ok(pid), Ok(bhwnd)) =
+                                    (pid_str.parse::<isize>(), hwnd_str.parse::<isize>())
+                                {
+                                    app_from(hwnd).on_explorer_navigated(pid, bhwnd, url);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            LRESULT(1) // non-zero = data accepted (WM_COPYDATA convention)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
