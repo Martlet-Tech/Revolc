@@ -291,6 +291,12 @@ pub(crate) struct App {
     /// window was absorbed. We spawned that window; adopting it later would
     /// make the closed tab reappear. Matched by title, with a timestamp.
     discard: Vec<(String, Instant)>,
+    /// BHO navigation pushes for windows this process has not absorbed yet.
+    /// Explorer fires NavigateComplete2 the moment a new folder window
+    /// navigates — long before our sweep absorbs it — so the initial path of
+    /// every tab arrives here. Consumed by `absorb_window`; expires with the
+    /// entry TTL so vanished windows do not accumulate.
+    nav_cache: Vec<(isize, String, Instant)>,
     /// (tab index, l, t, r, b, measured placement metrics) of the last
     /// geometry pushed to an absorbed window. Guards enforce_views() against
     /// re-issuing a cross-process SetWindowPos on every 200ms tick — but the
@@ -686,6 +692,7 @@ impl App {
             path_done: Vec::new(),
             reserve_deadline: None,
             discard: Vec::new(),
+            nav_cache: Vec::new(),
             laid_out: None,
             last_client: (0, 0),
             tabbar,
@@ -1128,10 +1135,12 @@ impl App {
             v.as_ref().map(|v| v.top.0 as isize == hwnd).unwrap_or(false)
         });
         let Some(i) = idx else {
-            // Window may not be absorbed yet (BHO fires during creation), or
-            // belongs to another Revolc window — both are normal. INFO so a
-            // hand-test can tell "arrived but unmatched" from "never sent".
-            tracing::info!(?hwnd, ?path, "BHO navigation: no matching tab in this window");
+            // The window may not be absorbed yet: Explorer navigates a fresh
+            // folder window seconds before our sweep adopts it. Cache the
+            // path so absorb_window can seed Tab.path from it. A window that
+            // belongs to ANOTHER Revolc process is also cached here and
+            // simply expires — harmless.
+            self.cache_nav(hwnd, path);
             return;
         };
         let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
@@ -1140,6 +1149,32 @@ impl App {
         }
         tracing::info!(tab = i, ?hwnd, ?old, new = ?path, "tab navigated (BHO event)");
         self.tabs.set_path(i, path);
+    }
+
+    /// TTL for cached pre-absorb navigation paths.
+    const NAV_CACHE_TTL: Duration = Duration::from_secs(60);
+
+    /// Store (or refresh) the latest BHO-reported path for a not-yet-absorbed
+    /// window. Keeps one entry per hwnd; expired entries of other windows are
+    /// pruned opportunistically.
+    fn cache_nav(&mut self, hwnd: isize, path: String) {
+        // Drop expired entries and any previous entry for this hwnd (the new
+        // push replaces it — the latest navigation wins).
+        self.nav_cache
+            .retain(|(h, _, t)| h != &hwnd && t.elapsed() < Self::NAV_CACHE_TTL);
+        self.nav_cache.push((hwnd, path.clone(), Instant::now()));
+        tracing::info!(?hwnd, ?path, "BHO navigation cached (window not absorbed yet)");
+    }
+
+    /// The cached path for an Explorer window that was just absorbed, if the
+    /// BHO pushed one before absorption. Consumes the entry.
+    fn take_cached_nav(&mut self, hwnd: isize) -> Option<String> {
+        let idx = self
+            .nav_cache
+            .iter()
+            .position(|(h, _, t)| *h == hwnd && t.elapsed() < Self::NAV_CACHE_TTL)?;
+        let (_, path, _) = self.nav_cache.remove(idx);
+        Some(path)
     }
 
     // ---- tab drag: reorder inside the band -------------------------------
@@ -1358,9 +1393,20 @@ impl App {
         // retries for nothing: resolve it on a later sweep instead.
         let need_path = self.tabs.get(idx).map(|t| t.path.is_empty()).unwrap_or(true);
         if need_path && visible {
-            let store = host::read_folder_path(top, 1, false).unwrap_or_default();
-            if !store.is_empty() {
-                self.tabs.set_path(idx, store);
+            // Preferred source: the BHO pushed this window's initial folder
+            // URL before we absorbed it (cached by on_explorer_navigated).
+            // That read happens INSIDE Explorer and is exact; the IShellWindows
+            // fallback below is cross-process and blind to re-parented
+            // windows, so it only runs when no push ever arrived (e.g. Revolc
+            // started after the window did).
+            if let Some(cached) = self.take_cached_nav(top.0 as isize) {
+                tracing::info!(?top, path = ?cached, "absorb: seeding path from BHO cache");
+                self.tabs.set_path(idx, cached);
+            } else {
+                let store = host::read_folder_path(top, 1, false).unwrap_or_default();
+                if !store.is_empty() {
+                    self.tabs.set_path(idx, store);
+                }
             }
         }
         // Display text comes from the window title so it follows navigation.
@@ -1531,48 +1577,24 @@ impl App {
     /// foreign window returns its cached caption (no WM_GETTEXT round-trip),
     /// so one pass over all tabs is microseconds. This is what makes a tab
     /// say "此电脑" after the user navigates away from "zt".
+    ///
+    /// Path tracking is NOT here: `Tab.path` is updated by the BHO's
+    /// NavigateComplete2/DocumentComplete push (WM_COPYDATA, see
+    /// `on_explorer_navigated`), which is event-driven and reads the URL
+    /// inside the Explorer process. A title change no longer triggers an
+    /// IShellWindows read — that reader cannot see re-parented windows and
+    /// cross-wired tabs to whichever shell window matched first.
     fn refresh_labels(&mut self) -> bool {
         let mut changed = false;
-        // Collect first: track_navigation needs &mut self, so we cannot call
-        // it while `views` / `tabs` are borrowed in the loop body.
-        let mut navigated: Vec<(usize, HWND, String)> = Vec::new();
         for (i, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot {
                 let title = host::window_title(v.top);
-                if !title.is_empty() && self.tabs.set_label(i, title.clone()) {
+                if !title.is_empty() && self.tabs.set_label(i, title) {
                     changed = true;
-                    navigated.push((i, v.top, title));
                 }
             }
         }
-        for (i, top, title) in navigated {
-            // A changed Explorer title almost always means the user navigated.
-            // Capture the live folder now so Tab.path stops being a stale
-            // snapshot of where the tab was opened.
-            self.track_navigation(i, top, &title);
-        }
         changed
-    }
-
-    /// Navigation tracking (feat/tab-context-menu): when a tab's window title
-    /// changes, read its live folder path and write it back to Tab.path, with
-    /// a log line so navigation is observable. Uses the diagnosing reader so
-    /// a failure also records why (IShellWindows enumeration + pid match).
-    fn track_navigation(&mut self, i: usize, top: HWND, title: &str) {
-        let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
-        match host::read_folder_path(top, 1, true) {
-            Some(path) if path != old => {
-                tracing::info!(tab = i, ?old, new = ?path, title, "tab navigated");
-                self.tabs.set_path(i, path);
-            }
-            Some(_) => {
-                tracing::debug!(tab = i, ?old, title, "tab title changed, path unchanged");
-            }
-            None => {
-                tracing::warn!(tab = i, ?old, title, ?top,
-                    "tab title changed but live path unreadable; Tab.path stays stale");
-            }
-        }
     }
 
     /// Fill in the folder path of tabs that were absorbed before their window
@@ -1604,22 +1626,15 @@ impl App {
     /// Folder a tab is actually showing right now. `Tab::path` is only what
     /// the tab was opened with; the user may have navigated since. Used by the
     /// context menu (which can target a non-active tab) and by `+` / shortcuts.
+    /// The tab's live folder. `Tab.path` is kept fresh by the BHO's
+    /// navigation push (see `on_explorer_navigated`) — reading IShellWindows
+    /// here was REMOVED on purpose: it cannot see re-parented windows and
+    /// cross-wired tabs to whichever shell window matched first (the original
+    /// "new window opens the wrong folder" bug).
     fn folder_path_of(&self, i: usize) -> String {
-        let label = self.tabs.get(i).map(|t| t.label.clone()).unwrap_or_default();
         let stored = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
-        if let Some(v) = self.views.get(i).and_then(|s| s.as_ref()) {
-            if let Some(p) = host::read_folder_path(v.top, 1, true) {
-                if p != stored {
-                    tracing::info!(tab = i, ?label, live = ?p, ?stored,
-                        "folder_path_of: live path differs from stored (navigated since open)");
-                }
-                return p;
-            }
-            tracing::warn!(tab = i, ?label, ?stored, top = ?v.top,
-                "folder_path_of: live read FAILED, falling back to stored path");
-        } else {
-            tracing::warn!(tab = i, ?label, ?stored,
-                "folder_path_of: no view for tab, falling back to stored path");
+        if stored.is_empty() {
+            tracing::warn!(tab = i, "folder_path_of: Tab.path empty (no BHO push seen yet)");
         }
         self.tabs
             .get(i)

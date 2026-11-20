@@ -492,9 +492,12 @@ pub fn read_folder_path(top: HWND, retries: usize, diagnose: bool) -> Option<Str
                 let bpid = GetWindowThreadProcessId(hwnd, None);
                 let url = browser.LocationURL().map(|u| u.to_string()).unwrap_or_default();
                 let path = file_url_to_path(&url);
-                let hwnd_match = hwnd.0 == top.0
-                    || IsChild(top, hwnd).as_bool()
-                    || IsChild(hwnd, top).as_bool();
+                let hwnd_match = hwnd.0 == top.0 || IsChild(top, hwnd).as_bool();
+                // NO `IsChild(hwnd, top)` here: the reverse direction matches
+                // our own frame (or sibling absorbed windows' ancestors) to
+                // any top, which cross-wired every tab to the first shell
+                // window (observed 2026-11-20 04:35: "MATCH p=C:\Users\zt"
+                // for a tab showing something else entirely).
                 let pid_match = top_pid != 0 && top_pid == bpid;
                 if diagnose {
                     tracing::info!(
