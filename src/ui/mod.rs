@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA, IsChild,
+    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA, GetWindowThreadProcessId,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -1126,19 +1126,18 @@ impl App {
     /// Event-driven navigation from the BHO: `hwnd` is the CabinetWClass the
     /// BHO saw navigate; find the tab holding that exact window and update its
     /// path. Matching by HWND (not URL) keeps same-folder tabs independent.
-    fn on_explorer_navigated(&mut self, hwnd: isize, url: &str) {
+    fn on_explorer_navigated(&mut self, pid: isize, _hwnd: isize, url: &str) {
         let Some(path) = host::file_url_to_path(url) else {
             tracing::debug!(?url, "BHO navigation: non-filesystem URL, ignored");
             return;
         };
-        // The BHO reports the owning CabinetWClass (normalized by walking up
-        // from the WebBrowser control window). Accept an exact frame match,
-        // and as a belt-and-suspenders fallback any descendant of the frame —
-        // a normalization miss must not silently drop path updates again.
-        let target = HWND(hwnd as *mut core::ffi::c_void);
+        // Match tabs by the explorer.exe PROCESS ID. The frame HWND is
+        // unrecoverable after absorb (get_HWND returns RevolcMain — its
+        // parent chain is RevolcMain -> desktop, measured 2026-11-20 14:15),
+        // but each Revolc tab is its own explorer.exe process and the pid
+        // survives re-parenting 1:1.
         let idx = self.views.iter().position(|v| {
-            v.as_ref()
-                .map(|v| v.top.0 == target.0 || unsafe { IsChild(v.top, target).as_bool() })
+            v.as_ref().map(|v| unsafe { GetWindowThreadProcessId(v.top, None) as isize } == pid)
                 .unwrap_or(false)
         });
         let Some(i) = idx else {
@@ -1147,14 +1146,14 @@ impl App {
             // path so absorb_window can seed Tab.path from it. A window that
             // belongs to ANOTHER Revolc process is also cached here and
             // simply expires — harmless.
-            self.cache_nav(hwnd, path);
+            self.cache_nav(pid, path);
             return;
         };
         let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
         if old == path {
             return;
         }
-        tracing::info!(tab = i, ?hwnd, ?old, new = ?path, "tab navigated (BHO event)");
+        tracing::info!(tab = i, ?pid, ?old, new = ?path, "tab navigated (BHO event)");
         self.tabs.set_path(i, path);
     }
 
@@ -1162,24 +1161,22 @@ impl App {
     const NAV_CACHE_TTL: Duration = Duration::from_secs(60);
 
     /// Store (or refresh) the latest BHO-reported path for a not-yet-absorbed
-    /// window. Keeps one entry per hwnd; expired entries of other windows are
-    /// pruned opportunistically.
-    fn cache_nav(&mut self, hwnd: isize, path: String) {
-        // Drop expired entries and any previous entry for this hwnd (the new
-        // push replaces it — the latest navigation wins).
+    /// window. Keyed by explorer.exe pid (HWND is rewritten by re-parenting);
+    /// one entry per pid, latest navigation wins.
+    fn cache_nav(&mut self, pid: isize, path: String) {
         self.nav_cache
-            .retain(|(h, _, t)| h != &hwnd && t.elapsed() < Self::NAV_CACHE_TTL);
-        self.nav_cache.push((hwnd, path.clone(), Instant::now()));
-        tracing::info!(?hwnd, ?path, "BHO navigation cached (window not absorbed yet)");
+            .retain(|(p, _, t)| p != &pid && t.elapsed() < Self::NAV_CACHE_TTL);
+        self.nav_cache.push((pid, path.clone(), Instant::now()));
+        tracing::info!(?pid, ?path, "BHO navigation cached (window not absorbed yet)");
     }
 
-    /// The cached path for an Explorer window that was just absorbed, if the
-    /// BHO pushed one before absorption. Consumes the entry.
-    fn take_cached_nav(&mut self, hwnd: isize) -> Option<String> {
+    /// The cached path for a just-absorbed window, if the BHO pushed one
+    /// before absorption. Consumes the entry.
+    fn take_cached_nav(&mut self, pid: isize) -> Option<String> {
         let idx = self
             .nav_cache
             .iter()
-            .position(|(h, _, t)| *h == hwnd && t.elapsed() < Self::NAV_CACHE_TTL)?;
+            .position(|(p, _, t)| *p == pid && t.elapsed() < Self::NAV_CACHE_TTL)?;
         let (_, path, _) = self.nav_cache.remove(idx);
         Some(path)
     }
@@ -1406,8 +1403,9 @@ impl App {
             // fallback below is cross-process and blind to re-parented
             // windows, so it only runs when no push ever arrived (e.g. Revolc
             // started after the window did).
-            if let Some(cached) = self.take_cached_nav(top.0 as isize) {
-                tracing::info!(?top, path = ?cached, "absorb: seeding path from BHO cache");
+            let pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
+            if let Some(cached) = self.take_cached_nav(pid) {
+                tracing::info!(?top, ?pid, path = ?cached, "absorb: seeding path from BHO cache");
                 self.tabs.set_path(idx, cached);
             } else {
                 let store = host::read_folder_path(top, 1, false).unwrap_or_default();
@@ -2814,9 +2812,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
                     let payload = std::slice::from_raw_parts(ptr, len);
                     if let Ok(text) = std::str::from_utf8(payload) {
-                        if let Some((hwnd_str, url)) = text.split_once('\t') {
-                            if let Ok(explorer_hwnd) = hwnd_str.parse::<isize>() {
-                                app_from(hwnd).on_explorer_navigated(explorer_hwnd, url);
+                        // "explorer_pid\tbrowser_hwnd\turl"
+                        if let Some((pid_str, rest)) = text.split_once('\t') {
+                            if let Some((hwnd_str, url)) = rest.split_once('\t') {
+                                if let (Ok(pid), Ok(bhwnd)) =
+                                    (pid_str.parse::<isize>(), hwnd_str.parse::<isize>())
+                                {
+                                    app_from(hwnd).on_explorer_navigated(pid, bhwnd, url);
+                                }
                             }
                         }
                     }

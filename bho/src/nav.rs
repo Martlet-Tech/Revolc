@@ -77,8 +77,8 @@ static PENDING: Mutex<Vec<SendCom<IUnknown>>> = Mutex::new(Vec::new());
 /// WM_COPYDATA marshals the string across processes; SendMessageTimeout keeps
 /// a stuck Revolc from hanging Explorer's UI thread. `ntrace` gates the log
 /// only — delivery is controlled by the bho.nav file at subscribe time.
-fn send_navigation(hwnd: isize, url: &str) {
-    let payload = format!("{hwnd}\t{url}");
+fn send_navigation(pid: isize, hwnd: isize, url: &str) {
+    let payload = format!("{pid}\t{hwnd}\t{url}");
     let mut bytes = payload.into_bytes();
     if bytes.len() > 16 * 1024 {
         return;
@@ -103,40 +103,17 @@ fn send_navigation(hwnd: isize, url: &str) {
             windows::Win32::Foundation::LPARAM(ctx.as_ptr() as isize),
         );
         crate::bho_log(&format!(
-            "[nav] sent to {} RevolcMain windows hwnd={hwnd:#x} url={url:?}",
+            "[nav] sent to {} RevolcMain windows pid={pid} hwnd={hwnd:#x} url={url:?}",
             sent.load(std::sync::atomic::Ordering::Relaxed)
         ));
     }
 }
 
-/// Walk up the window tree to the owning `CabinetWClass`.
-///
-/// `IWebBrowser2::get_HWND` returns an inner WebBrowser-control window, not
-/// the frame Explorer shows. Revolc absorbs (and matches tabs by) the frame
-/// itself, so the reported HWND must be normalized to the frame first
-/// (observed 2026-11-20 13:24: push carried 0x1E0092 while the absorbed frame
-/// was 0x4042e — nothing matched and every path update was dropped).
-fn normalize_to_frame(hwnd: HWND) -> isize {
-    unsafe {
-        let mut cur = hwnd;
-        for _ in 0..8 {
-            let mut cls = [0u16; 32];
-            let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(cur, &mut cls);
-            if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "CabinetWClass" {
-                return cur.0 as isize;
-            }
-            let parent = windows::Win32::UI::WindowsAndMessaging::GetAncestor(
-                cur,
-                windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
-            );
-            if parent.0.is_null() || parent.0 == cur.0 {
-                break;
-            }
-            cur = parent;
-        }
-        cur.0 as isize
-    }
-}
+/// NOTE (2026-11-20 14:15): the frame HWND is UNRECOVERABLE from the BHO once
+/// the window is absorbed — `get_HWND` returns the host top-level (RevolcMain;
+/// measured parent chain: RevolcMain -> #32769, no CabinetWClass anywhere).
+/// Tab matching therefore uses the explorer.exe PROCESS ID, which survives
+/// re-parenting and is 1:1 with tabs in the per-process folder-window layout.
 
 unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
     // ctx = [*mut COPYDATASTRUCT, *const AtomicUsize]
@@ -260,8 +237,13 @@ impl IDispatch_Impl for NavEventSink_Impl {
         // across re-parent). Revolc matches by this HWND, never by URL, so
         // several tabs in the same folder cannot cross-talk.
         let raw = unsafe { self.browser.HWND() }.unwrap_or_default();
-        let frame = normalize_to_frame(HWND(raw.0 as *mut core::ffi::c_void));
-        send_navigation(frame, &url);
+        // The frame HWND is UNRECOVERABLE after absorb: get_HWND returns the
+        // host top-level (RevolcMain) once SetParent re-parented the frame —
+        // its parent chain is RevolcMain -> desktop, no CabinetWClass (see the
+        // frame-chain log). Match tabs by PROCESS ID instead: each Revolc tab
+        // is its own explorer.exe process, and the pid survives re-parenting.
+        let pid = std::process::id() as isize;
+        send_navigation(pid, raw.0 as isize, &url);
         Ok(())
     }
 }
