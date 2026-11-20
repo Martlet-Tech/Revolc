@@ -9,6 +9,7 @@
 //! Per-user registration (HKCU) so takeover never needs admin rights.
 
 mod dblclick;
+mod nav;
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::OnceLock;
@@ -77,6 +78,13 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
                 bho_log("SetSite skipped (takeover disabled)");
                 return Ok(());
             }
+            // Optional event-driven navigation tracking. Gated behind a file
+            // so default behaviour is byte-for-byte unchanged. queue_site only
+            // AddRefs the site into a queue; no method call here (crash rule).
+            if nav_enabled() {
+                nav::queue_site(psite.unwrap());
+                bho_log("SetSite: navigation site queued");
+            }
             // Notify FIRST: SetSite runs on Explorer's window-creation path,
             // so anything slow here delays every folder window. Disk logging
             // is opt-in (see bho_log).
@@ -112,6 +120,15 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
 pub(crate) fn revolc_disabled() -> bool {
     std::env::var_os("APPDATA")
         .map(|d| std::path::Path::new(&d).join("revolc").join("disabled").exists())
+        .unwrap_or(false)
+}
+
+/// Event-driven navigation tracking is opt-in via `%APPDATA%\revolc\bho.nav`.
+/// Off by default so the risky COM subscription never runs unless enabled for
+/// a hand-test. Combined with bho.navtrace it logs without pushing to Revolc.
+fn nav_enabled() -> bool {
+    std::env::var_os("APPDATA")
+        .map(|d| std::path::Path::new(&d).join("revolc").join("bho.nav").exists())
         .unwrap_or(false)
 }
 
