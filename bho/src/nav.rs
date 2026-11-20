@@ -89,18 +89,60 @@ fn send_navigation(hwnd: isize, url: &str) {
         lpData: bytes.as_mut_ptr() as *mut core::ffi::c_void,
     };
     unsafe {
-        let mut sent = 0usize;
+        // Context = two raw pointers passed as a [usize; 2]. (The earlier
+        // reference-in-reference layout was reinterpreted one level shallower
+        // by the callback, so the counter was never written — it logged
+        // "sent to 0" while delivery actually succeeded.)
+        let sent = std::sync::atomic::AtomicUsize::new(0);
+        let ctx = [
+            &mut cds as *mut COPYDATASTRUCT as usize,
+            &sent as *const std::sync::atomic::AtomicUsize as usize,
+        ];
         let _ = EnumWindows(
             Some(send_nav_window),
-            windows::Win32::Foundation::LPARAM(&mut (&mut cds, &mut sent) as *mut (_, &mut usize)
-                as isize),
+            windows::Win32::Foundation::LPARAM(ctx.as_ptr() as isize),
         );
-        crate::bho_log(&format!("[nav] sent to {sent} RevolcMain windows hwnd={hwnd:#x} url={url:?}"));
+        crate::bho_log(&format!(
+            "[nav] sent to {} RevolcMain windows hwnd={hwnd:#x} url={url:?}",
+            sent.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    }
+}
+
+/// Walk up the window tree to the owning `CabinetWClass`.
+///
+/// `IWebBrowser2::get_HWND` returns an inner WebBrowser-control window, not
+/// the frame Explorer shows. Revolc absorbs (and matches tabs by) the frame
+/// itself, so the reported HWND must be normalized to the frame first
+/// (observed 2026-11-20 13:24: push carried 0x1E0092 while the absorbed frame
+/// was 0x4042e — nothing matched and every path update was dropped).
+fn normalize_to_frame(hwnd: HWND) -> isize {
+    unsafe {
+        let mut cur = hwnd;
+        for _ in 0..8 {
+            let mut cls = [0u16; 32];
+            let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(cur, &mut cls);
+            if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "CabinetWClass" {
+                return cur.0 as isize;
+            }
+            let parent = windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                cur,
+                windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
+            );
+            if parent.0.is_null() || parent.0 == cur.0 {
+                break;
+            }
+            cur = parent;
+        }
+        cur.0 as isize
     }
 }
 
 unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
-    let (cds, sent) = &mut *(lp.0 as *mut (*mut COPYDATASTRUCT, usize));
+    // ctx = [*mut COPYDATASTRUCT, *const AtomicUsize]
+    let ctx = lp.0 as *const usize;
+    let cds = *ctx as *mut COPYDATASTRUCT;
+    let sent = &*(*ctx.add(1) as *const std::sync::atomic::AtomicUsize);
     let mut cls = [0u16; 64];
     let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut cls);
     if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "RevolcMain" {
@@ -109,12 +151,12 @@ unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Founda
             hwnd,
             WM_COPYDATA,
             windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(*cds as *const COPYDATASTRUCT as isize),
+            windows::Win32::Foundation::LPARAM(cds as isize),
             SMTO_ABORTIFHUNG,
             200,
             Some(&mut r),
         );
-        *sent += 1;
+        sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     windows::Win32::Foundation::BOOL(1)
 }
@@ -218,7 +260,8 @@ impl IDispatch_Impl for NavEventSink_Impl {
         // across re-parent). Revolc matches by this HWND, never by URL, so
         // several tabs in the same folder cannot cross-talk.
         let raw = unsafe { self.browser.HWND() }.unwrap_or_default();
-        send_navigation(raw.0, &url);
+        let frame = normalize_to_frame(HWND(raw.0 as *mut core::ffi::c_void));
+        send_navigation(frame, &url);
         Ok(())
     }
 }

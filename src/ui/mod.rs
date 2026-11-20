@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
+    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA, IsChild,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -1131,8 +1131,15 @@ impl App {
             tracing::debug!(?url, "BHO navigation: non-filesystem URL, ignored");
             return;
         };
+        // The BHO reports the owning CabinetWClass (normalized by walking up
+        // from the WebBrowser control window). Accept an exact frame match,
+        // and as a belt-and-suspenders fallback any descendant of the frame —
+        // a normalization miss must not silently drop path updates again.
+        let target = HWND(hwnd as *mut core::ffi::c_void);
         let idx = self.views.iter().position(|v| {
-            v.as_ref().map(|v| v.top.0 as isize == hwnd).unwrap_or(false)
+            v.as_ref()
+                .map(|v| v.top.0 == target.0 || unsafe { IsChild(v.top, target).as_bool() })
+                .unwrap_or(false)
         });
         let Some(i) = idx else {
             // The window may not be absorbed yet: Explorer navigates a fresh
