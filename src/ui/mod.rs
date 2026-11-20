@@ -1149,8 +1149,7 @@ impl App {
         }
         // pid fallback (kept as a second opinion; label may lag one sweep).
         let idx = self.views.iter().position(|v| {
-            v.as_ref().map(|v| unsafe { GetWindowThreadProcessId(v.top, None) as isize } == pid)
-                .unwrap_or(false)
+            v.as_ref().map(|v| host::process_id_of(v.top) as isize == pid).unwrap_or(false)
         });
         let Some(i) = idx else {
             self.cache_nav(pid, path);
@@ -1459,8 +1458,7 @@ impl App {
         // (that is the whole point — see stray_folder_windows). Everything
         // below that needs a *live, navigated* browser is therefore deferred.
         let visible = host::is_visible(top);
-        let absorbed_pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
-        tracing::info!(?top, idx, visible, pid = absorbed_pid, "absorbed into tab");
+        let absorbed_pid = host::process_id_of(top) as isize;
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
         // When we spawned the window ourselves the tab already carries the
@@ -1476,7 +1474,7 @@ impl App {
             // fallback below is cross-process and blind to re-parented
             // windows, so it only runs when no push ever arrived (e.g. Revolc
             // started after the window did).
-            let pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
+            let pid = host::process_id_of(top) as isize;
             if let Some(cached) = self.take_cached_nav(pid) {
                 tracing::info!(?top, ?pid, path = ?cached, "absorb: seeding path from BHO cache");
                 self.tabs.set_path(idx, cached);

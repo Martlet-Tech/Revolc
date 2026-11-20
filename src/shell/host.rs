@@ -446,6 +446,18 @@ fn descendants(parent: HWND) -> Vec<HWND> {
     out
 }
 
+/// The PID of the process that created `hwnd`.
+///
+/// `GetWindowThreadProcessId`'s RETURN value is the thread id — the process id
+/// comes out of the second parameter. The whole nav-matching failure chain
+/// (2026-11-20, X光体检报告 §3.1) was this exact mix-up: passing `None` and
+/// comparing the TID against `std::process::id()` never matched.
+pub fn process_id_of(hwnd: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
 /// True if `top` is already a child of our host (absorbed earlier).
 /// GA_ROOT: robust even if something re-parented `top` in between.
 pub fn is_absorbed(top: HWND, host: HWND) -> bool {
@@ -467,7 +479,7 @@ pub fn is_absorbed(top: HWND, host: HWND) -> bool {
 /// cross-wired every tab to the first shell window (2026-11-20).
 pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
     unsafe {
-        let top_pid = GetWindowThreadProcessId(top, None);
+        let top_pid = process_id_of(top);
         let svc: IShellWindows = CoCreateInstance(&shell::ShellWindows, None, CLSCTX_LOCAL_SERVER)
             .ok()?;
         for attempt in 0..retries.max(1) {
@@ -477,7 +489,7 @@ pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
                 let Ok(browser) = dispatch.cast::<IWebBrowser2>() else { continue };
                 let Ok(whwnd) = browser.HWND() else { continue };
                 let hwnd = HWND(whwnd.0 as *mut _);
-                let bpid = GetWindowThreadProcessId(hwnd, None);
+                let bpid = process_id_of(hwnd);
                 let hwnd_match = hwnd.0 == top.0 || IsChild(top, hwnd).as_bool();
                 let pid_match = top_pid != 0 && top_pid == bpid;
                 if !hwnd_match && !pid_match {
