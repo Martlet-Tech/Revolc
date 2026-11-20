@@ -48,7 +48,7 @@ impl std::io::Write for Tee {
 }
 
 /// Logging init: console + rotating file, compile-time trimmed in release.
-/// Must run before everything else (see doc/M0_Tech_Design.md §6).
+/// Must run before everything else (see docs/M0_Tech_Design.md §6).
 pub fn init(name: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 

@@ -1,4 +1,4 @@
-//! Tab model: pure logic, no Win32 imports (doc/M0_Tech_Design.md 铁律).
+//! Tab model: pure logic, no Win32 imports (docs/M0_Tech_Design.md 铁律).
 
 pub mod events;
 

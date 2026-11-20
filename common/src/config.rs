@@ -48,7 +48,7 @@ impl Default for Tray {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Takeover {
-    /// "off" | "redirect" (doc/Takeover_Research.md §4; spec §7.1)
+    /// "off" | "redirect" (docs/Takeover_Research.md §4; spec §7.1)
     pub mode: String,
 }
 
