@@ -18,7 +18,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{self as shell, IShellWindows, IWebBrowser2};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsWindow, IsWindowVisible,
+    GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsChild, IsWindow, IsWindowVisible,
     SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
     SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
@@ -469,7 +469,16 @@ pub fn read_folder_path(top: HWND, retries: usize) -> Option<String> {
                 let Ok(dispatch) = svc.Item(&VARIANT::from(i)) else { continue };
                 let Ok(browser) = dispatch.cast::<IWebBrowser2>() else { continue };
                 let Ok(whwnd) = browser.HWND() else { continue };
-                if GetAncestor(HWND(whwnd.0 as *mut _), GA_PARENT).0 != top.0 {
+                let hwnd = HWND(whwnd.0 as *mut _);
+                // `browser.HWND()` is the CabinetWClass itself. After absorb
+                // it is re-parented under our frame, so the old
+                // `GetAncestor(hwnd, GA_PARENT) == top` never matches (top
+                // *is* hwnd) — every tab path silently fell back to home.
+                // Accept an exact match or either direction of ancestry.
+                let same = hwnd.0 == top.0
+                    || IsChild(top, hwnd).as_bool()
+                    || IsChild(hwnd, top).as_bool();
+                if !same {
                     continue;
                 }
                 if let Ok(url) = browser.LocationURL() {

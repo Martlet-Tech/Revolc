@@ -1233,15 +1233,23 @@ impl App {
         host::spawn_explorer(&path);
     }
 
-    /// Context menu "open in new window": launch a fresh revolc.exe with the
-    /// target folder as its startup path. The new process handles its own
-    /// absorb; this one keeps the tab (browser semantics: open a copy).
-    fn open_tab_in_new_window(&mut self, i: usize) {
+    /// Context menu "open in new window": MOVE the tab — close it here, then
+    /// launch a fresh revolc.exe with the tab's *live* folder as startup path.
+    /// The new process absorbs its own Explorer window. Keep the close after
+    /// the spawn: if this is the last tab, close_tab destroys this window and
+    /// we must have captured the path and started the replacement first.
+    fn move_tab_to_new_window(&mut self, i: usize) {
         let path = self.folder_path_of(i);
         let exe = std::env::current_exe().unwrap_or_default();
         match std::process::Command::new(exe).arg(&path).spawn() {
-            Ok(_) => tracing::info!(?path, "spawned new window for tab"),
-            Err(e) => tracing::error!(error = %e, ?path, "failed to spawn new window"),
+            Ok(_) => {
+                tracing::info!(?path, tab = i, "moved tab to new window");
+                self.close_tab(i);
+            }
+            Err(e) => {
+                // Spawn failed: leave the tab where it is — never lose it.
+                tracing::error!(error = %e, ?path, "failed to spawn new window, tab kept");
+            }
         }
     }
 
@@ -2122,6 +2130,7 @@ unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usi
 
     if has_tab {
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_WINDOW, w!("在新窗口打开此标签页(&N)"));
+        // (moves the tab: closes it here + opens the same folder in a new window)
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("在右侧新建标签页(&A)"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE, w!("关闭标签页(&C)"));
@@ -2519,7 +2528,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 match cmd {
                     CMD_TAB_NEW_WINDOW => {
                         if let Some(i) = idx {
-                            app.open_tab_in_new_window(i);
+                            app.move_tab_to_new_window(i);
                         }
                     }
                     CMD_TAB_NEW_AFTER => {
