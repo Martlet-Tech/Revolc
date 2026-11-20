@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA, GetWindowThreadProcessId,
+    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -1458,7 +1458,6 @@ impl App {
         // (that is the whole point — see stray_folder_windows). Everything
         // below that needs a *live, navigated* browser is therefore deferred.
         let visible = host::is_visible(top);
-        let absorbed_pid = host::process_id_of(top) as isize;
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
         // When we spawned the window ourselves the tab already carries the
@@ -1790,8 +1789,12 @@ impl App {
 
         // Local excludes plus everything any dying window released back to
         // the desktop (the "FE 被吸走" fix). Both expire on the same TTL.
+        // The global table is pruned HERE, in place (write lock): it only
+        // ever grows via park_released, and pruning the local copy alone
+        // left the process-global table growing forever (X光体检报告 §3.2).
         let mut excl: Vec<(isize, Instant)> = self.excluded.clone();
-        if let Ok(g) = RELEASED_WINDOWS.lock() {
+        if let Ok(mut g) = RELEASED_WINDOWS.lock() {
+            g.retain(|(_, t)| t.elapsed() < EXCLUDE_TTL);
             excl.extend(g.iter().copied());
         }
         excl.retain(|(_, t)| t.elapsed() < EXCLUDE_TTL);
@@ -1847,13 +1850,17 @@ impl App {
     }
 
     /// Browser-style "close all tabs?" confirm. Only called with 2+ tabs.
-    fn confirm_close_all_tabs(&self) -> bool {
-        let n = self.tabs.len();
+    /// Standalone (no &mut App): MessageBoxW runs a modal loop that dispatches
+    /// messages — WM_TIMER(sweep) re-enters app_from and would alias the &mut
+    /// App a caller is still holding (X光体检报告 §3.3). Callers drop their
+    /// borrow before invoking this, exactly like the WM_RBUTTONUP three-phase
+    /// pattern.
+    fn confirm_close_all_tabs(host: HWND, n: usize) -> bool {
         let text = format!("要关闭全部 {n} 个标签页吗？\r\n每个标签页的文件夹窗口会一并关闭。");
         let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
         let r = unsafe {
             MessageBoxW(
-                self.main_hwnd,
+                host,
                 PCWSTR(wide.as_ptr()),
                 w!("Revolc"),
                 MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
@@ -2806,10 +2813,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // first; confirming closes every FE window, then the frame. The
             // released-panes table keeps any survivor from re-adopting them.
             // One tab (or no tabs): just close, like every other window.
-            let app = app_from(hwnd);
-            if app.tabs.len() > 1 && !app.confirm_close_all_tabs() {
+            //
+            // Three-phase like WM_RBUTTONUP: the MessageBoxW in the confirm
+            // runs a modal loop that dispatches WM_TIMER(sweep), which would
+            // re-enter app_from and alias the &mut App still held here.
+            // Phase 1: count tabs under the borrow, then drop it.
+            let (multi, n) = {
+                let app = app_from(hwnd);
+                (app.tabs.len() > 1, app.tabs.len())
+            };
+            // Phase 2: modal loop — no &mut App alive here.
+            if multi && !App::confirm_close_all_tabs(hwnd, n) {
                 return LRESULT(0);
             }
+            // Phase 3: re-acquire and dispatch.
+            let mut app = app_from(hwnd);
             app.close_all_tabs();
             unsafe {
                 let _ = DestroyWindow(hwnd);
