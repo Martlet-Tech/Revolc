@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
     RDW_UPDATENOW, SRCCOPY, TRANSPARENT, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -43,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE, WM_PAINT, WM_RBUTTONUP,
+    WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -60,6 +61,9 @@ pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher threa
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
 /// handler and `--shutdown` post this) need their own message.
 pub const WM_APP_QUIT: u32 = 0x8010;
+/// WM_COPYDATA tag from the BHO for navigation events ("RNAV"). Payload is
+/// UTF-8 "HWND<TAB>url"; must match NAV_COPYDATA_TAG in bho/src/nav.rs.
+const NAV_COPYDATA_TAG: usize = 0x524E4156;
 /// wParam = Explorer top-level HWND. Sent by the BHO via the registered
 /// window message "RevolcAbsorbExplorer" (system-assigned id, identical
 /// in every process of the session).
@@ -1110,6 +1114,31 @@ impl App {
     /// Index of the tab with `id`, if it still exists.
     fn index_of(&self, id: u64) -> Option<usize> {
         self.tabs.iter_all().position(|t| t.id == id)
+    }
+
+    /// Event-driven navigation from the BHO: `hwnd` is the CabinetWClass the
+    /// BHO saw navigate; find the tab holding that exact window and update its
+    /// path. Matching by HWND (not URL) keeps same-folder tabs independent.
+    fn on_explorer_navigated(&mut self, hwnd: isize, url: &str) {
+        let Some(path) = host::file_url_to_path(url) else {
+            tracing::debug!(?url, "BHO navigation: non-filesystem URL, ignored");
+            return;
+        };
+        let idx = self.views.iter().position(|v| {
+            v.as_ref().map(|v| v.top.0 as isize == hwnd).unwrap_or(false)
+        });
+        let Some(i) = idx else {
+            // Window may not be absorbed yet (BHO fires during creation), or
+            // belongs to another Revolc window — both are normal.
+            tracing::debug!(?hwnd, ?path, "BHO navigation: no matching tab in this window");
+            return;
+        };
+        let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+        if old == path {
+            return;
+        }
+        tracing::info!(tab = i, ?hwnd, ?old, new = ?path, "tab navigated (BHO event)");
+        self.tabs.set_path(i, path);
     }
 
     // ---- tab drag: reorder inside the band -------------------------------
@@ -2749,6 +2778,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.on_notify();
             }
             LRESULT(0)
+        }
+        WM_COPYDATA => {
+            // Event-driven navigation from the BHO. Payload: "HWND\turl" UTF-8.
+            // Validate the tag and length; a random WM_COPYDATA from another
+            // app must never touch our tabs.
+            let cds = lp.0 as *const COPYDATASTRUCT;
+            if !cds.is_null() && (*cds).dwData == NAV_COPYDATA_TAG {
+                let len = (*cds).cbData as usize;
+                let ptr = (*cds).lpData as *const u8;
+                if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
+                    let payload = std::slice::from_raw_parts(ptr, len);
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Some((hwnd_str, url)) = text.split_once('\t') {
+                            if let Ok(explorer_hwnd) = hwnd_str.parse::<isize>() {
+                                app_from(hwnd).on_explorer_navigated(explorer_hwnd, url);
+                            }
+                        }
+                    }
+                }
+            }
+            LRESULT(1) // non-zero = data accepted (WM_COPYDATA convention)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }

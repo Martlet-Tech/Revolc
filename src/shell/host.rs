@@ -783,9 +783,20 @@ pub fn focus_into(host: HWND, top: HWND, already_attached: bool) {
     }
 }
 
-/// "file:///D:/dir%20name" -> "D:\dir name"
-fn file_url_to_path(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("file:///")?;
+/// Convert an Explorer `LocationURL` into a filesystem path.
+///   "file:///D:/dir%20name"          -> "D:\dir name"
+///   "file://server/share/dir"        -> "\\server\share\dir"  (UNC)
+/// Percent-decoding is byte-wise; a UTF-8 path is a run of %XX bytes that
+/// `String::from_utf8` reassembles into the original Chinese characters.
+pub fn file_url_to_path(url: &str) -> Option<String> {
+    let (rest, unc) = if let Some(r) = url.strip_prefix("file:///") {
+        (r, false)
+    } else if let Some(r) = url.strip_prefix("file://") {
+        // file://host/share -> UNC \\host\share
+        (r, true)
+    } else {
+        return None; // shell: / virtual locations
+    };
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -799,9 +810,15 @@ fn file_url_to_path(url: &str) -> Option<String> {
             i += 1;
         }
     }
-    let path = String::from_utf8(out).ok()?.replace('/', "\\");
+    let mut path = String::from_utf8(out).ok()?.replace('/', "\\");
+    if unc {
+        // file://192.168.5.5/share/dir -> \\192.168.5.5\share\dir
+        path.insert_str(0, "\\\\");
+    }
     let b = path.as_bytes();
-    if b.len() < 3 || b[1] != b':' {
+    let valid_drive = b.len() >= 3 && b[1] == b':';
+    let valid_unc = path.starts_with("\\\\") && path.len() > 2;
+    if !valid_drive && !valid_unc {
         return None; // virtual locations (This PC etc.) — not real folders
     }
     Some(path)
@@ -826,5 +843,32 @@ pub fn spawn_explorer(path: &str) {
     match std::process::Command::new("explorer.exe").arg(&normalized).spawn() {
         Ok(_) => tracing::info!(path, "explorer spawned for absorb"),
         Err(e) => tracing::error!(error = %e, path, "spawn explorer failed"),
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::file_url_to_path;
+
+    #[test]
+    fn local_path_with_space() {
+        assert_eq!(
+            file_url_to_path("file:///D:/_Work_Of_Mine/261119%20%E9%A1%B9%E7%9B%AE%E6%8A%A5%E4%BB%B7"),
+            Some("D:\\_Work_Of_Mine\\261119 项目报价".into())
+        );
+    }
+
+    #[test]
+    fn unc_path() {
+        assert_eq!(
+            file_url_to_path("file://192.168.5.5/共享服务/展盒"),
+            Some("\\\\192.168.5.5\\共享服务\\展盒".into())
+        );
+    }
+
+    #[test]
+    fn virtual_location_rejected() {
+        assert_eq!(file_url_to_path("shell:MyComputerFolder"), None);
+        assert_eq!(file_url_to_path("about:blank"), None);
     }
 }

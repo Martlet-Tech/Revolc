@@ -23,8 +23,14 @@ use windows::Win32::System::Com::{
     IConnectionPoint, IConnectionPointContainer, IDispatch, IDispatch_Impl, ITypeInfo,
     DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Shell::IWebBrowser2;
-use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, SendMessageTimeoutW, SetTimer, SMTO_ABORTIFHUNG, WM_COPYDATA,
+};
+
+/// WM_COPYDATA tag for navigation events: "RNAV" (Revolc NAVigation).
+const NAV_COPYDATA_TAG: usize = 0x524E4156;
 
 /// COM interfaces are !Send, but all our uses are confined to Explorer's UI
 /// thread. The unsafe impl only lets them live in a process-wide static.
@@ -66,6 +72,48 @@ static SUBS: Mutex<Vec<SendCom<NavigationSink>>> = Mutex::new(Vec::new());
 /// Sites queued by SetSite (which must not call COM methods). The timer
 /// callback drains this and subscribes on the Explorer UI thread.
 static PENDING: Mutex<Vec<SendCom<IUnknown>>> = Mutex::new(Vec::new());
+
+/// Broadcast "this Explorer window navigated to URL" to every RevolcMain.
+/// WM_COPYDATA marshals the string across processes; SendMessageTimeout keeps
+/// a stuck Revolc from hanging Explorer's UI thread. `ntrace` gates the log
+/// only — delivery is controlled by the bho.nav file at subscribe time.
+fn send_navigation(hwnd: isize, url: &str) {
+    let payload = format!("{hwnd}\t{url}");
+    let mut bytes = payload.into_bytes();
+    if bytes.len() > 16 * 1024 {
+        return;
+    }
+    let mut cds = COPYDATASTRUCT {
+        dwData: NAV_COPYDATA_TAG,
+        cbData: bytes.len() as u32,
+        lpData: bytes.as_mut_ptr() as *mut core::ffi::c_void,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(send_nav_window),
+            windows::Win32::Foundation::LPARAM(&mut cds as *mut COPYDATASTRUCT as isize),
+        );
+    }
+}
+
+unsafe extern "system" fn send_nav_window(hwnd: HWND, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+    let cds = &*(lp.0 as *const COPYDATASTRUCT);
+    let mut cls = [0u16; 64];
+    let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut cls);
+    if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "RevolcMain" {
+        let mut r = 0usize;
+        let _ = SendMessageTimeoutW(
+            hwnd,
+            WM_COPYDATA,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(cds as *const COPYDATASTRUCT as isize),
+            SMTO_ABORTIFHUNG,
+            200,
+            Some(&mut r),
+        );
+    }
+    windows::Win32::Foundation::BOOL(1)
+}
 
 /// Called from SetSite. Only clones the site pointer into a queue — no method
 /// calls on it here (2026-11-17 crash rule). The actual subscribe runs later
@@ -159,7 +207,14 @@ impl IDispatch_Impl for NavEventSink_Impl {
             let name = if dispidmember == DISPID_NAVIGATECOMPLETE2 { "NavigateComplete2" } else { "DocumentComplete" };
             log(&format!("{name} url={url:?}"));
         }
-        // Step 1 is VERIFY ONLY: log, do not push to Revolc yet.
+        if url.is_empty() {
+            return Ok(());
+        }
+        // The browser's HWND is the CabinetWClass Revolc absorbed (stable
+        // across re-parent). Revolc matches by this HWND, never by URL, so
+        // several tabs in the same folder cannot cross-talk.
+        let raw = unsafe { self.browser.HWND() }.unwrap_or_default();
+        send_navigation(raw.0, &url);
         Ok(())
     }
 }
