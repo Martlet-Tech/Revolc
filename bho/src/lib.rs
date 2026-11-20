@@ -128,12 +128,15 @@ fn notify_revolc() {
         static MSG_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let msg = *MSG_ID.get_or_init(|| RegisterWindowMessageW(w!("RevolcAbsorbExplorer")));
 
-        let Ok(target) = FindWindowW(w!("RevolcMain"), None) else {
-            return; // Revolc not running
+        // Prefer a live RevolcMain; fall back to the resident window (redirect
+        // takeover with zero open windows — docs/双进程架构设计.md Phase 1).
+        let target = match FindWindowW(w!("RevolcMain"), None) {
+            Ok(h) if !h.0.is_null() => h,
+            _ => match FindWindowW(w!("RevolcResident"), None) {
+                Ok(h) if !h.0.is_null() => h,
+                _ => return, // Revolc not running
+            },
         };
-        if target.0.is_null() {
-            return;
-        }
         // wParam unused: Revolc finds the new window via IShellWindows.
         let _ = PostMessageW(target, msg, WPARAM(0), LPARAM(0));
     }

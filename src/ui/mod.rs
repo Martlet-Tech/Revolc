@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod dwm;
 pub mod icon;
+pub mod resident;
 pub mod tabbar;
 pub mod tray;
 
@@ -27,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
     IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
@@ -51,11 +52,10 @@ pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher threa
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
 /// handler and `--shutdown` post this) need their own message.
 pub const WM_APP_QUIT: u32 = 0x8010;
-pub(crate) use tray::WM_APP_TRAY;
 /// wParam = Explorer top-level HWND. Sent by the BHO via the registered
 /// window message "RevolcAbsorbExplorer" (system-assigned id, identical
 /// in every process of the session).
-fn absorb_msg() -> u32 {
+pub(crate) fn absorb_msg() -> u32 {
     static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *ID.get_or_init(|| unsafe {
         windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("RevolcAbsorbExplorer"))
@@ -94,6 +94,24 @@ static LAST_ACTIVE: AtomicIsize = AtomicIsize::new(0);
 /// loop; closing any other one is just closing a window.
 static LIVE_WINDOWS: AtomicUsize = AtomicUsize::new(0);
 
+/// HWNDs released back to the desktop by a *dying* window (`release_all`).
+///
+/// Per-window `excluded` lists cannot see this: the window that released the
+/// Explorer panes is being destroyed, and the surviving windows' sweeps would
+/// immediately re-adopt its panes ("FE 被吸走"). This table is process-global
+/// and every sweep merges it in; entries expire after the same EXCLUDE_TTL.
+static RELEASED_WINDOWS: std::sync::Mutex<Vec<(isize, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Park an HWND we are deliberately letting go of (closed tab, dying window,
+/// failed absorb) in the process-global table so **no** window's sweep picks
+/// it back up until it expires.
+fn park_released(top: HWND) {
+    if let Ok(mut g) = RELEASED_WINDOWS.lock() {
+        g.push((top.0 as isize, Instant::now()));
+    }
+}
+
 /// Stray-window sweep. The BHO notify is a hint, not a guarantee: SetSite
 /// fires before the frame is shown and some folder windows never notify at
 /// all, so the timer has to exist. But it does not have to be one constant
@@ -126,12 +144,9 @@ const MAX_TABS: usize = 40;
 struct WindowArgs {
     cfg: Arc<ConfigHandle>,
     initial_path: Option<String>,
-    /// Not a preference: the tray icon must exist once per process, so exactly
-    /// one window may add it (a second registration would either fail or show
-    /// two clovers in the notification area).
-    tray: bool,
-    /// Built per window by the creator; the loop translates with the table of
-    /// whichever window owns the focused control, so this cannot be shared.
+    /// Not a preference: built per window by the creator; the loop translates
+    /// with the table of whichever window owns the focused control, so this
+    /// cannot be shared.
     accel: HACCEL,
 }
 
@@ -153,10 +168,6 @@ pub(crate) struct App {
     /// on the frame: with two windows, the second one's Ctrl+T would be
     /// delivered to the first one's tab list.
     accel: HACCEL,
-    /// This window owns the tray icon, so in redirect mode it is the one that
-    /// hides instead of closing. A second window has no tray entry to come
-    /// back from — hiding it would strand its absorbed Explorer windows.
-    owns_tray: bool,
     tabs: TabList,
     views: Vec<Option<Absorbed>>,
     /// HWNDs we deliberately left on the desktop (closed tabs), with the
@@ -220,21 +231,20 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
-    /// The window created by `app::run`. It owns the tray icon, the console-ctrl
-    /// target and the `--shutdown` mailbox (`FindWindowW("RevolcMain")`).
+    /// The window created by `app::run`. The tray icon lives on the resident
+    /// window now; every RevolcMain is a plain closable window.
     pub fn new(cfg: Arc<ConfigHandle>, initial_path: Option<String>) -> windows::core::Result<Self> {
-        Self::create(cfg, initial_path, true)
+        Self::create(cfg, initial_path)
     }
 
     /// Another window on the same UI thread, from the tray menu.
     pub fn spawn_extra(cfg: Arc<ConfigHandle>) -> windows::core::Result<Self> {
-        Self::create(cfg, None, false)
+        Self::create(cfg, None)
     }
 
     fn create(
         cfg: Arc<ConfigHandle>,
         initial_path: Option<String>,
-        tray: bool,
     ) -> windows::core::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
@@ -256,7 +266,6 @@ impl MainWindow {
             let args = Box::into_raw(Box::new(WindowArgs {
                 cfg,
                 initial_path,
-                tray,
                 accel,
             }));
 
@@ -491,9 +500,10 @@ fn any_visible_window() -> bool {
 }
 
 /// Destroy every window of ours, leaving the loop to quit on the last
-/// `WM_DESTROY`. Used by `WM_APP_QUIT` (tray 退出 / `--shutdown` / Ctrl+C):
-/// with several windows open, quitting must not leave orphans behind.
-fn close_all_windows() {
+/// `WM_DESTROY` (or on the resident's, in redirect+tray mode). Used by
+/// `WM_APP_QUIT` (tray 退出 / `--shutdown` / Ctrl+C): with several windows
+/// open, quitting must not leave orphans behind.
+pub(crate) fn close_all_windows() {
     // Collected first: destroying while enumerating skips windows.
     for h in our_windows() {
         unsafe {
@@ -530,7 +540,6 @@ impl App {
             cfg: args.cfg,
             keymap: events::default_keymap(),
             accel: args.accel,
-            owns_tray: args.tray,
             tabs: TabList::new(),
             views: Vec::new(),
             excluded: Vec::new(),
@@ -551,29 +560,8 @@ impl App {
             tab_press: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
-        let owns_tray = args.tray;
         app.new_tab(first);
-        if owns_tray && app.cfg.get().takeover.mode == "redirect" {
-            tray::add(hwnd);
-            // Startup is a burst too: we just spawned Explorer.
-            app.arm_burst();
-        }
         app
-    }
-
-    /// Show window; if no tabs remain (was hidden in tray), open a home tab.
-    ///
-    /// Tray clicks land here, so this also takes the foreground. Two separate
-    /// dimensions on purpose: `surface` decides *visibility* (and restores a
-    /// minimized frame to its previous zoom), `host::activate` decides
-    /// *foreground*. A maximized window stays maximized, a restored one stays
-    /// restored — this never calls SW_RESTORE on a zoomed window.
-    pub(crate) fn open_main(&mut self) {
-        self.surface();
-        if self.tabs.is_empty() {
-            self.new_tab(home_dir());
-        }
-        host::activate(self.main_hwnd, self.attached_tid);
     }
 
     /// Make sure the frame is on screen **without ever touching WS_MAXIMIZE**.
@@ -1060,6 +1048,7 @@ impl App {
                 // blocked by UIPI) must not be retried every sweep tick.
                 tracing::error!(error = %e, ?top, "absorb failed, parking window");
                 self.excluded.push((top.0 as isize, Instant::now()));
+                park_released(top);
                 return;
             }
         };
@@ -1203,6 +1192,7 @@ impl App {
         self.discard.retain(|(l, _)| *l != label);
         // Park it so the sweep does not try again while it closes.
         self.excluded.push((top.0 as isize, Instant::now()));
+        park_released(top);
         tracing::info!(
             ?top,
             title,
@@ -1238,13 +1228,8 @@ impl App {
             self.tabs.remove(i);
         }
         if self.tabs.is_empty() {
-            if self.cfg.get().takeover.mode == "redirect" {
-                unsafe {
-                    let _ = ShowWindow(self.main_hwnd, SW_HIDE);
-                }
-                self.sync_tabbar_window();
-                return;
-            }
+            // Every window closes for real (docs/双进程架构设计.md Phase 1);
+            // the resident window keeps redirect takeover alive.
             unsafe {
                 let _ = DestroyWindow(self.main_hwnd);
             }
@@ -1344,22 +1329,6 @@ impl App {
         me_visible || !any_visible_window()
     }
 
-    /// A second window on this UI thread, from the tray menu.
-    ///
-    /// No message loop, no thread: the new window joins the one already
-    /// running, which is what keeps `AttachThreadInput`, the sweep tables and
-    /// `WM_CAPTURECHANGED` behaving exactly as they do with one window.
-    pub(crate) fn spawn_window(&mut self) {
-        match MainWindow::spawn_extra(self.cfg.clone()) {
-            Ok(w) => unsafe {
-                // The user is about to work *here*; without this the batch
-                // still in flight would be routed to the previous window.
-                let _ = SetForegroundWindow(w.hwnd);
-            },
-            Err(e) => tracing::error!(error = %e, "extra window creation failed"),
-        }
-    }
-
     /// Absorb every desktop folder window Revolc doesn't own yet.
     fn sweep(&mut self) {
         if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
@@ -1370,7 +1339,14 @@ impl App {
         self.drop_dead_views();
         self.expire_reserved();
 
-        let excluded: Vec<isize> = self.excluded.iter().map(|(h, _)| *h).collect();
+        // Local excludes plus everything any dying window released back to
+        // the desktop (the "FE 被吸走" fix). Both expire on the same TTL.
+        let mut excl: Vec<(isize, Instant)> = self.excluded.clone();
+        if let Ok(g) = RELEASED_WINDOWS.lock() {
+            excl.extend(g.iter().copied());
+        }
+        excl.retain(|(_, t)| t.elapsed() < EXCLUDE_TTL);
+        let excluded: Vec<isize> = excl.iter().map(|(h, _)| *h).collect();
         // Take windows while they are still hidden whenever a folder is
         // expected. Explorer creates the frame **~850ms before showing it**
         // (log/probe_hidden.ps1), so this is the difference between "absorbed
@@ -1446,6 +1422,7 @@ impl App {
             // Park it: the sweep must not grab the window back while it is
             // still alive during WM_CLOSE teardown.
             self.excluded.push((v.top.0 as isize, Instant::now()));
+            park_released(v.top);
             // `restore()` re-parents the window to the *desktop* and shows it
             // (SWP_SHOWWINDOW) before the close lands, so every closed tab
             // painted one frame of a plain native Explorer window — the
@@ -1459,16 +1436,8 @@ impl App {
         self.tabs.remove(i);
         self.views.remove(i);
         if self.tabs.is_empty() {
-            // spec §7: in redirect mode the resident window stays in the tray
-            // so takeover keeps working; otherwise exit.
-            if self.owns_tray && self.cfg.get().takeover.mode == "redirect" {
-                tracing::info!("last tab closed, hiding to tray (redirect mode)");
-                unsafe {
-                    let _ = ShowWindow(self.main_hwnd, SW_HIDE);
-                }
-                self.sync_tabbar_window();
-                return;
-            }
+            // Every window closes for real (docs/双进程架构设计.md Phase 1);
+            // the resident window keeps redirect takeover alive.
             tracing::info!("last tab closed, closing window");
             unsafe {
                 let _ = DestroyWindow(self.main_hwnd);
@@ -1812,6 +1781,9 @@ impl App {
     fn release_all(&mut self) {
         for v in self.views.iter_mut() {
             if let Some(v) = v.take() {
+                // Park it process-wide: this window is on its way out, and the
+                // surviving windows' sweeps must not adopt the pane back.
+                park_released(v.top);
                 unsafe { v.restore() };
             }
         }
@@ -1912,7 +1884,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if LAST_ACTIVE.load(Ordering::SeqCst) == hwnd.0 as isize {
                 LAST_ACTIVE.store(0, Ordering::SeqCst);
             }
-            if left <= 1 {
+            if left <= 1 && !resident::alive() {
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -2243,31 +2215,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
-            // redirect mode: closing the *resident* window means "hide to the
-            // tray" — the takeover keeps running (Clover semantics). Real exit
-            // lives in the tray menu and in WM_APP_QUIT (--shutdown). Extra
-            // windows have no tray entry, so they close like any other window.
-            let app = app_from(hwnd);
-            if app.owns_tray && app.cfg.get().takeover.mode == "redirect" {
-                unsafe {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
-                // The tab strip is an owned top-level popup, not a child of the
-                // frame: hiding the owner does not hide it. Without this the
-                // strip stays painted on the desktop after clicking X.
-                app.sync_tabbar_window();
-                tracing::info!("main window hidden to tray (redirect mode)");
-                return LRESULT(0);
-            }
+            // Every window closes for real now (docs/双进程架构设计.md Phase 1):
+            // the resident window keeps the process alive in redirect+tray
+            // mode, so no window ever needs to hide instead of closing.
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         m if m == WM_APP_QUIT => {
             // Every window, not just this one: 退出 in the tray menu means the
-            // process is gone, and the last WM_DESTROY posts the quit. Take the
-            // icon out first — Windows would clean it up on hover, but that
-            // leaves a dead clover in the notification area until then.
-            tray::remove(hwnd);
+            // process is gone. The tray icon lives on the resident window, so
+            // route the quit there after the windows are down.
             close_all_windows();
+            if let Some(h) = resident::hwnd() {
+                let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+            }
             LRESULT(0)
         }
         // WM_ENDSESSION (logoff/shutdown): restore absorbed windows NOW —
@@ -2313,13 +2273,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             app.on_notify();
             LRESULT(0)
-        }
-        m if m == WM_APP_TRAY => {
-            let app = app_from(hwnd);
-            match tray::on_tray_message(hwnd, lp, app) {
-                Some(r) => r,
-                None => DefWindowProcW(hwnd, msg, wp, lp),
-            }
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }

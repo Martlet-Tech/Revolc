@@ -18,20 +18,24 @@ use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
 
 /// `revolc.exe --shutdown`: ask the running instance to quit the polite way.
 /// Never kill the process — absorbed Explorer windows are its children and
-/// die with it (2026-11-17 crash loop). WM_APP_QUIT, not WM_CLOSE: WM_CLOSE
-/// only hides the window in redirect mode.
+/// die with it (2026-11-17 crash loop). WM_APP_QUIT tears down every window
+/// and the resident (docs/双进程架构设计.md Phase 1).
 fn shutdown_running() -> i32 {
     unsafe {
-        match FindWindowW(w!("RevolcMain"), None) {
-            Ok(h) if !h.0.is_null() => {
-                let _ = PostMessageW(h, ui::WM_APP_QUIT, WPARAM(0), LPARAM(0));
-                0
-            }
-            _ => {
-                eprintln!("Revolc is not running");
-                1
-            }
-        }
+        // Resident-only sessions (all windows closed, redirect+tray) have no
+        // RevolcMain, so try the resident class as well.
+        let target = match FindWindowW(w!("RevolcMain"), None) {
+            Ok(h) if !h.0.is_null() => h,
+            _ => match FindWindowW(w!("RevolcResident"), None) {
+                Ok(h) if !h.0.is_null() => h,
+                _ => {
+                    eprintln!("Revolc is not running");
+                    return 1;
+                }
+            },
+        };
+        let _ = PostMessageW(target, ui::WM_APP_QUIT, WPARAM(0), LPARAM(0));
+        0
     }
 }
 
