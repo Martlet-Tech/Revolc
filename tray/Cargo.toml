@@ -1,0 +1,22 @@
+[package]
+name = "revolc-tray"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Optional tray launcher / window list / foreground ledger for Revolc"
+build = "build.rs"
+
+[dependencies]
+revolc-common = { path = "../common" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+notify = "6"
+tracing = "0.1"

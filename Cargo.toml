@@ -1,5 +1,5 @@
 [workspace]
-members = ["bho"]
+members = ["bho", "common", "tray"]
 
 [package]
 name = "revolc"
@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 arc-swap = "1"
+revolc-common = { path = "common" }
 
 [profile.release]
 lto = true

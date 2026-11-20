@@ -11,8 +11,9 @@
 mod dblclick;
 
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{BOOL, HINSTANCE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::core::{implement, w, GUID, IUnknown, Interface, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
@@ -23,7 +24,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, PostMessageW, RegisterWindowMessageW,
+    EnumWindows, FindWindowW, GetClassNameW, PostMessageW, RegisterWindowMessageW,
 };
 
 /// Our COM object CLSID (also the BHO key leaf).
@@ -72,6 +73,10 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
         // crashes). BHO reports "a shell window was created"; Revolc
         // discovers the new window itself via IShellWindows (out-of-proc).
         if psite.is_some() {
+            if revolc_disabled() {
+                bho_log("SetSite skipped (takeover disabled)");
+                return Ok(());
+            }
             // Notify FIRST: SetSite runs on Explorer's window-creation path,
             // so anything slow here delays every folder window. Disk logging
             // is opt-in (see bho_log).
@@ -100,8 +105,17 @@ impl IObjectWithSite_Impl for TabHelper_Impl {
     }
 }
 
-/// Post the Explorer top-level HWND to the Revolc main window.
-/// Revolc not running → no-op (pure BHO, zero side effects).
+/// `%APPDATA%\revolc\disabled` is written by the tray/window when takeover is
+/// stopped. The BHO stays registered in HKLM but becomes a complete no-op —
+/// no notify, no Explorer subclassing — so leaving Revolc never needs a UAC
+/// prompt just to unregister.
+pub(crate) fn revolc_disabled() -> bool {
+    std::env::var_os("APPDATA")
+        .map(|d| std::path::Path::new(&d).join("revolc").join("disabled").exists())
+        .unwrap_or(false)
+}
+
+/// Optional disk logging (off by default; `%APPDATA%\revolc\bho.debug`).
 fn bho_log(msg: &str) {
     // Off by default: logging opens/writes a file on Explorer's
     // window-creation thread, which stalls every folder window and made
@@ -123,23 +137,44 @@ fn bho_log(msg: &str) {
     let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
 }
 
+fn absorb_msg() -> u32 {
+    static MSG_ID: OnceLock<u32> = OnceLock::new();
+    *MSG_ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("RevolcAbsorbExplorer")) })
+}
+
+/// Broadcast the "a folder window appeared" hint to every `RevolcMain`.
+///
+/// Phase 1 posted to one window via FindWindowW, which loses when there are
+/// several (the wrong process may be elevated / busy / closing). Phase 2 has
+/// one process per window: let each receive the hint, and the shared ledger
+/// decides who actually adopts the stray. If no window exists, the optional
+/// tray exe gets the same message and spawns one as fallback.
 fn notify_revolc() {
     unsafe {
-        static MSG_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        let msg = *MSG_ID.get_or_init(|| RegisterWindowMessageW(w!("RevolcAbsorbExplorer")));
-
-        // Prefer a live RevolcMain; fall back to the resident window (redirect
-        // takeover with zero open windows — docs/双进程架构设计.md Phase 1).
-        let target = match FindWindowW(w!("RevolcMain"), None) {
-            Ok(h) if !h.0.is_null() => h,
-            _ => match FindWindowW(w!("RevolcResident"), None) {
-                Ok(h) if !h.0.is_null() => h,
-                _ => return, // Revolc not running
-            },
-        };
-        // wParam unused: Revolc finds the new window via IShellWindows.
-        let _ = PostMessageW(target, msg, WPARAM(0), LPARAM(0));
+        let msg = absorb_msg();
+        let mut count = 0usize;
+        let _ = EnumWindows(
+            Some(notify_window),
+            LPARAM(&mut count as *mut usize as isize),
+        );
+        if let Ok(h) = FindWindowW(w!("RevolcResident"), None) {
+            if !h.0.is_null() {
+                let _ = PostMessageW(h, msg, WPARAM(0), LPARAM(0));
+            }
+        }
+        bho_log(&format!("notify sent to {count} windows + tray"));
     }
+}
+
+unsafe extern "system" fn notify_window(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let count = &mut *(lp.0 as *mut usize);
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "RevolcMain" {
+        let _ = PostMessageW(hwnd, absorb_msg(), WPARAM(0), LPARAM(0));
+        *count += 1;
+    }
+    BOOL(1)
 }
 
 // ---------------------------------------------------------------- Class factory

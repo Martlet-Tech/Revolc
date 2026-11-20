@@ -1,16 +1,17 @@
 pub mod caption;
 pub mod dwm;
-pub mod icon;
-pub mod resident;
 pub mod tabbar;
-pub mod tray;
 
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use std::sync::Arc;
+pub use revolc_common::icon;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
@@ -19,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -26,7 +28,7 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
     DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
+    GetMessageW, GetClassNameW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
     IsZoomed, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
     SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
@@ -47,6 +49,7 @@ use crate::config::ConfigHandle;
 use crate::shell::host::{self, Absorbed};
 use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
+use revolc_common::ledger::Ledger;
 
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
 /// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
@@ -84,12 +87,82 @@ const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
 
 /// The window the user is working in right now (0 = none yet).
 ///
-/// Everything here runs on one UI thread, but the stray-window sweep runs
-/// **per window**. Without a shared answer to "whose folder is this", every
-/// window's timer sees the same `CabinetWClass` and the first one to fire wins
-/// — which is the "it opened in some other window" complaint. The winner is
-/// therefore the window the user last activated, not the fastest timer.
-static LAST_ACTIVE: AtomicIsize = AtomicIsize::new(0);
+/// Phase 2: one `revolc.exe` per window, so this lives in a shared file
+/// mapping written by `revolc-tray.exe`'s foreground hook (and echoed by each
+/// window on activation for the no-tray case). Every window's sweep asks the
+/// ledger "whose folder is this" instead of racing its own timer.
+static LEDGER: OnceLock<Ledger> = OnceLock::new();
+
+fn ledger() -> Option<&'static Ledger> {
+    if LEDGER.get().is_none() {
+        let l = match Ledger::open_or_create() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "shared ledger unavailable");
+                return None;
+            }
+        };
+        let _ = LEDGER.set(l);
+    }
+    LEDGER.get()
+}
+
+/// Cross-process lock held from "enumerate stray folders" through the last
+/// SetParent. Without it two window processes can pick the same Explorer
+/// HWND in the same few ms and both re-parent it (2026-11-20 double-absorb
+/// → ntdll crash on teardown). Abandoned means the previous owner died;
+/// take over rather than skipping forever.
+struct SweepLock(HANDLE);
+
+impl SweepLock {
+    /// Try, never wait. Sweeps are frequent (15ms burst / 200ms idle); a
+    /// contended tick can simply be skipped. Blocking the UI thread here
+    /// would freeze dragging while another process is mid-SetParent.
+    fn acquire() -> Option<Self> {
+        unsafe {
+            let h = CreateMutexW(None, false, w!("Local\\RevolcSweepLock")).ok()?;
+            // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80, WAIT_TIMEOUT = 0x102.
+            let r = WaitForSingleObject(h, 0).0;
+            if r == 0 || r == 0x80 {
+                Some(Self(h))
+            } else {
+                let _ = CloseHandle(h);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// All RevolcMain windows on the desktop, across processes.
+fn all_main_windows() -> Vec<HWND> {
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_main_window),
+            LPARAM(&mut out as *mut Vec<HWND> as isize),
+        );
+    }
+    out
+}
+
+unsafe extern "system" fn enum_main_window(hwnd: HWND, lp: LPARAM) -> windows::Win32::Foundation::BOOL {
+    let out = &mut *(lp.0 as *mut Vec<HWND>);
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "RevolcMain" {
+        out.push(hwnd);
+    }
+    windows::Win32::Foundation::BOOL(1)
+}
 
 /// Windows alive in this process. Closing the last one is what quits the
 /// loop; closing any other one is just closing a window.
@@ -232,15 +305,9 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
-    /// The window created by `app::run`. The tray icon lives on the resident
-    /// window now; every RevolcMain is a plain closable window.
+    /// The single window owned by this `revolc.exe` process.
     pub fn new(cfg: Arc<ConfigHandle>, initial_path: Option<String>) -> windows::core::Result<Self> {
         Self::create(cfg, initial_path)
-    }
-
-    /// Another window on the same UI thread, from the tray menu.
-    pub fn spawn_extra(cfg: Arc<ConfigHandle>) -> windows::core::Result<Self> {
-        Self::create(cfg, None)
     }
 
     fn create(
@@ -480,45 +547,12 @@ fn owner_window(hwnd: HWND) -> Option<HWND> {
     }
 }
 
-/// Every top-level window of ours, in enumeration order.
-fn our_windows() -> Vec<HWND> {
-    let mut ours: Vec<HWND> = Vec::new();
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_ours),
-            LPARAM(&mut ours as *mut Vec<HWND> as isize),
-        );
-    }
-    ours
-}
-
-/// Is anything of ours on screen? Asked by a tray-resident window to decide
-/// whether it is still the only thing working on the desktop.
+/// Is any Revolc window on screen? Used as the last-resort fallback when the
+/// ledger has no valid entry.
 fn any_visible_window() -> bool {
-    our_windows()
+    all_main_windows()
         .iter()
         .any(|h| unsafe { IsWindowVisible(*h).as_bool() })
-}
-
-/// Destroy every window of ours, leaving the loop to quit on the last
-/// `WM_DESTROY` (or on the resident's, in redirect+tray mode). Used by
-/// `WM_APP_QUIT` (tray 退出 / `--shutdown` / Ctrl+C): with several windows
-/// open, quitting must not leave orphans behind.
-pub(crate) fn close_all_windows() {
-    // Collected first: destroying while enumerating skips windows.
-    for h in our_windows() {
-        unsafe {
-            let _ = DestroyWindow(h);
-        }
-    }
-}
-
-unsafe extern "system" fn enum_ours(hwnd: HWND, lp: LPARAM) -> windows::Win32::Foundation::BOOL {
-    let out = &mut *(lp.0 as *mut Vec<HWND>);
-    if app_opt(hwnd).is_some() {
-        out.push(hwnd);
-    }
-    windows::Win32::Foundation::BOOL(1)
 }
 
 unsafe fn app_opt(hwnd: HWND) -> Option<&'static mut App> {
@@ -1312,22 +1346,27 @@ impl App {
         if self.views.iter().any(|v| v.is_none()) {
             return true;
         }
-        let last = LAST_ACTIVE.load(Ordering::SeqCst);
-        let me = self.main_hwnd.0 as isize;
-        let (last_usable, me_visible) = unsafe {
-            let other = HWND(last as *mut _);
-            (
-                last != 0 && IsWindow(other).as_bool() && IsWindowVisible(other).as_bool(),
-                IsWindowVisible(self.main_hwnd).as_bool(),
-            )
-        };
-        if last_usable && last != me {
-            return false;
+        let me = self.main_hwnd;
+        let me_visible = unsafe { IsWindowVisible(me).as_bool() };
+        let last = ledger().and_then(|l| l.last_active());
+        if let Some(other) = last {
+            let usable = unsafe { IsWindow(other).as_bool() && IsWindowVisible(other).as_bool() };
+            if usable {
+                // The ledger is authoritative: the user touched `other` last.
+                return other == me;
+            }
         }
-        // Visible (a minimised frame still counts: absorbing restores it, which
-        // is the behaviour single-window has always had), or the last one
-        // standing.
-        me_visible || !any_visible_window()
+        // No valid ledger entry (tray not installed / just launched): pick a
+        // deterministic owner instead of letting whichever timer fires first
+        // win. Smallest live HWND among visible RevolcMain windows.
+        let owner = all_main_windows()
+            .into_iter()
+            .filter(|h| unsafe { IsWindowVisible(*h).as_bool() })
+            .min_by_key(|h| h.0 as usize);
+        match owner {
+            Some(h) => h == me,
+            None => me_visible || !any_visible_window(),
+        }
     }
 
     /// Absorb every desktop folder window Revolc doesn't own yet.
@@ -1335,6 +1374,17 @@ impl App {
         if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
             return;
         }
+        // Phase 2: one process per window. Each sweep enumerates top-level
+        // CabinetWClass windows and then spends hundreds of ms in cross-process
+        // SetParent. Two processes that enumerate in the same few ms both see
+        // the same folder and both adopt it (observed 2026-11-20: same HWND
+        // absorbed twice, then a ntdll crash during teardown). Serialise the
+        // whole enumerate+adopt section across processes; the loser sees the
+        // window already re-parented and skips it.
+        let Some(_sweep_lock) = SweepLock::acquire() else {
+            // Another window is mid-absorb; next tick sees the settled state.
+            return;
+        };
         self.sweeping = true;
         self.prune_excluded();
         self.drop_dead_views();
@@ -1539,13 +1589,13 @@ impl App {
     /// our window is the active window, and detached otherwise: merged queues
     /// also share hangs, so a stuck Explorer would freeze Revolc too.
     fn sync_input_queue(&mut self) {
-        // AttachThreadInput is per *thread*, not per window. With two windows
-        // open, the one that just lost focus must not detach the queue the
-        // other one is using — and the activation order between them is not
-        // guaranteed, so "am I the last activated" is the only stable test.
-        if !self.active && LAST_ACTIVE.load(Ordering::SeqCst) != self.main_hwnd.0 as isize {
-            return;
-        }
+        // One process = one window = one UI thread now. The Phase 1 guard
+        // ("did *this* window lose focus?") used a process-local LAST_ACTIVE;
+        // in Phase 2 the shared ledger already points at the *new* window by
+        // the time WM_ACTIVATE(WA_INACTIVE) arrives, so it returned early and
+        // never detached — three windows stayed attached to three Explorer
+        // input queues: drag stuttered and taskbar clicks stopped switching.
+        // Each process owns only its own attachment; always tear it down.
         let want = if self.active {
             self.views
                 .get(self.tabs.active_index())
@@ -1917,18 +1967,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             app_from(hwnd).release_all();
-            // One window closing is not the end of the session any more: the
-            // loop quits when the *last* window is gone (tray-resident mode
-            // survives on the remaining ones).
-            let left = LIVE_WINDOWS
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
-                .unwrap_or(0);
-            if LAST_ACTIVE.load(Ordering::SeqCst) == hwnd.0 as isize {
-                LAST_ACTIVE.store(0, Ordering::SeqCst);
+            // One process = one window now (Phase 2): its destruction ends
+            // this process. The tray, if any, lives in a separate exe.
+            if let Some(l) = ledger() {
+                let _ = l.clear_if(hwnd);
             }
-            if left <= 1 && !resident::alive() {
-                PostQuitMessage(0);
-            }
+            LIVE_WINDOWS.fetch_sub(1, Ordering::SeqCst);
+            PostQuitMessage(0);
             LRESULT(0)
         }
         WM_NCDESTROY => {
@@ -2272,13 +2317,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == WM_APP_QUIT => {
-            // Every window, not just this one: 退出 in the tray menu means the
-            // process is gone. The tray icon lives on the resident window, so
-            // route the quit there after the windows are down.
-            close_all_windows();
-            if let Some(h) = resident::hwnd() {
-                let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
-            }
+            // Tray/CLI broadcasts this to every window process; here it means
+            // "restore my panes and close this window" (WM_DESTROY does both).
+            let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         // WM_ENDSESSION (logoff/shutdown): restore absorbed windows NOW —
@@ -2297,8 +2338,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // low word: WA_INACTIVE(0) / WA_ACTIVE(1) / WA_CLICKACTIVE(2)
             app.active = (wp.0 & 0xffff) as u32 != 0;
             if app.active {
-                // Who gets the next stray folder window: this one.
-                LAST_ACTIVE.store(hwnd.0 as isize, Ordering::SeqCst);
+                // Echo into the ledger so takeover works even without the
+                // optional tray exe. The tray hook writes the same value.
+                if let Some(l) = ledger() {
+                    l.note_active(hwnd);
+                }
             }
             app.sync_input_queue();
             app.sync_chrome();
@@ -2318,11 +2362,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == absorb_msg() => {
-            // wParam unused: BHO reports "window created" without touching
-            // the site object; we discover the HWND by enumerating desktop
-            // folder windows and skip the ones we already own.
+            // BHO now broadcasts to every RevolcMain. Only the ledger's
+            // chosen window enters fast-sweep mode; the rest ignore it so
+            // they don't fight over the same stray folder window.
             let app = app_from(hwnd);
-            app.on_notify();
+            if app.may_adopt() {
+                app.on_notify();
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
