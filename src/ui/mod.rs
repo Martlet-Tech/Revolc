@@ -27,8 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
     DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
-    IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    IsZoomed, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
@@ -38,7 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
     WM_NCMOUSELEAVE, WM_PAINT,
-    WM_SETICON, WM_SIZE, WM_TIMER, MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
+    MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
@@ -1396,6 +1397,47 @@ impl App {
         }
     }
 
+    /// Browser-style "close all tabs?" confirm. Only called with 2+ tabs.
+    fn confirm_close_all_tabs(&self) -> bool {
+        let n = self.tabs.len();
+        let text = format!("要关闭全部 {n} 个标签页吗？\r\n每个标签页的文件夹窗口会一并关闭。");
+        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let r = unsafe {
+            MessageBoxW(
+                self.main_hwnd,
+                PCWSTR(wide.as_ptr()),
+                w!("Revolc"),
+                MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
+            )
+        };
+        r == IDOK
+    }
+
+    /// Close every tab's FE window (hidden, then WM_CLOSE — the same path as
+    /// `close_tab`, so Explorer dies quietly instead of growing a title bar on
+    /// the desktop), leaving nothing for another window's sweep to re-adopt.
+    fn close_all_tabs(&mut self) {
+        for slot in self.views.iter_mut() {
+            if let Some(v) = slot.take() {
+                self.excluded.push((v.top.0 as isize, Instant::now()));
+                park_released(v.top);
+                unsafe {
+                    let _ = ShowWindow(v.top, SW_HIDE);
+                    let _ = PostMessageW(v.top, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+        // Tabs whose Explorer window never arrived: nothing to close, but the
+        // late window must not land in some other window as a fresh tab.
+        for t in self.tabs.iter_all() {
+            if !t.label.is_empty() {
+                self.discard.push((t.label.clone(), Instant::now()));
+            }
+        }
+        self.views.clear();
+        self.tabs.clear();
+    }
+
     fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
@@ -2215,10 +2257,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
-            // Every window closes for real now (docs/双进程架构设计.md Phase 1):
-            // the resident window keeps the process alive in redirect+tray
-            // mode, so no window ever needs to hide instead of closing.
-            DefWindowProcW(hwnd, msg, wp, lp)
+            // Browser semantics (docs/双进程架构设计.md): several tabs → ask
+            // first; confirming closes every FE window, then the frame. The
+            // released-panes table keeps any survivor from re-adopting them.
+            // One tab (or no tabs): just close, like every other window.
+            let app = app_from(hwnd);
+            if app.tabs.len() > 1 && !app.confirm_close_all_tabs() {
+                return LRESULT(0);
+            }
+            app.close_all_tabs();
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
         }
         m if m == WM_APP_QUIT => {
             // Every window, not just this one: 退出 in the tray menu means the
