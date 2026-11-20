@@ -32,8 +32,11 @@ struct SendCom<T>(T);
 unsafe impl<T> Send for SendCom<T> {}
 unsafe impl<T> Sync for SendCom<T> {}
 
-/// DISPID of DWebBrowserEvents2::NavigateComplete2.
-const DISPID_NAVIGATECOMPLETE2: i32 = 250;
+/// DISPIDs of DWebBrowserEvents2 (verified: BeforeNavigate2=250,
+/// NavigateComplete2=252, DocumentComplete=259 — the old 250 was WRONG,
+/// which silently skipped every real navigation event).
+const DISPID_NAVIGATECOMPLETE2: i32 = 252;
+const DISPID_DOCUMENTCOMPLETE: i32 = 259;
 /// IID of DWebBrowserEvents2 (outgoing dispinterface).
 const DIID_DWEBBROWSEREVENTS2: GUID =
     GUID::from_u128(0x34a715a0_6587_11d0_924a_0020afc7ac4d);
@@ -137,7 +140,14 @@ impl IDispatch_Impl for NavEventSink_Impl {
         _pexcepinfo: *mut EXCEPINFO,
         _puargerr: *mut u32,
     ) -> Result<()> {
-        if dispidmember != DISPID_NAVIGATECOMPLETE2 {
+        if trace() {
+            log(&format!("Invoke dispid={dispidmember}"));
+        }
+        // Accept either navigation-complete signal. DocumentComplete (259) is
+        // the most reliable for folder windows; NavigateComplete2 (252) fires
+        // a bit earlier. BeforeNavigate2 (250) fires before navigation — the
+        // URL is the OLD folder, so ignore it for path tracking.
+        if dispidmember != DISPID_NAVIGATECOMPLETE2 && dispidmember != DISPID_DOCUMENTCOMPLETE {
             return Ok(());
         }
         // Event runs on Explorer's UI thread. Reading LocationURL here is
@@ -146,8 +156,10 @@ impl IDispatch_Impl for NavEventSink_Impl {
             .map(|u| u.to_string())
             .unwrap_or_default();
         if trace() {
-            log(&format!("NavigateComplete2 url={url:?}"));
+            let name = if dispidmember == DISPID_NAVIGATECOMPLETE2 { "NavigateComplete2" } else { "DocumentComplete" };
+            log(&format!("{name} url={url:?}"));
         }
+        // Step 1 is VERIFY ONLY: log, do not push to Revolc yet.
         Ok(())
     }
 }
