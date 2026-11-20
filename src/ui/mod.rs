@@ -26,20 +26,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateAcceleratorTableW, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClientRect, GetParent,
-    GetMessageW, GetClassNameW, GetSystemMetrics, GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible,
-    IsZoomed, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    AppendMenuW, CreateAcceleratorTableW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyAcceleratorTable, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetAncestor, GetClientRect, GetParent, GetMessageW, GetClassNameW, GetSystemMetrics,
+    GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL, HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
-    ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_MINIMIZE,
-    SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, WM_CAPTURECHANGED,
+    ICON_BIG, ICON_SMALL, IDC_ARROW, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_MINIMIZE, SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, TPM_RETURNCMD,
+    WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCMOUSELEAVE, WM_PAINT,
+    WM_NCMOUSELEAVE, WM_PAINT, WM_RBUTTONUP,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -84,6 +86,13 @@ const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// us, and always raised above those panes, so a foreign process can never
 /// erase our title bar again.
 const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
+/// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
+/// with accelerators (which use 1..=keymap.len()).
+const CMD_TAB_NEW_WINDOW: usize = 0x8001;
+const CMD_TAB_CLOSE: usize = 0x8002;
+const CMD_TAB_CLOSE_OTHERS: usize = 0x8003;
+const CMD_TAB_CLOSE_RIGHT: usize = 0x8004;
+const CMD_TAB_NEW_AFTER: usize = 0x8005;
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -490,6 +499,7 @@ unsafe extern "system" fn tabbar_wndproc(
         | WM_LBUTTONUP
         | WM_LBUTTONDBLCLK
         | WM_MBUTTONUP
+        | WM_RBUTTONUP
         | WM_MOUSELEAVE
         | WM_NCMOUSELEAVE
         | WM_NCLBUTTONDOWN
@@ -1042,14 +1052,61 @@ impl App {
     /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
     /// notify or on the next fast sweep tick, whichever comes first.
     fn new_tab(&mut self, path: String) {
+        let at = self.tabs.len();
         self.tabs.push(path.clone());
-        self.views.push(None);
-        // Start (or restart) the "its window must arrive" clock.
+        self.views.insert(at, None);
+        self.launch_tab_view(at, path);
+    }
+
+    /// Context menu "new tab to the right": insert after `after` and open it.
+    fn new_tab_after(&mut self, after: usize, path: String) {
+        let at = (after + 1).min(self.tabs.len());
+        self.tabs.insert_after(after, path.clone());
+        self.views.insert(at, None);
+        self.launch_tab_view(at, path);
+    }
+
+    /// Shared tail of new_tab / new_tab_after: arm the reserve clock, show and
+    /// activate the new tab, then spawn the Explorer window to absorb.
+    fn launch_tab_view(&mut self, at: usize, path: String) {
         self.reserve_deadline = Some(Instant::now() + RESERVE_TTL);
         self.sync_tabbar();
-        self.activate(self.tabs.active_index());
+        self.activate(at);
         self.arm_burst();
         host::spawn_explorer(&path);
+    }
+
+    /// Context menu "open in new window": launch a fresh revolc.exe with the
+    /// target folder as its startup path. The new process handles its own
+    /// absorb; this one keeps the tab (browser semantics: open a copy).
+    fn open_tab_in_new_window(&mut self, i: usize) {
+        let path = self.folder_path_of(i);
+        let exe = std::env::current_exe().unwrap_or_default();
+        match std::process::Command::new(exe).arg(&path).spawn() {
+            Ok(_) => tracing::info!(?path, "spawned new window for tab"),
+            Err(e) => tracing::error!(error = %e, ?path, "failed to spawn new window"),
+        }
+    }
+
+    /// Close every tab except `keep`. Iterate in reverse so removing a tab
+    /// never shifts the index of one we have not visited yet.
+    fn close_other_tabs(&mut self, keep: usize) {
+        if keep >= self.tabs.len() {
+            return;
+        }
+        for i in (0..self.tabs.len()).rev() {
+            if i != keep {
+                self.close_tab(i);
+            }
+        }
+    }
+
+    /// Close every tab to the right of `i` (again, reverse order).
+    fn close_tabs_to_right(&mut self, i: usize) {
+        let start = i + 1;
+        for j in (start..self.tabs.len()).rev() {
+            self.close_tab(j);
+        }
     }
 
     /// Attach an Explorer window to the first reserved (view-less) tab,
@@ -1318,19 +1375,24 @@ impl App {
         self.path_done.retain(|h| known.contains(h));
     }
 
-    /// Folder the active tab is actually showing right now. `Tab::path` is
-    /// only what the tab was opened with; the user may have navigated since.
-    fn active_folder_path(&self) -> String {
-        if let Some(v) = self.views.get(self.tabs.active_index()).and_then(|s| s.as_ref()) {
+    /// Folder a tab is actually showing right now. `Tab::path` is only what
+    /// the tab was opened with; the user may have navigated since. Used by the
+    /// context menu (which can target a non-active tab) and by `+` / shortcuts.
+    fn folder_path_of(&self, i: usize) -> String {
+        if let Some(v) = self.views.get(i).and_then(|s| s.as_ref()) {
             if let Some(p) = host::read_folder_path(v.top, 1) {
                 return p;
             }
         }
         self.tabs
-            .active()
+            .get(i)
             .map(|t| t.path.clone())
             .filter(|p| !p.is_empty())
             .unwrap_or_else(home_dir)
+    }
+
+    fn active_folder_path(&self) -> String {
+        self.folder_path_of(self.tabs.active_index())
     }
 
     /// May this window adopt a folder window that just appeared?
@@ -1892,6 +1954,42 @@ fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
 
 /// x/y out of a mouse message's lParam, sign-extended (screen coords can be
 /// negative on a monitor to the left of the primary).
+/// Build and show the tab context menu. Returns the chosen command id, or 0.
+///
+/// `TrackPopupMenuEx` runs a modal loop that dispatches other messages to this
+/// window, so the caller must NOT hold an `&mut App` across it (re-entrant
+/// `app_from` would alias). Collect the target first, drop the borrow, show the
+/// menu, then re-acquire the app to dispatch.
+unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usize {
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+
+    if has_tab {
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_WINDOW, w!("在新窗口打开此标签页(&N)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("在右侧新建标签页(&A)"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE, w!("关闭标签页(&C)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_OTHERS, w!("关闭其他标签页(&O)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_RIGHT, w!("关闭右侧标签页(&R)"));
+    } else {
+        // Bare strip: still offer a new tab, nothing tab-specific.
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("新建标签页(&A)"));
+    }
+
+    // A menu owned by another window does not dismiss on outside click unless
+    // that window is foreground first (classic TrackPopupMenu gotcha).
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenuEx(
+        menu,
+        TPM_RETURNCMD.0,
+        screen.x,
+        screen.y,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    cmd.0 as usize
+}
+
 fn point_from_lparam(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 as u16) as i16 as i32;
     let y = ((lp.0 >> 16) as u16) as i16 as i32;
@@ -2226,6 +2324,69 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if let Some(i) = app.index_of(id) {
                         app.close_tab(i);
                     }
+                }
+            }
+            LRESULT(0)
+        }
+        // Tab context menu. lp comes from the owned strip, whose client origin
+        // equals the frame's, so the same coords drive `TabBar::hit`. The strip
+        // forwards WM_RBUTTONUP here; resolving the tab by stable id keeps the
+        // target correct even if a sweep reorders views while the menu is up.
+        WM_RBUTTONUP => {
+            let (x, y) = point_from_lparam(lp);
+            // Phase 1: gather target + screen point, then DROP the app borrow.
+            let (hit_index, screen) = {
+                let app = app_from(hwnd);
+                let width = app.client().right;
+                let idx = match app.tabbar.hit(x, y, width) {
+                    tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
+                        .tabbar
+                        .ids()
+                        .get(i)
+                        .copied()
+                        .and_then(|id| app.index_of(id)),
+                    _ => None,
+                };
+                let mut pt = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                (idx, pt)
+            };
+            // Phase 2: modal loop — no &mut App alive here.
+            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some());
+            // Phase 3: re-acquire and dispatch.
+            if cmd != 0 {
+                let app = app_from(hwnd);
+                // Re-resolve by id in case the list shifted during the loop.
+                let idx = hit_index;
+                match cmd {
+                    CMD_TAB_NEW_WINDOW => {
+                        if let Some(i) = idx {
+                            app.open_tab_in_new_window(i);
+                        }
+                    }
+                    CMD_TAB_NEW_AFTER => {
+                        let path = idx
+                            .map(|i| app.folder_path_of(i))
+                            .unwrap_or_else(|| app.active_folder_path());
+                        let anchor = idx.unwrap_or_else(|| app.tabs.len().saturating_sub(1));
+                        app.new_tab_after(anchor, path);
+                    }
+                    CMD_TAB_CLOSE => {
+                        if let Some(i) = idx {
+                            app.close_tab(i);
+                        }
+                    }
+                    CMD_TAB_CLOSE_OTHERS => {
+                        if let Some(i) = idx {
+                            app.close_other_tabs(i);
+                        }
+                    }
+                    CMD_TAB_CLOSE_RIGHT => {
+                        if let Some(i) = idx {
+                            app.close_tabs_to_right(i);
+                        }
+                    }
+                    _ => {}
                 }
             }
             LRESULT(0)
