@@ -1131,52 +1131,124 @@ impl App {
             tracing::debug!(?url, "BHO navigation: non-filesystem URL, ignored");
             return;
         };
-        // Match tabs by the explorer.exe PROCESS ID. The frame HWND is
-        // unrecoverable after absorb (get_HWND returns RevolcMain — its
-        // parent chain is RevolcMain -> desktop, measured 2026-11-20 14:15),
-        // but each Revolc tab is its own explorer.exe process and the pid
-        // survives re-parenting 1:1.
+        // Match the push to a tab by LABEL — the Explorer window title IS the
+        // current folder name and is the one signal that never lies: HWND is
+        // rewritten by re-parenting (get_HWND returns RevolcMain), while the
+        // pid match proved flaky in hand tests. The push's URL tail segment
+        // (".../Downloads" -> "Downloads") equals the tab label of the
+        // navigating window. Ambiguity (two tabs on same-named folders) is
+        // resolved in favour of the ACTIVE tab; no match -> cache and replay
+        // on the next sweep tick, when refresh_labels has caught up.
+        if let Some(i) = self.tab_by_label_tail(&path) {
+            let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+            if old != path {
+                tracing::info!(tab = i, ?old, new = ?path, "tab navigated (BHO event)");
+                self.tabs.set_path(i, path);
+            }
+            return;
+        }
+        // pid fallback (kept as a second opinion; label may lag one sweep).
         let idx = self.views.iter().position(|v| {
             v.as_ref().map(|v| unsafe { GetWindowThreadProcessId(v.top, None) as isize } == pid)
                 .unwrap_or(false)
         });
         let Some(i) = idx else {
-            // The window may not be absorbed yet: Explorer navigates a fresh
-            // folder window seconds before our sweep adopts it. Cache the
-            // path so absorb_window can seed Tab.path from it. A window that
-            // belongs to ANOTHER Revolc process is also cached here and
-            // simply expires — harmless.
             self.cache_nav(pid, path);
             return;
         };
         let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
-        if old == path {
-            return;
+        if old != path {
+            tracing::info!(tab = i, ?pid, ?old, new = ?path, "tab navigated (BHO event, pid)");
+            self.tabs.set_path(i, path);
         }
-        tracing::info!(tab = i, ?pid, ?old, new = ?path, "tab navigated (BHO event)");
-        self.tabs.set_path(i, path);
     }
 
-    /// TTL for cached pre-absorb navigation paths.
+    /// Last path segment as a folder name ("D:\a\b" -> "b", "D:\" -> "").
+    fn label_tail(path: &str) -> &str {
+        path.trim_end_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+    }
+
+    /// The tab whose label equals `path`'s tail segment. One exact match wins;
+    /// several matches resolve to the active tab (the user navigated in the
+    /// tab they are looking at); zero or unresolvable -> None.
+    fn tab_by_label_tail(&self, path: &str) -> Option<usize> {
+        let want = Self::label_tail(path);
+        if want.is_empty() {
+            return None;
+        }
+        let hits: Vec<usize> = self
+            .tabs
+            .iter_all()
+            .enumerate()
+            .filter(|(i, t)| t.label == want && self.views.get(*i).map(|v| v.is_some()).unwrap_or(false))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.len() {
+            1 => hits.first().copied(),
+            _ if hits.contains(&self.tabs.active_index()) => Some(self.tabs.active_index()),
+            _ => None,
+        }
+    }
+
+    /// TTL for cached navigation pushes that could not be matched yet.
     const NAV_CACHE_TTL: Duration = Duration::from_secs(60);
 
-    /// Store (or refresh) the latest BHO-reported path for a not-yet-absorbed
-    /// window. Keyed by explorer.exe pid (HWND is rewritten by re-parenting);
-    /// one entry per pid, latest navigation wins.
+    /// Store the latest unmatched BHO push. Keyed by explorer pid; consumed
+    /// by label replay (sweep), absorb seeding, and folder_path_of.
     fn cache_nav(&mut self, pid: isize, path: String) {
         self.nav_cache
             .retain(|(p, _, t)| p != &pid && t.elapsed() < Self::NAV_CACHE_TTL);
         self.nav_cache.push((pid, path.clone(), Instant::now()));
-        tracing::info!(?pid, ?path, "BHO navigation cached (window not absorbed yet)");
+        tracing::info!(?pid, ?path, "BHO push cached (no label/pid match yet)");
     }
 
-    /// The cached path for a just-absorbed window, if the BHO pushed one
-    /// before absorption. Consumes the entry.
+    /// Reconcile cached pushes whose tab label has caught up with the push's
+    /// folder name. Runs every sweep: the label lags the navigation by up to
+    /// one tick, so a push that matched nothing on arrival matches here once
+    /// refresh_labels has run.
+    fn replay_nav_cache(&mut self) {
+        let mut expired: Vec<usize> = Vec::new();
+        for (idx, (_, path, t)) in self.nav_cache.iter().enumerate() {
+            if t.elapsed() >= Self::NAV_CACHE_TTL {
+                expired.push(idx);
+                continue;
+            }
+            if let Some(i) = self.tab_by_label_tail(path) {
+                let old = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
+                if old != *path {
+                    tracing::info!(tab = i, ?old, new = ?path, "tab navigated (BHO replay)");
+                    self.tabs.set_path(i, path.clone());
+                }
+                expired.push(idx);
+            }
+        }
+        for idx in expired.into_iter().rev() {
+            self.nav_cache.remove(idx);
+        }
+    }
+
+    /// The cached push for a just-absorbed window, by pid (absorb seeding).
+    /// Consumes the entry.
     fn take_cached_nav(&mut self, pid: isize) -> Option<String> {
         let idx = self
             .nav_cache
             .iter()
             .position(|(p, _, t)| *p == pid && t.elapsed() < Self::NAV_CACHE_TTL)?;
+        let (_, path, _) = self.nav_cache.remove(idx);
+        Some(path)
+    }
+
+    /// Right-click moment: consume any cached push that matches THIS tab's
+    /// label, before falling back to the stored path. Labels are the only
+    /// always-correct live signal, and the label-matching replay may not have
+    /// run yet when the menu fires.
+    fn take_cached_nav_by_label(&mut self, label: &str) -> Option<String> {
+        let idx = self.nav_cache.iter().position(|(_, path, t)| {
+            t.elapsed() < Self::NAV_CACHE_TTL && Self::label_tail(path) == label && !label.is_empty()
+        })?;
         let (_, path, _) = self.nav_cache.remove(idx);
         Some(path)
     }
@@ -1387,7 +1459,8 @@ impl App {
         // (that is the whole point — see stray_folder_windows). Everything
         // below that needs a *live, navigated* browser is therefore deferred.
         let visible = host::is_visible(top);
-        tracing::info!(?top, idx, visible, "absorbed into tab");
+        let absorbed_pid = unsafe { GetWindowThreadProcessId(top, None) } as isize;
+        tracing::info!(?top, idx, visible, pid = absorbed_pid, "absorbed into tab");
 
         // Best-effort path only for reserved tabs (Ctrl+T / stray adoption).
         // When we spawned the window ourselves the tab already carries the
@@ -1636,7 +1709,15 @@ impl App {
     /// here was REMOVED on purpose: it cannot see re-parented windows and
     /// cross-wired tabs to whichever shell window matched first (the original
     /// "new window opens the wrong folder" bug).
-    fn folder_path_of(&self, i: usize) -> String {
+    fn folder_path_of(&mut self, i: usize) -> String {
+        // Right-click is a synchronization point: consume any cached BHO push
+        // whose folder name equals this tab's label BEFORE falling back to the
+        // stored path — the sweep replay may not have run yet.
+        let label = self.tabs.get(i).map(|t| t.label.clone()).unwrap_or_default();
+        if let Some(cached) = self.take_cached_nav_by_label(&label) {
+            tracing::info!(tab = i, ?label, path = ?cached, "folder_path_of: consumed cached push");
+            self.tabs.set_path(i, cached);
+        }
         let stored = self.tabs.get(i).map(|t| t.path.clone()).unwrap_or_default();
         if stored.is_empty() {
             tracing::warn!(tab = i, "folder_path_of: Tab.path empty (no BHO push seen yet)");
@@ -1648,7 +1729,7 @@ impl App {
             .unwrap_or_else(home_dir)
     }
 
-    fn active_folder_path(&self) -> String {
+    fn active_folder_path(&mut self) -> String {
         self.folder_path_of(self.tabs.active_index())
     }
 
@@ -1752,6 +1833,7 @@ impl App {
         if self.refresh_labels() {
             self.sync_tabbar();
         }
+        self.replay_nav_cache();
         self.resolve_pending_paths();
         self.enforce_views();
 
