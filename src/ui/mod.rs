@@ -9,7 +9,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
@@ -18,6 +20,9 @@ use windows::Win32::Graphics::Gdi::{
     RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -102,6 +107,38 @@ fn ledger() -> Option<&'static Ledger> {
         let _ = LEDGER.set(l);
     }
     LEDGER.get()
+}
+
+/// Cross-process lock held from "enumerate stray folders" through the last
+/// SetParent. Without it two window processes can pick the same Explorer
+/// HWND in the same few ms and both re-parent it (2026-11-20 double-absorb
+/// → ntdll crash on teardown). Abandoned means the previous owner died;
+/// take over rather than skipping forever.
+struct SweepLock(HANDLE);
+
+impl SweepLock {
+    fn acquire() -> Option<Self> {
+        unsafe {
+            let h = CreateMutexW(None, false, w!("Local\\RevolcSweepLock")).ok()?;
+            // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80.
+            let r = WaitForSingleObject(h, INFINITE).0;
+            if r == 0 || r == 0x80 {
+                Some(Self(h))
+            } else {
+                let _ = CloseHandle(h);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 /// All RevolcMain windows on the desktop, across processes.
@@ -1336,6 +1373,17 @@ impl App {
         if self.sweeping || self.cfg.get().takeover.mode != "redirect" {
             return;
         }
+        // Phase 2: one process per window. Each sweep enumerates top-level
+        // CabinetWClass windows and then spends hundreds of ms in cross-process
+        // SetParent. Two processes that enumerate in the same few ms both see
+        // the same folder and both adopt it (observed 2026-11-20: same HWND
+        // absorbed twice, then a ntdll crash during teardown). Serialise the
+        // whole enumerate+adopt section across processes; the loser sees the
+        // window already re-parented and skips it.
+        let Some(_sweep_lock) = SweepLock::acquire() else {
+            tracing::warn!("sweep lock unavailable, skipping tick");
+            return;
+        };
         self.sweeping = true;
         self.prune_excluded();
         self.drop_dead_views();
