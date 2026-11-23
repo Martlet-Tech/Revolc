@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::Config;
 
+use super::gdi::{contrast_text, rgb};
+
 const RAIL_W: i32 = 140;
 const ROW_H: i32 = 52;
 const ROW_GAP: i32 = 8;
@@ -119,22 +121,7 @@ impl SettingsPanel {
 
     fn color(cfg: &Config, key: impl FnOnce(&crate::config::Theme) -> &str) -> COLORREF {
         let (r, g, b) = cfg.color(key);
-        COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32)
-    }
-
-    /// Pick legible text on an arbitrary background: light bg -> dark ink and
-    /// vice versa. The theme's tab_text is tuned for tabs, not for this page,
-    /// so we derive contrast instead of reusing it blindly.
-    fn ink_on(bg: COLORREF) -> COLORREF {
-        let r = (bg.0 & 0xff) as u32;
-        let g = ((bg.0 >> 8) & 0xff) as u32;
-        let b = ((bg.0 >> 16) & 0xff) as u32;
-        let luma = r * 299 / 1000 + g * 587 / 1000 + b * 114 / 1000;
-        if luma > 128 {
-            COLORREF(0x0010_1010) // near-black
-        } else {
-            COLORREF(0x00F5_F5F5) // near-white
-        }
+        rgb(r, g, b)
     }
 
     /// Paint the settings page into `rc` (already the view rect).
@@ -142,8 +129,8 @@ impl SettingsPanel {
         let bg = Self::color(cfg, |t| &t.tabbar_background);
         let fill = Self::color(cfg, |t| &t.tab_active);
         let rail_bg = Self::color(cfg, |t| &t.bookmark_bar_background);
-        let page_ink = Self::ink_on(bg);
-        let rail_ink = Self::ink_on(rail_bg);
+        let page_ink = contrast_text(bg);
+        let rail_ink = contrast_text(rail_bg);
 
         // Whole page background + left rail.
         let brush = CreateSolidBrush(bg);
@@ -173,7 +160,7 @@ impl SettingsPanel {
                 let brush = CreateSolidBrush(fill);
                 let _ = FillRect(hdc, &row, brush);
                 let _ = DeleteObject(HGDIOBJ(brush.0));
-                let _ = SetTextColor(hdc, Self::ink_on(fill));
+                let _ = SetTextColor(hdc, contrast_text(fill));
             } else {
                 let _ = SetTextColor(hdc, rail_ink);
             }
@@ -247,7 +234,7 @@ impl SettingsPanel {
         let brush = CreateSolidBrush(row_bg);
         let _ = FillRect(hdc, &rc, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
-        let _ = SetTextColor(hdc, Self::ink_on(row_bg));
+        let _ = SetTextColor(hdc, contrast_text(row_bg));
         let mut lrc = RECT { left: x + 12, top: *y, right: x + 180, bottom: *y + ROW_H };
         let mut lwide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut lwide, &mut lrc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);

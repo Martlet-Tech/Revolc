@@ -1,6 +1,8 @@
 pub mod caption;
 pub mod chrome;
 pub mod dwm;
+pub mod gdi;
+pub mod reorder;
 pub mod settings;
 pub mod tabbar;
 pub mod view;
@@ -13,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
@@ -52,6 +54,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
+use crate::bookmarks::BookmarkStore;
 use crate::config::ConfigHandle;
 use crate::shell::host::{self, Absorbed};
 use crate::tabs::events::{self, Action, Binding};
@@ -111,6 +114,9 @@ const CMD_TAB_CLOSE: usize = 0x8002;
 const CMD_TAB_CLOSE_OTHERS: usize = 0x8003;
 const CMD_TAB_CLOSE_RIGHT: usize = 0x8004;
 const CMD_TAB_NEW_AFTER: usize = 0x8005;
+const CMD_TAB_BOOKMARK: usize = 0x8006;
+const CMD_BOOKMARK_OPEN: usize = 0x8007;
+const CMD_BOOKMARK_REMOVE: usize = 0x8008;
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -337,6 +343,17 @@ pub(crate) struct App {
     /// State of the painted settings tab (selected category). Only meaningful
     /// while a Painted(Settings) view is active.
     settings_panel: settings::SettingsPanel,
+    /// Flat list of saved folders, painted on the toolbar row and toggled from
+    /// the tab context menu. Loaded at startup, saved atomically on change.
+    bookmarks: BookmarkStore,
+    /// Pending press / active drag for toolbar bookmark chips. Shares the tab
+    /// strip's `reorder` state machine — only the slot geometry differs.
+    bookmark_press: Option<reorder::Press>,
+    bookmark_drag: Option<reorder::Drag>,
+    /// Chip under the pointer on the toolbar row; painted with the hover fill.
+    bookmark_hover: Option<usize>,
+    /// Whether the right-end settings gear is under the pointer.
+    settings_hover: bool,
 }
 
 pub struct MainWindow {
@@ -635,6 +652,11 @@ impl App {
             hover_tracking: false,
             tab_press: None,
             settings_panel: settings::SettingsPanel::new(),
+            bookmarks: BookmarkStore::open(crate::bookmarks::bookmarks_path()),
+            bookmark_press: None,
+            bookmark_drag: None,
+            bookmark_hover: None,
+            settings_hover: false,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -699,8 +721,8 @@ impl App {
             return;
         }
         let rc = self.client();
-        let (r, g, bl) = self.cfg.get().color(|t| &t.window_border);
-        let color = COLORREF((bl as u32) << 16 | (g as u32) << 8 | r as u32);
+        let (r, g, border_rgb_b) = self.cfg.get().color(|t| &t.window_border);
+        let color = gdi::rgb(r, g, border_rgb_b);
         let strips = [
             RECT { left: 0, top: 0, right: rc.right, bottom: b },
             RECT { left: 0, top: rc.bottom - b, right: rc.right, bottom: rc.bottom },
@@ -751,12 +773,26 @@ impl App {
                     let _ = DeleteDC(mem);
                 }
                 self.tabbar.paint(hdc, w);
-                chrome::paint(hdc, w, TABBAR_HEIGHT, &self.cfg.get());
+                chrome::paint(
+                    hdc,
+                    w,
+                    TABBAR_HEIGHT,
+                    &self.cfg.get(),
+                    self.bookmarks.items(),
+                    self.chrome_paint_state(w),
+                );
                 return;
             }
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
             self.tabbar.paint(mem, w);
-            chrome::paint(mem, w, TABBAR_HEIGHT, &self.cfg.get());
+            chrome::paint(
+                mem,
+                w,
+                TABBAR_HEIGHT,
+                &self.cfg.get(),
+                self.bookmarks.items(),
+                self.chrome_paint_state(w),
+            );
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));
@@ -837,6 +873,18 @@ impl App {
             // invalidate the window that actually paints them.
             let target = if self.tabbar_hwnd.0.is_null() { self.main_hwnd } else { self.tabbar_hwnd };
             let _ = InvalidateRect(target, Some(&band), false);
+        }
+    }
+
+    /// Gather the toolbar row's transient interaction state in one value,
+    /// shared by both paint paths (with and without a back buffer).
+    fn chrome_paint_state(&self, width: i32) -> chrome::PaintState {
+        chrome::PaintState {
+            drag: self.bookmark_drag.map(|d| {
+                (d.from, chrome::clamped_drag_left(d.raw, width))
+            }),
+            hover: self.bookmark_hover,
+            settings_hover: self.settings_hover,
         }
     }
 
@@ -926,20 +974,31 @@ impl App {
     /// whether the point resolves to a client area (tabs) or a non-client one
     /// (caption buttons).
     fn update_hover(&mut self, x: i32, y: i32, width: i32) {
-        // While a tab is being dragged the highlight belongs to the tab in
-        // hand: letting the pointer repaint hover fills underneath it makes
-        // the strip flicker as the drag passes over each slot.
-        if self.tabbar.drag().is_some() {
+        // While a row is being dragged the highlight belongs to the item in
+        // hand: repainting hover fills underneath it makes the band flicker.
+        if self.tabbar.drag().is_some() || self.bookmark_drag.is_some() {
             return;
         }
         let want = caption::hit(x, y, width);
-        // A tab is a client-area target, a caption button a non-client one:
-        // the two hovers are tracked separately and both repaint the band.
-        // The close X belongs to its tab: without that, sliding onto the X
-        // dropped the tab's hover fill and the tab flickered.
-        let over_tab = match self.tabbar.hit(x, y, width) {
-            tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => Some(i),
-            _ => None,
+        // The tab strip and the toolbar row are mutually exclusive vertical
+        // bands. Resolve one hit and feed each painter only its own state.
+        let (over_tab, over_plus, over_bookmark, over_settings) = if y < TABBAR_HEIGHT {
+            match self.tabbar.hit(x, y, width) {
+                tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => (Some(i), false, None, false),
+                tabbar::Hit::Plus => (None, true, None, false),
+                _ => (None, false, None, false),
+            }
+        } else if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+            let total = self.bookmarks.items().len();
+            let settings = chrome::hit_settings(x, y, width);
+            (
+                None,
+                false,
+                if settings { None } else { chrome::hit_bookmark(x, y, width, total) },
+                settings,
+            )
+        } else {
+            (None, false, None, false)
         };
         let maximized = self.is_maximized();
         let active = self.active;
@@ -947,10 +1006,27 @@ impl App {
         if self.tabbar.set_hover_tab(over_tab) {
             dirty = true;
         }
+        if self.tabbar.set_hover_plus(over_plus) {
+            dirty = true;
+        }
+        if self.bookmark_hover != over_bookmark {
+            self.bookmark_hover = over_bookmark;
+            dirty = true;
+        }
+        if self.settings_hover != over_settings {
+            self.settings_hover = over_settings;
+            dirty = true;
+        }
         if dirty {
             self.invalidate_band();
         }
-        if (want.is_some() || over_tab.is_some()) && !self.hover_tracking {
+        if (want.is_some()
+            || over_tab.is_some()
+            || over_plus
+            || over_bookmark.is_some()
+            || over_settings)
+            && !self.hover_tracking
+        {
             self.hover_tracking = true;
             unsafe {
                 let mut tme = TRACKMOUSEEVENT {
@@ -979,6 +1055,16 @@ impl App {
         let active = self.active;
         let mut dirty = self.tabbar.set_chrome(None, maximized, active);
         if self.tabbar.set_hover_tab(None) {
+            dirty = true;
+        }
+        if self.tabbar.set_hover_plus(false) {
+            dirty = true;
+        }
+        if self.bookmark_hover.take().is_some() {
+            dirty = true;
+        }
+        if self.settings_hover {
+            self.settings_hover = false;
             dirty = true;
         }
         if dirty {
@@ -1261,6 +1347,127 @@ impl App {
                 // Spawn failed: leave the tab where it is — never lose it.
                 tracing::error!(error = %e, ?path, "failed to spawn new window, tab kept");
             }
+        }
+    }
+
+    /// Context menu "收藏此标签页": toggle the tab's live folder in the flat
+    /// bookmark list. Uses the same real-time path resolution as "open in new
+    /// window" (BHO push + label), never the possibly-stale `Tab.path`.
+    fn toggle_bookmark(&mut self, i: usize) {
+        // Only a real folder (Hosted) can be bookmarked — a Painted settings
+        // tab has no path worth saving.
+        if !self.views.get(i).map(|v| v.as_hosted().is_some()).unwrap_or(false) {
+            return;
+        }
+        let path = self.folder_path_of(i);
+        let already = self.bookmarks.contains(&path);
+        if already {
+            self.bookmarks.remove(&path);
+            tracing::info!(?path, tab = i, "bookmark removed");
+        } else {
+            let label = self
+                .tabs
+                .get(i)
+                .map(|t| t.label.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| short_label(&path));
+            self.bookmarks.add(label, path.clone());
+            tracing::info!(?path, tab = i, "bookmark added");
+        }
+        // Chip count changed: a stale hover index could light up a neighbour.
+        self.bookmark_hover = None;
+        self.refresh_band();
+    }
+
+    /// Toolbar click on a bookmark: open it in a new tab in this window, at
+    /// the same position a "+" click would use. Never replaces the current
+    /// tab — bookmarks are navigational shortcuts, not tab moves.
+    fn open_bookmark(&mut self, index: usize) {
+        let Some(bm) = self.bookmarks.items().get(index).cloned() else {
+            return;
+        };
+        tracing::info!(path = ?bm.path, "bookmark opened");
+        self.new_tab(bm.path);
+    }
+
+    /// A left press on a bookmark chip: remember a stable key (the chip index)
+    /// and the press x, exactly like `begin_tab_press`. The key is re-resolved
+    /// on drag so a reorder mid-press cannot retarget the wrong chip.
+    fn begin_bookmark_press(&mut self, index: usize, x: i32) {
+        self.bookmark_press = Some(reorder::Press { key: index as u64, x });
+    }
+
+    /// Mouse move while a bookmark chip may be held. Mirrors `tab_drag_track`
+    /// with the bookmark bar's slot geometry; the actual landing decision is
+    /// the same `reorder` code the tab strip uses.
+    fn bookmark_drag_track(&mut self, x: i32) -> bool {
+        if let Some(press) = self.bookmark_press {
+            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+            if !reorder::crossed(press.x, x, threshold) {
+                return false;
+            }
+            self.bookmark_press = None;
+            let from = press.key as usize;
+            let width = self.client().right;
+            // Only visible chips can be dragged; guard against a resize that
+            // shrank the bar between press and drag.
+            let visible = chrome::visible_bookmarks(width, self.bookmarks.items().len());
+            if from >= visible {
+                return false;
+            }
+            let left = chrome::slot_x(from);
+            self.bookmark_drag = Some(reorder::Drag::new(from, press.x, left));
+            unsafe {
+                SetCapture(self.main_hwnd);
+            }
+        }
+        let Some(mut d) = self.bookmark_drag else {
+            return false;
+        };
+        d.move_to(x);
+        let width = self.client().right;
+        let visible = chrome::visible_bookmarks(width, self.bookmarks.items().len());
+        if let Some(to) = d.landing(
+            chrome::slot_width(),
+            chrome::slot_gap(),
+            chrome::slot_origin(),
+            visible,
+        ) {
+            let from = d.from;
+            if self.bookmarks.move_to(from, to) {
+                d.set_from(to);
+                tracing::info!(from, to, "bookmark reordered");
+            }
+        }
+        self.bookmark_drag = Some(d);
+        self.invalidate_band();
+        true
+    }
+
+    /// Drop the held bookmark chip. The model already holds the final order.
+    fn end_bookmark_drag(&mut self) {
+        self.bookmark_press = None;
+        if self.bookmark_drag.is_none() {
+            return;
+        }
+        self.bookmark_drag = None;
+        self.bookmark_hover = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.invalidate_band();
+    }
+
+    /// Bookmark chip context menu "取消收藏": delete the saved item and
+    /// repaint the toolbar so the chip disappears immediately.
+    fn remove_bookmark(&mut self, index: usize) {
+        let Some(bm) = self.bookmarks.items().get(index).cloned() else {
+            return;
+        };
+        if self.bookmarks.remove_at(index) {
+            tracing::info!(path = ?bm.path, "bookmark removed via chip menu");
+            self.bookmark_hover = None;
+            self.refresh_band();
         }
     }
 
@@ -1601,7 +1808,16 @@ impl App {
     }
 
     fn active_folder_path(&mut self) -> String {
-        self.folder_path_of(self.tabs.active_index())
+        let active = self.tabs.active_index();
+        // A Painted tab (e.g. settings) has no filesystem folder. Opening a
+        // new tab from there must not try to spawn Explorer at the literal
+        // label "设置" (seen in 2026-11-23 logs as
+        // `explorer spawned for absorb path="设置"`). Fall back to home.
+        if !self.views.get(active).map(|v| v.as_hosted().is_some()).unwrap_or(false) {
+            tracing::debug!(tab = active, "active tab is not a folder, new tab uses home");
+            return home_dir();
+        }
+        self.folder_path_of(active)
     }
 
     /// May this window adopt a folder window that just appeared?
@@ -2264,7 +2480,13 @@ fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
 /// window, so the caller must NOT hold an `&mut App` across it (re-entrant
 /// `app_from` would alias). Collect the target first, drop the borrow, show the
 /// menu, then re-acquire the app to dispatch.
-unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usize {
+unsafe fn show_tab_context_menu(
+    hwnd: HWND,
+    screen: POINT,
+    has_tab: bool,
+    // None = not a folder tab (painted page): hide the bookmark item.
+    bookmarked: Option<bool>,
+) -> usize {
     let Ok(menu) = CreatePopupMenu() else { return 0 };
 
     if has_tab {
@@ -2272,6 +2494,15 @@ unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usi
         // (moves the tab: closes it here + opens the same folder in a new window)
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("在右侧新建标签页(&A)"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        if let Some(bookmarked) = bookmarked {
+            let bookmark_label = if bookmarked {
+                w!("取消收藏此标签页(&B)")
+            } else {
+                w!("收藏此标签页(&B)")
+            };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_BOOKMARK, bookmark_label);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE, w!("关闭标签页(&C)"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_OTHERS, w!("关闭其他标签页(&O)"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_RIGHT, w!("关闭右侧标签页(&R)"));
@@ -2282,6 +2513,26 @@ unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usi
 
     // A menu owned by another window does not dismiss on outside click unless
     // that window is foreground first (classic TrackPopupMenu gotcha).
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenuEx(
+        menu,
+        TPM_RETURNCMD.0,
+        screen.x,
+        screen.y,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    cmd.0 as usize
+}
+
+/// Context menu for a bookmark chip on the toolbar row. Unlike the tab menu
+/// this one manages the saved item itself: open here, open in a new window,
+/// or remove (取消收藏). Modal — the caller must not hold `&mut App`.
+unsafe fn show_bookmark_context_menu(hwnd: HWND, screen: POINT) -> usize {
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+    let _ = AppendMenuW(menu, MF_STRING, CMD_BOOKMARK_OPEN, w!("打开此收藏(&O)"));
+    let _ = AppendMenuW(menu, MF_STRING, CMD_BOOKMARK_REMOVE, w!("取消收藏(&R)"));
     let _ = SetForegroundWindow(hwnd);
     let cmd = TrackPopupMenuEx(
         menu,
@@ -2446,7 +2697,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // there would switch the capture to non-client and start emitting
             // WM_NCMOUSEMOVE — the tab would freeze mid-air until the button
             // was released.
-            if app.tabbar.drag().is_some() {
+            if app.tabbar.drag().is_some() || app.bookmark_drag.is_some() {
                 return LRESULT(HTCLIENT as isize);
             }
             let hit = app.tabbar.hit(pt.x, pt.y, cr.right);
@@ -2537,15 +2788,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
-            // Toolbar row: only the right-end settings gear is live for now.
-            // Other toolbar clicks do nothing (bookmark items are phase 3).
-            // Checked before tabbar.hit() so the row never falls into Hit::Band
-            // and starts a window drag.
+            // Toolbar row: the right-end settings gear and the bookmark chips
+            // are the live targets. Checked before tabbar.hit() so the row
+            // never falls into Hit::Band and starts a window drag.
             if chrome::hit_settings(x, y, width) {
                 app.open_settings_tab();
                 return LRESULT(0);
             }
             if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+                let total = app.bookmarks.items().len();
+                if let Some(i) = chrome::hit_bookmark(x, y, width, total) {
+                    // Remember the press; a click opens on LBUTTONUP, a drag
+                    // reorders. Same shape as the tab strip's press/drag.
+                    app.begin_bookmark_press(i, x);
+                }
                 return LRESULT(0);
             }
             // Route by vertical band first. The caption/tab strip always wins
@@ -2636,19 +2892,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // crossed here, the reorder happens on the spot (the model is the
         // truth; the strip only paints the tab under the cursor).
         WM_MOUSEMOVE => {
-            let app = app_from(hwnd);
             let (x, _y) = point_from_lparam(lp);
-            app.tab_drag_track(x);
+            let app = app_from(hwnd);
+            if !app.tab_drag_track(x) {
+                // Both rows share the same gesture; only one can be active.
+                app.bookmark_drag_track(x);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            app_from(hwnd).end_tab_drag();
+            let (_x, y) = point_from_lparam(lp);
+            let app = app_from(hwnd);
+            // Snapshot the pending press BEFORE the end helpers clear it. A
+            // press released without crossing the drag threshold is a click.
+            let pending_press = app.bookmark_press.take();
+            let was_dragging = app.bookmark_drag.is_some();
+            app.end_tab_drag();
+            app.end_bookmark_drag();
+            if !was_dragging {
+                if let Some(press) = pending_press {
+                    let width = app.client().right;
+                    let index = press.key as usize;
+                    if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y)
+                        && index < chrome::visible_bookmarks(width, app.bookmarks.items().len())
+                    {
+                        app.open_bookmark(index);
+                    }
+                }
+            }
             LRESULT(0)
         }
         // Capture stolen (Alt+Tab, a modal, another window grabbing the
-        // mouse): drop the drag instead of leaving a tab glued to the cursor.
+        // mouse): drop the drag instead of leaving a tab/chip glued to cursor.
         WM_CAPTURECHANGED => {
-            app_from(hwnd).end_tab_drag();
+            let app = app_from(hwnd);
+            app.end_tab_drag();
+            app.end_bookmark_drag();
             LRESULT(0)
         }
         // Middle click on a tab closes it (spec §3.1).
@@ -2671,31 +2950,74 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // target correct even if a sweep reorders views while the menu is up.
         WM_RBUTTONUP => {
             let (x, y) = point_from_lparam(lp);
-            // Phase 1: gather target + screen point, then DROP the app borrow.
-            let (hit_index, screen) = {
+            // Phase 1: gather target + screen point + menu kind, then DROP the
+            // app borrow before the modal menu loop. Two kinds of target:
+            //   * a bookmark chip on the toolbar row -> bookmark menu
+            //   * a tab (or empty strip)               -> tab menu
+            let (hit_index, screen, bookmarked, bm_index) = {
                 let app = app_from(hwnd);
                 let width = app.client().right;
-                let idx = match app.tabbar.hit(x, y, width) {
-                    tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
-                        .tabbar
-                        .ids()
-                        .get(i)
-                        .copied()
-                        .and_then(|id| app.index_of(id)),
-                    _ => None,
+                // The toolbar row is split from the tab strip: a right click
+                // there hits a bookmark chip, not a tab.
+                let bm = if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+                    chrome::hit_bookmark(x, y, width, app.bookmarks.items().len())
+                } else {
+                    None
                 };
+                let idx = if bm.is_none() {
+                    match app.tabbar.hit(x, y, width) {
+                        tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
+                            .tabbar
+                            .ids()
+                            .get(i)
+                            .copied()
+                            .and_then(|id| app.index_of(id)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                // Painted tabs (settings) have no folder — don't offer to
+                // bookmark them. Only Hosted tabs are real folders.
+                let marked = idx.and_then(|i| {
+                    let is_folder = app
+                        .views
+                        .get(i)
+                        .map(|v| v.as_hosted().is_some())
+                        .unwrap_or(false);
+                    if is_folder {
+                        let p = app.folder_path_of(i);
+                        Some(app.bookmarks.contains(&p))
+                    } else {
+                        None
+                    }
+                });
                 let mut pt = POINT { x, y };
                 let _ = ClientToScreen(hwnd, &mut pt);
-                (idx, pt)
+                (idx, pt, marked, bm)
             };
             // Phase 2: modal loop — no &mut App alive here.
-            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some());
+            let cmd = if bm_index.is_some() {
+                show_bookmark_context_menu(hwnd, screen)
+            } else {
+                show_tab_context_menu(hwnd, screen, hit_index.is_some(), bookmarked)
+            };
             // Phase 3: re-acquire and dispatch.
             if cmd != 0 {
                 let app = app_from(hwnd);
                 // Re-resolve by id in case the list shifted during the loop.
                 let idx = hit_index;
                 match cmd {
+                    CMD_BOOKMARK_OPEN => {
+                        if let Some(i) = bm_index {
+                            app.open_bookmark(i);
+                        }
+                    }
+                    CMD_BOOKMARK_REMOVE => {
+                        if let Some(i) = bm_index {
+                            app.remove_bookmark(i);
+                        }
+                    }
                     CMD_TAB_NEW_WINDOW => {
                         if let Some(i) = idx {
                             app.move_tab_to_new_window(i);
@@ -2707,6 +3029,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             .unwrap_or_else(|| app.active_folder_path());
                         let anchor = idx.unwrap_or_else(|| app.tabs.len().saturating_sub(1));
                         app.new_tab_after(anchor, path);
+                    }
+                    CMD_TAB_BOOKMARK => {
+                        if let Some(i) = idx {
+                            app.toggle_bookmark(i);
+                        }
                     }
                     CMD_TAB_CLOSE => {
                         if let Some(i) = idx {
@@ -2776,7 +3103,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let (r, g, b) = app.cfg.get().color(|t| &t.tabbar_background);
             unsafe {
-                let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
+                let brush = CreateSolidBrush(gdi::rgb(r, g, b));
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let _ = FillRect(HDC(wp.0 as *mut _), &rc, brush);

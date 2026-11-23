@@ -7,18 +7,88 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, LineTo,
-    MoveToEx, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, HDC, HGDIOBJ, PS_SOLID, TRANSPARENT,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, SelectObject,
+    SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HDC, HGDIOBJ, PS_SOLID, TRANSPARENT,
 };
 
+use crate::bookmarks::Bookmark;
 use crate::config::Config;
 
 use super::caption;
+use super::gdi::{self, line, rgb};
+
+/// Geometry of one bookmark chip. Fixed width keeps paint and hit-test
+/// perfectly in sync (no GDI text measurement needed), at the cost of a
+/// simple ellipsis for long labels.
+const BM_X0: i32 = 8;
+const BM_W: i32 = 92;
+const BM_GAP: i32 = 4;
+const BM_H: i32 = 20;
 
 /// X position of the settings button's left edge.
 pub fn settings_button_x(width: i32) -> i32 {
     width - super::SETTINGS_BTN_W
+}
+
+/// How many bookmark chips fit before the settings button. Extra bookmarks
+/// are not painted or clickable until the window is widened.
+pub fn visible_bookmarks(width: i32, total: usize) -> usize {
+    let room = settings_button_x(width) - 8 - BM_X0;
+    if room <= 0 {
+        return 0;
+    }
+    let per = BM_W + BM_GAP;
+    (((room + BM_GAP) / per).max(0) as usize).min(total)
+}
+
+/// Slot geometry, shared by paint / hit-test / drag so they cannot drift.
+pub fn slot_x(i: usize) -> i32 {
+    BM_X0 + (i as i32) * (BM_W + BM_GAP)
+}
+pub fn slot_width() -> i32 {
+    BM_W
+}
+pub fn slot_gap() -> i32 {
+    BM_GAP
+}
+pub fn slot_origin() -> i32 {
+    BM_X0
+}
+fn slot_top() -> i32 {
+    caption::HEIGHT + (super::BOOKMARK_HEIGHT - BM_H) / 2
+}
+
+/// Left edge a dragged chip is painted at, pinned inside the toolbar row.
+pub fn clamped_drag_left(raw: i32, width: i32) -> i32 {
+    let max_left = (settings_button_x(width) - 8 - BM_W).max(BM_X0);
+    raw.clamp(BM_X0, max_left)
+}
+
+/// Rectangle of bookmark `i` in chrome-popup client coords, if visible.
+fn bookmark_rect(i: usize, width: i32) -> Option<RECT> {
+    if i >= visible_bookmarks(width, usize::MAX) {
+        return None;
+    }
+    let top = slot_top();
+    Some(RECT {
+        left: slot_x(i),
+        top,
+        right: slot_x(i) + BM_W,
+        bottom: top + BM_H,
+    })
+}
+
+/// Which bookmark chip is under (x, y) in chrome-popup client coords?
+pub fn hit_bookmark(x: i32, y: i32, width: i32, total: usize) -> Option<usize> {
+    let top = slot_top();
+    if !(top..top + BM_H).contains(&y) {
+        return None;
+    }
+    (0..visible_bookmarks(width, total)).find(|&i| {
+        let left = slot_x(i);
+        x >= left && x < left + BM_W
+    })
 }
 
 /// Is (x, y) — in chrome-popup client coords — over the settings button?
@@ -55,53 +125,154 @@ pub fn route_click(y: i32, painted_active: bool) -> ClickRoute {
     }
 }
 
-/// Only a double-click in the chrome band may toggle maximize. The tab bar's
-/// hit test reports `Band` for the whole content area (y >= TABBAR_HEIGHT),
-/// so double-clicking a painted settings page would otherwise maximize the
-/// window. Gate on the chrome band first.
+/// Only a double-click on the caption strip (the tab/button row) may toggle
+/// maximize. The tab bar's hit test reports `Band` for everything below the
+/// tab row too — including the bookmark toolbar and the painted page — so
+/// gating on the whole chrome band used to maximize the window when the user
+/// double-clicked a bookmark chip (and the old settings-page bug). Restrict it
+/// to the caption row.
 pub fn is_chrome_double_click(y: i32) -> bool {
-    y < super::CHROME_HEIGHT
+    y < super::TABBAR_HEIGHT
+}
+
+/// Transient interaction state of the toolbar row, gathered by the caller
+/// once and passed to the painter. Keeping it in one value avoids a growing
+/// parameter list as new affordances are added.
+#[derive(Clone, Copy, Default)]
+pub struct PaintState {
+    /// `(index, left)` of a chip held by the pointer: skipped in its slot and
+    /// drawn last at `left` (the data model is already reordered).
+    pub drag: Option<(usize, i32)>,
+    /// Chip under the pointer, painted with the hover fill.
+    pub hover: Option<usize>,
+    /// Whether the right-end settings gear is under the pointer.
+    pub settings_hover: bool,
 }
 
 /// Paint the toolbar row. `top` is where the row starts (= TABBAR_HEIGHT).
-pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config) {
+/// Bookmarks are drawn left-to-right as chips; the settings glyph owns the
+/// right edge. With no bookmarks a hint reminds the user where to add them.
+pub unsafe fn paint(
+    hdc: HDC,
+    width: i32,
+    top: i32,
+    cfg: &Config,
+    bookmarks: &[Bookmark],
+    state: PaintState,
+) {
     let height = super::BOOKMARK_HEIGHT;
     let (r, g, b) = cfg.color(|t| &t.bookmark_bar_background);
-    let bg = COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32);
+    let bg = rgb(r, g, b);
     let brush = CreateSolidBrush(bg);
     let row = RECT { left: 0, top, right: width, bottom: top + height };
     let _ = FillRect(hdc, &row, brush);
     let _ = DeleteObject(HGDIOBJ(brush.0));
 
-    // Text colour: lift the background toward light so it reads on both the
-    // default dark grey and a user-supplied green.
-    let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
-    let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
-    let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
     let font = GetStockObject(DEFAULT_GUI_FONT);
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF((tb as u32) << 16 | (tg as u32) << 8 | tr as u32));
-    let mut text = RECT { left: 10, top, right: width - 10, bottom: top + height };
-    let mut label: Vec<u16> = "收藏夹".encode_utf16().chain(Some(0)).collect();
-    let _ = DrawTextW(
-        hdc,
-        &mut label,
-        &mut text,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-    );
+
+    let (cr, cg, cb) = cfg.color(|t| &t.tab_active);
+    let chip = rgb(cr, cg, cb);
+    let (ir, ig, ib) = cfg.color(|t| &t.tab_text_active);
+    let ink = rgb(ir, ig, ib);
+    let (hr, hg, hb) = cfg.color(|t| &t.tab_hover);
+    let hover = rgb(hr, hg, hb);
+    // Same contrast rule as the settings gear: a light hover fill needs dark
+    // ink regardless of what the theme's tab_text happens to be.
+    let hover_ink = gdi::contrast_text(hover);
+
+    let n = visible_bookmarks(width, bookmarks.len());
+    if n == 0 {
+        // Text colour: lift the background toward light so it reads on both
+        // the default dark grey and a user-supplied green.
+        let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
+        let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
+        let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
+        let _ = SetTextColor(hdc, rgb(tr, tg, tb));
+        let mut text = RECT { left: 10, top, right: settings_button_x(width) - 4, bottom: top + height };
+        let mut label: Vec<u16> = "收藏夹：在标签上点右键即可收藏".encode_utf16().chain(Some(0)).collect();
+        let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        for (i, bm) in bookmarks.iter().take(n).enumerate() {
+            if state.drag.map(|d| d.0 == i).unwrap_or(false) {
+                continue; // drawn last, at the pointer position
+            }
+            if let Some(rect) = bookmark_rect(i, width) {
+                if state.hover == Some(i) {
+                    paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+                } else {
+                    paint_chip(hdc, &rect, &bm.label, chip, ink);
+                }
+            }
+        }
+        // Held chip last, on top, with a lifted fill.
+        if let Some((index, left)) = state.drag {
+            if let Some(bm) = bookmarks.get(index) {
+                let rect = RECT {
+                    left,
+                    top: slot_top(),
+                    right: left + BM_W,
+                    bottom: slot_top() + BM_H,
+                };
+                paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+            }
+        }
+    }
     let _ = SelectObject(hdc, old_font);
 
     // Settings glyph at the right edge, drawn with the same 1px-line approach
-    // as the caption buttons (no font dependency, DPI-stable).
-    let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
+    // as the caption buttons (no font dependency, DPI-stable). Hover lights
+    // the whole button cell, matching the caption buttons' feedback.
+    if state.settings_hover {
+        let cell = RECT {
+            left: settings_button_x(width),
+            top,
+            right: width,
+            bottom: top + height,
+        };
+        let brush = CreateSolidBrush(hover);
+        let _ = FillRect(hdc, &cell, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    // On hover the glyph must contrast with the *fill*, not with the toolbar
+    // background: the green preset's light `tab_hover` made the themed light
+    // glyph disappear. Derive dark/light ink from the actual cell colour.
+    let glyph_color = if state.settings_hover {
+        gdi::contrast_text(hover)
+    } else {
+        let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
+        rgb(sr, sg, sb)
+    };
     paint_hexagon(
         hdc,
         settings_button_x(width),
         top,
         super::SETTINGS_BTN_W,
         height,
-        COLORREF((sb as u32) << 16 | (sg as u32) << 8 | sr as u32),
+        glyph_color,
+    );
+}
+
+/// One bookmark chip: filled rect + ellipsised label. Pure paint helper shared
+/// by the resting and dragged cases.
+unsafe fn paint_chip(hdc: HDC, rect: &RECT, label: &str, fill: COLORREF, ink: COLORREF) {
+    let brush = CreateSolidBrush(fill);
+    let _ = FillRect(hdc, rect, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let mut text = RECT {
+        left: rect.left + 6,
+        top: rect.top,
+        right: rect.right - 4,
+        bottom: rect.bottom,
+    };
+    let mut wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+    let _ = SetTextColor(hdc, ink);
+    let _ = DrawTextW(
+        hdc,
+        &mut wide,
+        &mut text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
 
@@ -134,11 +305,6 @@ unsafe fn paint_hexagon(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORRE
     line(hdc, cx - 1, cy, cx + 1, cy);
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(pen.0));
-}
-
-unsafe fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
-    let _ = MoveToEx(hdc, x1, y1, None);
-    let _ = LineTo(hdc, x2, y2);
 }
 
 #[cfg(test)]
@@ -175,11 +341,34 @@ mod tests {
     }
 
     #[test]
-    fn double_click_in_view_rect_never_maximizes() {
+    fn double_click_outside_caption_row_never_maximizes() {
         // Regression: tabbar.hit() reports Band for y >= TABBAR_HEIGHT, so a
-        // double-click on the settings page used to toggle maximize.
+        // double-click on the settings page — or on the bookmark toolbar —
+        // used to toggle maximize. Only the caption row is a valid target.
         assert!(is_chrome_double_click(caption::HEIGHT / 2));
+        assert!(!is_chrome_double_click(caption::HEIGHT)); // toolbar row
         assert!(!is_chrome_double_click(CHROME_HEIGHT));
         assert!(!is_chrome_double_click(CHROME_HEIGHT + 50));
+    }
+
+    #[test]
+    fn bookmark_chips_hit_test_inside_toolbar_row() {
+        let width = 800;
+        let y = caption::HEIGHT + BOOKMARK_HEIGHT / 2;
+        assert_eq!(hit_bookmark(10, y, width, 3), Some(0));
+        assert_eq!(hit_bookmark(8 + 92 + 4 + 10, y, width, 3), Some(1));
+        // The gaps between chips are dead space.
+        assert_eq!(hit_bookmark(8 + 92 + 2, y, width, 3), None);
+        // Not in the toolbar row -> no hit.
+        assert_eq!(hit_bookmark(10, caption::HEIGHT / 2, width, 3), None);
+    }
+
+    #[test]
+    fn bookmark_count_is_clamped_by_width_and_total() {
+        assert_eq!(visible_bookmarks(800, 3), 3);
+        assert_eq!(visible_bookmarks(800, 0), 0);
+        // A narrow window leaves room for fewer chips.
+        assert!(visible_bookmarks(140, 10) < 10);
+        assert_eq!(hit_bookmark(600, caption::HEIGHT + BOOKMARK_HEIGHT / 2, 140, 10), None);
     }
 }
