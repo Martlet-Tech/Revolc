@@ -22,6 +22,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
 use crate::config::Config;
+use crate::ui::reorder::Drag;
 use crate::ui::{caption, icon};
 
 pub const TAB_MAX_W: i32 = 190;
@@ -61,37 +62,9 @@ pub enum Hit {
     Caption(caption::Button),
 }
 
-/// An in-band tab drag: the tab left its slot and follows the pointer.
-///
-/// The model never sees a "dragged index": the app reorders `TabList` the
-/// moment `target()` changes, so `from` always means "where the tab sits in
-/// the *current* order". Tabs are all the same width, which is what makes this
-/// cheap — reordering changes the labels in each slot but not a single slot
-/// coordinate, so the centre lines that decide the swap stay put and the drag
-/// cannot oscillate.
-#[derive(Clone, Copy, Debug)]
-pub struct Drag {
-    /// Index of the dragged tab in the current order.
-    pub from: usize,
-    /// Pointer offset inside the tab at the time the drag started, so the tab
-    /// does not jump under the cursor.
-    grab: i32,
-    /// Left edge the pointer asks for, **before** the strip clamps it. The
-    /// clamp is a painting decision (the tab must stay on the band); using the
-    /// clamped value for hit-testing would make slot 0 unreachable — with the
-    /// left edge pinned at `GUTTER`, the tab's centre can never get past the
-    /// first tab's centre line, so "drag the second tab to the front" would
-    /// silently do nothing.
-    raw: i32,
-}
-
-impl Drag {
-    /// Where the tab is painted: same coordinate, pinned to the band.
-    fn left(&self, max_left: i32) -> i32 {
-        self.raw.clamp(GUTTER, max_left)
-    }
-}
-
+/// `Drag` now lives in `ui::reorder`, shared with the bookmark bar. The tab
+/// strip's slot geometry (origin `GUTTER`, width `tab_w`, gap `TAB_GAP`) is
+/// supplied at every call site, so behaviour is unchanged.
 /// Tab strip state + painter.
 pub struct TabBar {
     /// Tab ids, parallel to `labels`. Callbacks report ids, not indices: the
@@ -243,7 +216,7 @@ impl TabBar {
             return;
         }
         let left = self.tab_x(i);
-        self.drag = Some(Drag { from: i, grab: x - left, raw: left });
+        self.drag = Some(Drag::new(i, x, left));
         self.hover_tab = None;
     }
 
@@ -256,14 +229,14 @@ impl TabBar {
     /// painting.
     pub fn drag_to(&mut self, x: i32) {
         let Some(mut d) = self.drag else { return };
-        d.raw = x - d.grab;
+        d.move_to(x);
         self.drag = Some(d);
     }
 
     /// Adopt a new (post-reorder) index for the tab being dragged.
     pub fn set_drag_from(&mut self, i: usize) {
         if let Some(d) = &mut self.drag {
-            d.from = i;
+            d.set_from(i);
         }
     }
 
@@ -283,7 +256,7 @@ impl TabBar {
     /// pointer has not crossed a centre line yet).
     pub fn target(&self) -> Option<usize> {
         let d = self.drag?;
-        landing(d.raw + self.tab_w / 2, self.tab_w, self.labels.len(), d.from)
+        d.landing(self.tab_w, TAB_GAP, GUTTER, self.labels.len())
     }
 
     /// Recompute tab widths for a new client width. Returns true on change.
@@ -407,7 +380,7 @@ impl TabBar {
             if let Some(d) = self.drag {
                 if let Some(label) = self.labels.get(d.from) {
                     let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
-                    self.paint_tab(hdc, d.from, d.left(max_left), label, true);
+                    self.paint_tab(hdc, d.from, d.left(GUTTER, max_left), label, true);
                 }
             }
 
@@ -506,30 +479,6 @@ impl TabBar {
     }
 }
 
-/// Centre-line landing rule, as pure geometry so it can be tested without a
-/// window. `center` is the dragged tab's centre; slot `i` occupies
-/// `GUTTER + i * (tab_w + TAB_GAP)`.
-///
-/// The scan produces an *insertion slot* (0..=n). A tab that has not moved
-/// resolves to its own slot or the one right after it, and the correction
-/// below folds both back to "no change" — without it, every drag would report
-/// a move on the first pixel.
-fn landing(center: i32, tab_w: i32, n: usize, from: usize) -> Option<usize> {
-    if n < 2 || from >= n {
-        return None;
-    }
-    let mid = |i: usize| GUTTER + i as i32 * (tab_w + TAB_GAP) + tab_w / 2;
-    let mut insert = n;
-    for i in 0..n {
-        if center < mid(i) {
-            insert = i;
-            break;
-        }
-    }
-    let to = if insert > from { insert - 1 } else { insert };
-    (to != from && to < n).then_some(to)
-}
-
 /// Blend towards the band background: the "window is inactive" glyph colour.
 fn dim(fg: COLORREF, bg: COLORREF) -> COLORREF {
     let mix = |f: u32, b: u32| (f * 45 + b * 55) / 100;
@@ -611,10 +560,15 @@ fn to_wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::reorder;
 
     /// Slot geometry used below: GUTTER 28, tab 100, gap 4 -> step 104,
     /// centres at 78 / 182 / 286.
     const W: i32 = 100;
+
+    fn landing(center: i32, tab_w: i32, n: usize, from: usize) -> Option<usize> {
+        reorder::landing(center, tab_w, TAB_GAP, GUTTER, n, from)
+    }
 
     #[test]
     fn resting_in_your_own_slot_is_not_a_move() {
@@ -668,8 +622,9 @@ mod tests {
     /// pinned left edge would cap how far left a tab can be recognised.
     #[test]
     fn painting_clamps_but_landing_does_not() {
-        let d = Drag { from: 1, grab: 0, raw: GUTTER - 40 };
-        assert_eq!(d.left(500), GUTTER, "painted inside the band");
+        let mut d = Drag::new(1, GUTTER, GUTTER); // grab = 0
+        d.move_to(GUTTER - 40);
+        assert_eq!(d.left(GUTTER, 500), GUTTER, "painted inside the band");
         assert_eq!(landing(d.raw + W / 2, W, 3, 1), Some(0), "but decided on raw");
     }
 

@@ -85,6 +85,19 @@ impl BookmarkStore {
         true
     }
 
+    /// Reorder: move the item at `from` so it lands at `to`. Returns true when
+    /// the order actually changed (then the caller saves and repaints).
+    pub fn move_to(&mut self, from: usize, to: usize) -> bool {
+        let n = self.items.len();
+        if from >= n || to >= n || from == to {
+            return false;
+        }
+        let item = self.items.remove(from);
+        self.items.insert(to, item);
+        self.save();
+        true
+    }
+
     /// Remove every bookmark pointing at `path`. Returns true when removed.
     pub fn remove(&mut self, path: &str) -> bool {
         let key = normalize_path(path);
@@ -216,6 +229,27 @@ mod tests {
         assert_eq!(reopened.items().len(), 1);
         assert_eq!(reopened.items()[0].label, "Projects");
         assert_eq!(reopened.items()[0].path, "D:\\Projects");
+    }
+
+    #[test]
+    fn move_to_reorders_and_persists() {
+        let path = temp_path("move_to");
+        let mut store = BookmarkStore::open(path.clone());
+        for b in store.items().to_vec() {
+            let _ = store.remove(&b.path);
+        }
+        assert!(store.add("a", "C:\\a"));
+        assert!(store.add("b", "C:\\b"));
+        assert!(store.add("c", "C:\\c"));
+        assert!(store.move_to(0, 2));
+        let labels: Vec<_> = store.items().iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["b", "c", "a"]);
+        assert!(!store.move_to(1, 1));
+        assert!(!store.move_to(0, 99));
+        // The new order survives a reload.
+        let reopened = BookmarkStore::open(path);
+        let labels: Vec<_> = reopened.items().iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["b", "c", "a"]);
     }
 
     #[test]

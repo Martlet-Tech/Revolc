@@ -41,28 +41,51 @@ pub fn visible_bookmarks(width: i32, total: usize) -> usize {
     (((room + BM_GAP) / per).max(0) as usize).min(total)
 }
 
+/// Slot geometry, shared by paint / hit-test / drag so they cannot drift.
+pub fn slot_x(i: usize) -> i32 {
+    BM_X0 + (i as i32) * (BM_W + BM_GAP)
+}
+pub fn slot_width() -> i32 {
+    BM_W
+}
+pub fn slot_gap() -> i32 {
+    BM_GAP
+}
+pub fn slot_origin() -> i32 {
+    BM_X0
+}
+fn slot_top() -> i32 {
+    caption::HEIGHT + (super::BOOKMARK_HEIGHT - BM_H) / 2
+}
+
+/// Left edge a dragged chip is painted at, pinned inside the toolbar row.
+pub fn clamped_drag_left(raw: i32, width: i32) -> i32 {
+    let max_left = (settings_button_x(width) - 8 - BM_W).max(BM_X0);
+    raw.clamp(BM_X0, max_left)
+}
+
 /// Rectangle of bookmark `i` in chrome-popup client coords, if visible.
 fn bookmark_rect(i: usize, width: i32) -> Option<RECT> {
     if i >= visible_bookmarks(width, usize::MAX) {
         return None;
     }
-    let top = caption::HEIGHT + (super::BOOKMARK_HEIGHT - BM_H) / 2;
+    let top = slot_top();
     Some(RECT {
-        left: BM_X0 + (i as i32) * (BM_W + BM_GAP),
+        left: slot_x(i),
         top,
-        right: BM_X0 + (i as i32) * (BM_W + BM_GAP) + BM_W,
+        right: slot_x(i) + BM_W,
         bottom: top + BM_H,
     })
 }
 
 /// Which bookmark chip is under (x, y) in chrome-popup client coords?
 pub fn hit_bookmark(x: i32, y: i32, width: i32, total: usize) -> Option<usize> {
-    let top = caption::HEIGHT + (super::BOOKMARK_HEIGHT - BM_H) / 2;
+    let top = slot_top();
     if !(top..top + BM_H).contains(&y) {
         return None;
     }
     (0..visible_bookmarks(width, total)).find(|&i| {
-        let left = BM_X0 + (i as i32) * (BM_W + BM_GAP);
+        let left = slot_x(i);
         x >= left && x < left + BM_W
     })
 }
@@ -101,18 +124,31 @@ pub fn route_click(y: i32, painted_active: bool) -> ClickRoute {
     }
 }
 
-/// Only a double-click in the chrome band may toggle maximize. The tab bar's
-/// hit test reports `Band` for the whole content area (y >= TABBAR_HEIGHT),
-/// so double-clicking a painted settings page would otherwise maximize the
-/// window. Gate on the chrome band first.
+/// Only a double-click on the caption strip (the tab/button row) may toggle
+/// maximize. The tab bar's hit test reports `Band` for everything below the
+/// tab row too — including the bookmark toolbar and the painted page — so
+/// gating on the whole chrome band used to maximize the window when the user
+/// double-clicked a bookmark chip (and the old settings-page bug). Restrict it
+/// to the caption row.
 pub fn is_chrome_double_click(y: i32) -> bool {
-    y < super::CHROME_HEIGHT
+    y < super::TABBAR_HEIGHT
 }
 
 /// Paint the toolbar row. `top` is where the row starts (= TABBAR_HEIGHT).
 /// Bookmarks are drawn left-to-right as chips; the settings glyph owns the
 /// right edge. With no bookmarks a hint reminds the user where to add them.
-pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config, bookmarks: &[Bookmark]) {
+///
+/// `drag` is `(index, left)` of a chip held by the pointer: it is skipped in
+/// its slot and drawn last at `left`, above its neighbours (the data model has
+/// already been reordered, exactly like the tab strip's drag).
+pub unsafe fn paint(
+    hdc: HDC,
+    width: i32,
+    top: i32,
+    cfg: &Config,
+    bookmarks: &[Bookmark],
+    drag: Option<(usize, i32)>,
+) {
     let height = super::BOOKMARK_HEIGHT;
     let (r, g, b) = cfg.color(|t| &t.bookmark_bar_background);
     let bg = COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32);
@@ -124,6 +160,15 @@ pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config, bookmarks: &[B
     let font = GetStockObject(DEFAULT_GUI_FONT);
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
+
+    let (cr, cg, cb) = cfg.color(|t| &t.tab_active);
+    let chip = COLORREF((cb as u32) << 16 | (cg as u32) << 8 | cr as u32);
+    let (ir, ig, ib) = cfg.color(|t| &t.tab_text_active);
+    let ink = COLORREF((ib as u32) << 16 | (ig as u32) << 8 | ir as u32);
+    let (hr, hg, hb) = cfg.color(|t| &t.tab_hover);
+    let hover = COLORREF((hb as u32) << 16 | (hg as u32) << 8 | hr as u32);
+    let (hir, hig, hib) = cfg.color(|t| &t.tab_text);
+    let hover_ink = COLORREF((hib as u32) << 16 | (hig as u32) << 8 | hir as u32);
 
     let n = visible_bookmarks(width, bookmarks.len());
     if n == 0 {
@@ -137,30 +182,26 @@ pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config, bookmarks: &[B
         let mut label: Vec<u16> = "收藏夹：在标签上点右键即可收藏".encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
-        let (cr, cg, cb) = cfg.color(|t| &t.tab_active);
-        let chip = COLORREF((cb as u32) << 16 | (cg as u32) << 8 | cr as u32);
-        let (ir, ig, ib) = cfg.color(|t| &t.tab_text_active);
-        let ink = COLORREF((ib as u32) << 16 | (ig as u32) << 8 | ir as u32);
-        let chip_brush = CreateSolidBrush(chip);
         for (i, bm) in bookmarks.iter().take(n).enumerate() {
-            let Some(rect) = bookmark_rect(i, width) else { continue };
-            let _ = FillRect(hdc, &rect, chip_brush);
-            let mut text = RECT {
-                left: rect.left + 6,
-                top: rect.top,
-                right: rect.right - 4,
-                bottom: rect.bottom,
-            };
-            let mut label: Vec<u16> = bm.label.encode_utf16().chain(Some(0)).collect();
-            let _ = SetTextColor(hdc, ink);
-            let _ = DrawTextW(
-                hdc,
-                &mut label,
-                &mut text,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
+            if drag.map(|d| d.0 == i).unwrap_or(false) {
+                continue; // drawn last, at the pointer position
+            }
+            if let Some(rect) = bookmark_rect(i, width) {
+                paint_chip(hdc, &rect, &bm.label, chip, ink);
+            }
         }
-        let _ = DeleteObject(HGDIOBJ(chip_brush.0));
+        // Held chip last, on top, with a lifted fill.
+        if let Some((index, left)) = drag {
+            if let Some(bm) = bookmarks.get(index) {
+                let rect = RECT {
+                    left,
+                    top: slot_top(),
+                    right: left + BM_W,
+                    bottom: slot_top() + BM_H,
+                };
+                paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+            }
+        }
     }
     let _ = SelectObject(hdc, old_font);
 
@@ -174,6 +215,28 @@ pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config, bookmarks: &[B
         super::SETTINGS_BTN_W,
         height,
         COLORREF((sb as u32) << 16 | (sg as u32) << 8 | sr as u32),
+    );
+}
+
+/// One bookmark chip: filled rect + ellipsised label. Pure paint helper shared
+/// by the resting and dragged cases.
+unsafe fn paint_chip(hdc: HDC, rect: &RECT, label: &str, fill: COLORREF, ink: COLORREF) {
+    let brush = CreateSolidBrush(fill);
+    let _ = FillRect(hdc, rect, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let mut text = RECT {
+        left: rect.left + 6,
+        top: rect.top,
+        right: rect.right - 4,
+        bottom: rect.bottom,
+    };
+    let mut wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+    let _ = SetTextColor(hdc, ink);
+    let _ = DrawTextW(
+        hdc,
+        &mut wide,
+        &mut text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
 
@@ -247,10 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn double_click_in_view_rect_never_maximizes() {
+    fn double_click_outside_caption_row_never_maximizes() {
         // Regression: tabbar.hit() reports Band for y >= TABBAR_HEIGHT, so a
-        // double-click on the settings page used to toggle maximize.
+        // double-click on the settings page — or on the bookmark toolbar —
+        // used to toggle maximize. Only the caption row is a valid target.
         assert!(is_chrome_double_click(caption::HEIGHT / 2));
+        assert!(!is_chrome_double_click(caption::HEIGHT)); // toolbar row
         assert!(!is_chrome_double_click(CHROME_HEIGHT));
         assert!(!is_chrome_double_click(CHROME_HEIGHT + 50));
     }

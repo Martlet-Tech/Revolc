@@ -50,6 +50,13 @@
        自适应数量、省略号截断），点芯片新开 tab；右端设置齿轮不变。
      - 书签芯片右键菜单（同分支补做）：「打开此收藏 / 取消收藏」——直接从收藏栏
        管理，不必先打开成 tab 再右键。`BookmarkStore::remove_at(index)` 按芯片索引删。
+     - **拖拽重排（与标签栏共用一套逻辑）**：抽出 `src/ui/reorder.rs`（`Drag`/`Press`/
+       `landing()` 中心线落点，参数化 origin/width/gap）；`tabbar.rs` 的 Drag 与 landing
+       改为复用它，行为零变化；书签栏用同款 press→阈值→drag→`move_to` 三段式，
+       拖到的新顺序即时写回 `bookmarks.json`。App 层 `bookmark_press`/`bookmark_drag`
+       两个状态字段，消息路由在 WM_LBUTTONDOWN/MOUSEMOVE/LBUTTONUP/CAPTURECHANGED。
+       单击仍打开（按下即记录 press，抬起未跨阈值才算 click），拖不被误判为打开。
+       顺带收紧双击最大化门禁到 caption 行——此前双击书签芯片会最大化窗口。
      - 顺带修：设置页（Painted tab）活动时新建 tab 曾把字面量"设置"当文件夹
        路径 spawn（log 实锤 `explorer spawned for absorb path="设置"`）；
        `active_folder_path` 现在对非 Hosted tab 回退 home。

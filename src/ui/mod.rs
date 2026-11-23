@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod chrome;
 pub mod dwm;
+pub mod reorder;
 pub mod settings;
 pub mod tabbar;
 pub mod view;
@@ -344,6 +345,10 @@ pub(crate) struct App {
     /// Flat list of saved folders, painted on the toolbar row and toggled from
     /// the tab context menu. Loaded at startup, saved atomically on change.
     bookmarks: BookmarkStore,
+    /// Pending press / active drag for toolbar bookmark chips. Shares the tab
+    /// strip's `reorder` state machine — only the slot geometry differs.
+    bookmark_press: Option<reorder::Press>,
+    bookmark_drag: Option<reorder::Drag>,
 }
 
 pub struct MainWindow {
@@ -643,6 +648,8 @@ impl App {
             tab_press: None,
             settings_panel: settings::SettingsPanel::new(),
             bookmarks: BookmarkStore::open(crate::bookmarks::bookmarks_path()),
+            bookmark_press: None,
+            bookmark_drag: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -759,12 +766,30 @@ impl App {
                     let _ = DeleteDC(mem);
                 }
                 self.tabbar.paint(hdc, w);
-                chrome::paint(hdc, w, TABBAR_HEIGHT, &self.cfg.get(), self.bookmarks.items());
+                chrome::paint(
+                    hdc,
+                    w,
+                    TABBAR_HEIGHT,
+                    &self.cfg.get(),
+                    self.bookmarks.items(),
+                    self.bookmark_drag.map(|d| {
+                        (d.from, chrome::clamped_drag_left(d.raw, w))
+                    }),
+                );
                 return;
             }
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
             self.tabbar.paint(mem, w);
-            chrome::paint(mem, w, TABBAR_HEIGHT, &self.cfg.get(), self.bookmarks.items());
+            chrome::paint(
+                mem,
+                w,
+                TABBAR_HEIGHT,
+                &self.cfg.get(),
+                self.bookmarks.items(),
+                self.bookmark_drag.map(|d| {
+                    (d.from, chrome::clamped_drag_left(d.raw, w))
+                }),
+            );
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));
@@ -1308,6 +1333,73 @@ impl App {
         };
         tracing::info!(path = ?bm.path, "bookmark opened");
         self.new_tab(bm.path);
+    }
+
+    /// A left press on a bookmark chip: remember a stable key (the chip index)
+    /// and the press x, exactly like `begin_tab_press`. The key is re-resolved
+    /// on drag so a reorder mid-press cannot retarget the wrong chip.
+    fn begin_bookmark_press(&mut self, index: usize, x: i32) {
+        self.bookmark_press = Some(reorder::Press { key: index as u64, x });
+    }
+
+    /// Mouse move while a bookmark chip may be held. Mirrors `tab_drag_track`
+    /// with the bookmark bar's slot geometry; the actual landing decision is
+    /// the same `reorder` code the tab strip uses.
+    fn bookmark_drag_track(&mut self, x: i32) -> bool {
+        if let Some(press) = self.bookmark_press {
+            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+            if !reorder::crossed(press.x, x, threshold) {
+                return false;
+            }
+            self.bookmark_press = None;
+            let from = press.key as usize;
+            let width = self.client().right;
+            // Only visible chips can be dragged; guard against a resize that
+            // shrank the bar between press and drag.
+            let visible = chrome::visible_bookmarks(width, self.bookmarks.items().len());
+            if from >= visible {
+                return false;
+            }
+            let left = chrome::slot_x(from);
+            self.bookmark_drag = Some(reorder::Drag::new(from, press.x, left));
+            unsafe {
+                SetCapture(self.main_hwnd);
+            }
+        }
+        let Some(mut d) = self.bookmark_drag else {
+            return false;
+        };
+        d.move_to(x);
+        let width = self.client().right;
+        let visible = chrome::visible_bookmarks(width, self.bookmarks.items().len());
+        if let Some(to) = d.landing(
+            chrome::slot_width(),
+            chrome::slot_gap(),
+            chrome::slot_origin(),
+            visible,
+        ) {
+            let from = d.from;
+            if self.bookmarks.move_to(from, to) {
+                d.set_from(to);
+                tracing::info!(from, to, "bookmark reordered");
+            }
+        }
+        self.bookmark_drag = Some(d);
+        self.invalidate_band();
+        true
+    }
+
+    /// Drop the held bookmark chip. The model already holds the final order.
+    fn end_bookmark_drag(&mut self) {
+        self.bookmark_press = None;
+        if self.bookmark_drag.is_none() {
+            return;
+        }
+        self.bookmark_drag = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.invalidate_band();
     }
 
     /// Bookmark chip context menu "取消收藏": delete the saved item and
@@ -2548,7 +2640,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // there would switch the capture to non-client and start emitting
             // WM_NCMOUSEMOVE — the tab would freeze mid-air until the button
             // was released.
-            if app.tabbar.drag().is_some() {
+            if app.tabbar.drag().is_some() || app.bookmark_drag.is_some() {
                 return LRESULT(HTCLIENT as isize);
             }
             let hit = app.tabbar.hit(pt.x, pt.y, cr.right);
@@ -2649,7 +2741,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
                 let total = app.bookmarks.items().len();
                 if let Some(i) = chrome::hit_bookmark(x, y, width, total) {
-                    app.open_bookmark(i);
+                    // Remember the press; a click opens on LBUTTONUP, a drag
+                    // reorders. Same shape as the tab strip's press/drag.
+                    app.begin_bookmark_press(i, x);
                 }
                 return LRESULT(0);
             }
@@ -2741,19 +2835,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // crossed here, the reorder happens on the spot (the model is the
         // truth; the strip only paints the tab under the cursor).
         WM_MOUSEMOVE => {
-            let app = app_from(hwnd);
             let (x, _y) = point_from_lparam(lp);
-            app.tab_drag_track(x);
+            let app = app_from(hwnd);
+            if !app.tab_drag_track(x) {
+                // Both rows share the same gesture; only one can be active.
+                app.bookmark_drag_track(x);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            app_from(hwnd).end_tab_drag();
+            let (_x, y) = point_from_lparam(lp);
+            let app = app_from(hwnd);
+            // Snapshot the pending press BEFORE the end helpers clear it. A
+            // press released without crossing the drag threshold is a click.
+            let pending_press = app.bookmark_press.take();
+            let was_dragging = app.bookmark_drag.is_some();
+            app.end_tab_drag();
+            app.end_bookmark_drag();
+            if !was_dragging {
+                if let Some(press) = pending_press {
+                    let width = app.client().right;
+                    let index = press.key as usize;
+                    if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y)
+                        && index < chrome::visible_bookmarks(width, app.bookmarks.items().len())
+                    {
+                        app.open_bookmark(index);
+                    }
+                }
+            }
             LRESULT(0)
         }
         // Capture stolen (Alt+Tab, a modal, another window grabbing the
-        // mouse): drop the drag instead of leaving a tab glued to the cursor.
+        // mouse): drop the drag instead of leaving a tab/chip glued to cursor.
         WM_CAPTURECHANGED => {
-            app_from(hwnd).end_tab_drag();
+            let app = app_from(hwnd);
+            app.end_tab_drag();
+            app.end_bookmark_drag();
             LRESULT(0)
         }
         // Middle click on a tab closes it (spec §3.1).
