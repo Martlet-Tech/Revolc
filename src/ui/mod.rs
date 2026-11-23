@@ -113,6 +113,8 @@ const CMD_TAB_CLOSE_OTHERS: usize = 0x8003;
 const CMD_TAB_CLOSE_RIGHT: usize = 0x8004;
 const CMD_TAB_NEW_AFTER: usize = 0x8005;
 const CMD_TAB_BOOKMARK: usize = 0x8006;
+const CMD_BOOKMARK_OPEN: usize = 0x8007;
+const CMD_BOOKMARK_REMOVE: usize = 0x8008;
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -1308,6 +1310,18 @@ impl App {
         self.new_tab(bm.path);
     }
 
+    /// Bookmark chip context menu "取消收藏": delete the saved item and
+    /// repaint the toolbar so the chip disappears immediately.
+    fn remove_bookmark(&mut self, index: usize) {
+        let Some(bm) = self.bookmarks.items().get(index).cloned() else {
+            return;
+        };
+        if self.bookmarks.remove_at(index) {
+            tracing::info!(path = ?bm.path, "bookmark removed via chip menu");
+            self.refresh_band();
+        }
+    }
+
     /// Close every tab except `keep`. Iterate in reverse so removing a tab
     /// never shifts the index of one we have not visited yet.
     fn close_other_tabs(&mut self, keep: usize) {
@@ -1645,7 +1659,16 @@ impl App {
     }
 
     fn active_folder_path(&mut self) -> String {
-        self.folder_path_of(self.tabs.active_index())
+        let active = self.tabs.active_index();
+        // A Painted tab (e.g. settings) has no filesystem folder. Opening a
+        // new tab from there must not try to spawn Explorer at the literal
+        // label "设置" (seen in 2026-11-23 logs as
+        // `explorer spawned for absorb path="设置"`). Fall back to home.
+        if !self.views.get(active).map(|v| v.as_hosted().is_some()).unwrap_or(false) {
+            tracing::debug!(tab = active, "active tab is not a folder, new tab uses home");
+            return home_dir();
+        }
+        self.folder_path_of(active)
     }
 
     /// May this window adopt a folder window that just appeared?
@@ -2354,6 +2377,26 @@ unsafe fn show_tab_context_menu(
     cmd.0 as usize
 }
 
+/// Context menu for a bookmark chip on the toolbar row. Unlike the tab menu
+/// this one manages the saved item itself: open here, open in a new window,
+/// or remove (取消收藏). Modal — the caller must not hold `&mut App`.
+unsafe fn show_bookmark_context_menu(hwnd: HWND, screen: POINT) -> usize {
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+    let _ = AppendMenuW(menu, MF_STRING, CMD_BOOKMARK_OPEN, w!("打开此收藏(&O)"));
+    let _ = AppendMenuW(menu, MF_STRING, CMD_BOOKMARK_REMOVE, w!("取消收藏(&R)"));
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenuEx(
+        menu,
+        TPM_RETURNCMD.0,
+        screen.x,
+        screen.y,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    cmd.0 as usize
+}
+
 fn point_from_lparam(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 as u16) as i16 as i32;
     let y = ((lp.0 >> 16) as u16) as i16 as i32;
@@ -2733,19 +2776,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // target correct even if a sweep reorders views while the menu is up.
         WM_RBUTTONUP => {
             let (x, y) = point_from_lparam(lp);
-            // Phase 1: gather target + screen point + bookmark state, then
-            // DROP the app borrow before the modal menu loop.
-            let (hit_index, screen, bookmarked) = {
+            // Phase 1: gather target + screen point + menu kind, then DROP the
+            // app borrow before the modal menu loop. Two kinds of target:
+            //   * a bookmark chip on the toolbar row -> bookmark menu
+            //   * a tab (or empty strip)               -> tab menu
+            let (hit_index, screen, bookmarked, bm_index) = {
                 let app = app_from(hwnd);
                 let width = app.client().right;
-                let idx = match app.tabbar.hit(x, y, width) {
-                    tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
-                        .tabbar
-                        .ids()
-                        .get(i)
-                        .copied()
-                        .and_then(|id| app.index_of(id)),
-                    _ => None,
+                // The toolbar row is split from the tab strip: a right click
+                // there hits a bookmark chip, not a tab.
+                let bm = if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+                    chrome::hit_bookmark(x, y, width, app.bookmarks.items().len())
+                } else {
+                    None
+                };
+                let idx = if bm.is_none() {
+                    match app.tabbar.hit(x, y, width) {
+                        tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => app
+                            .tabbar
+                            .ids()
+                            .get(i)
+                            .copied()
+                            .and_then(|id| app.index_of(id)),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 // Painted tabs (settings) have no folder — don't offer to
                 // bookmark them. Only Hosted tabs are real folders.
@@ -2764,16 +2820,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 });
                 let mut pt = POINT { x, y };
                 let _ = ClientToScreen(hwnd, &mut pt);
-                (idx, pt, marked)
+                (idx, pt, marked, bm)
             };
             // Phase 2: modal loop — no &mut App alive here.
-            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some(), bookmarked);
+            let cmd = if bm_index.is_some() {
+                show_bookmark_context_menu(hwnd, screen)
+            } else {
+                show_tab_context_menu(hwnd, screen, hit_index.is_some(), bookmarked)
+            };
             // Phase 3: re-acquire and dispatch.
             if cmd != 0 {
                 let app = app_from(hwnd);
                 // Re-resolve by id in case the list shifted during the loop.
                 let idx = hit_index;
                 match cmd {
+                    CMD_BOOKMARK_OPEN => {
+                        if let Some(i) = bm_index {
+                            app.open_bookmark(i);
+                        }
+                    }
+                    CMD_BOOKMARK_REMOVE => {
+                        if let Some(i) = bm_index {
+                            app.remove_bookmark(i);
+                        }
+                    }
                     CMD_TAB_NEW_WINDOW => {
                         if let Some(i) = idx {
                             app.move_tab_to_new_window(i);

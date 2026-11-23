@@ -48,8 +48,13 @@
      - 交互：标签右键「收藏此标签页 / 取消收藏」（只对 Hosted 文件夹 tab 出现，
        用实时 BHO 路径，设置页不提供）；工具栏行左起画书签芯片（92px 固定宽、
        自适应数量、省略号截断），点芯片新开 tab；右端设置齿轮不变。
-     - 范围外：文件夹层级、右键管理菜单、pin（四期）。当前实现未设数量上限，
-       窗口宽度决定可见芯片数，超出的等窗口变宽才显示。
+     - 书签芯片右键菜单（同分支补做）：「打开此收藏 / 取消收藏」——直接从收藏栏
+       管理，不必先打开成 tab 再右键。`BookmarkStore::remove_at(index)` 按芯片索引删。
+     - 顺带修：设置页（Painted tab）活动时新建 tab 曾把字面量"设置"当文件夹
+       路径 spawn（log 实锤 `explorer spawned for absorb path="设置"`）；
+       `active_folder_path` 现在对非 Hosted tab 回退 home。
+     - 范围外：文件夹层级、pin（四期）。当前实现未设数量上限，窗口宽度决定
+       可见芯片数，超出的等窗口变宽才显示。
    - ⬜ 四期：固定标签页(pin)。
    **「重新打开关闭的标签页」明确不做**（浏览器式 reopen 需要 close stack：在 `close_tab`
    里存 path+label，还得跟 discard/reserve 竞态协调；当前 `Tab` 被直接丢弃，无此基础设施）。

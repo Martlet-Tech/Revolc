@@ -52,10 +52,12 @@
   2026-11-23 前的"独立 owned popup `[bookmarks].enabled` 开关"已废除，见
   `docs/Chrome一体化与设置页改造计划.md`；工具栏右端是设置入口（六边形图标）
 - 工具栏左起画真实书签芯片（92px 固定宽、按窗口宽度决定可见数、长标签省略号）；
-  点芯片在该窗口新开 tab。无书签时显示"右键收藏"提示
+  点芯片在该窗口新开 tab；**右键芯片**弹「打开此收藏 / 取消收藏」，直接从收藏栏
+  管理。无书签时显示"右键收藏"提示
 - 书签 = 文件系统路径（`Bookmark { label, path }` 扁平列表）；标签右键
   「收藏此标签页 / 取消收藏」用实时 BHO 路径，Painted（设置）页不提供。
-  **文件夹层级、右键管理菜单后置**（四期之后）
+  **文件夹层级后置**（四期之后）；设置页活动时新建 tab 回退 home 而非把
+  "设置"当路径 spawn
 - 保存格式：JSON（schema 带 `version=1` 便于迁移），文件名 `bookmarks.json`，
   与 `revolc.toml` 同在 `%APPDATA%\revolc\`。路径按大小写/斜杠/尾分隔符归一化去重
 - 原子替换：`.tmp` → `sync_all` → `MoveFileExW(REPLACE_EXISTING)`；损坏/未来版本

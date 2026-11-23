@@ -97,6 +97,17 @@ impl BookmarkStore {
         true
     }
 
+    /// Remove the bookmark at `index` (as painted on the toolbar). Used by the
+    /// chip's context menu, which identifies its target by chip index.
+    pub fn remove_at(&mut self, index: usize) -> bool {
+        if index >= self.items.len() {
+            return false;
+        }
+        self.items.remove(index);
+        self.save();
+        true
+    }
+
     fn reload(&mut self) {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
@@ -205,6 +216,22 @@ mod tests {
         assert_eq!(reopened.items().len(), 1);
         assert_eq!(reopened.items()[0].label, "Projects");
         assert_eq!(reopened.items()[0].path, "D:\\Projects");
+    }
+
+    #[test]
+    fn remove_at_deletes_by_chip_index() {
+        let mut store = BookmarkStore::open(temp_path("remove_at"));
+        for b in store.items().to_vec() {
+            let _ = store.remove(&b.path);
+        }
+        assert!(store.add("one", "C:\\one"));
+        assert!(store.add("two", "C:\\two"));
+        assert!(store.add("three", "C:\\three"));
+        assert!(store.remove_at(1));
+        let paths: Vec<_> = store.items().iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(paths, ["C:\\one", "C:\\three"]);
+        assert!(!store.remove_at(99), "out-of-range index is a no-op");
+        assert_eq!(store.items().len(), 2);
     }
 
     #[test]
