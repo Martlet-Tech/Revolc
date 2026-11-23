@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 use crate::config::Config;
 use crate::ui::reorder::Drag;
 use crate::ui::{caption, icon};
+use super::gdi::rgb;
 
 pub const TAB_MAX_W: i32 = 190;
 /// Floor for the per-tab width. Tabs share whatever the fixed furniture leaves
@@ -132,7 +133,7 @@ impl TabBar {
     pub fn restyle(&mut self, cfg: &Config) {
         let c = |f: &dyn Fn(&crate::config::Theme) -> &str| {
             let (r, g, b) = cfg.color(f);
-            COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32) // COLORREF = 0x00BBGGRR
+            rgb(r, g, b)
         };
         self.bg = c(&|t| &t.tabbar_background);
         self.active_bg = c(&|t| &t.tab_active);

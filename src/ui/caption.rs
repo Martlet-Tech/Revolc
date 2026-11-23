@@ -18,9 +18,10 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, FillRect, LineTo, MoveToEx, SelectObject, HDC,
-    HGDIOBJ, PS_SOLID,
+    CreatePen, CreateSolidBrush, DeleteObject, FillRect, SelectObject, HDC, HGDIOBJ, PS_SOLID,
 };
+
+use super::gdi::line;
 /// Height of the caption band, i.e. the whole tab bar. Windows' own caption is
 /// 31–32px at 100% DPI; 34 leaves room for a full-height tab plus its rounding.
 pub const HEIGHT: i32 = 34;
@@ -148,11 +149,6 @@ unsafe fn glyph(hdc: HDC, b: Button, rc: &RECT, color: COLORREF, maximized: bool
     }
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(pen.0));
-}
-
-unsafe fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
-    let _ = MoveToEx(hdc, x1, y1, None);
-    let _ = LineTo(hdc, x2, y2);
 }
 
 unsafe fn box_outline(hdc: HDC, l: i32, t: i32, r: i32, b: i32) {

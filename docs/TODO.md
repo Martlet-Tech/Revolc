@@ -61,6 +61,16 @@
        （复用主题 `tab_hover` 配色）。`tabbar.rs` 加 `hover_plus` 状态与 setter；
        App 的 `update_hover` 按垂直分区解析 tab/+/书签三种 hover（互斥），
        拖拽期间抑制、离开窗口 `clear_hover` 清除、书签增删后清索引防错位。
+     - **UI 交互一致性审查（同分支补做）**：五个 chrome 控件里此前只有设置齿轮
+       缺悬停反馈，本轮补上（App `settings_hover`，工具栏右端命中时填 `tab_hover`
+       底色，与 caption 按钮一致）。同时消除两类重复：① 新建 `src/ui/gdi.rs`
+       收敛 `rgb()`（RGB→COLORREF 0x00BBGGRR，原散落 4 文件 11 处）与 `line()`
+       （caption/chrome 各一份）；② `chrome::paint` 的交互状态打包为
+       `PaintState{drag,hover,settings_hover}`，App 统一用 `chrome_paint_state()`
+       构造（原两处 paint 路径各写一遍）。
+     - **审查发现但未做（待定）**：设置页（Painted tab）右侧的设置行没有悬停
+       反馈——左侧分类有选中态、右侧行没有；且 Painted 页目前不接收
+       WM_MOUSEMOVE 路由。属于新一层交互，未在本次 chrome 条一致性范围内。
      - 顺带修：设置页（Painted tab）活动时新建 tab 曾把字面量"设置"当文件夹
        路径 spawn（log 实锤 `explorer spawned for absorb path="设置"`）；
        `active_folder_path` 现在对非 Hosted tab 回退 home。

@@ -7,15 +7,16 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, LineTo,
-    MoveToEx, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT,
-    DT_SINGLELINE, DT_VCENTER, HDC, HGDIOBJ, PS_SOLID, TRANSPARENT,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, SelectObject,
+    SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HDC, HGDIOBJ, PS_SOLID, TRANSPARENT,
 };
 
 use crate::bookmarks::Bookmark;
 use crate::config::Config;
 
 use super::caption;
+use super::gdi::{line, rgb};
 
 /// Geometry of one bookmark chip. Fixed width keeps paint and hit-test
 /// perfectly in sync (no GDI text measurement needed), at the cost of a
@@ -134,26 +135,34 @@ pub fn is_chrome_double_click(y: i32) -> bool {
     y < super::TABBAR_HEIGHT
 }
 
+/// Transient interaction state of the toolbar row, gathered by the caller
+/// once and passed to the painter. Keeping it in one value avoids a growing
+/// parameter list as new affordances are added.
+#[derive(Clone, Copy, Default)]
+pub struct PaintState {
+    /// `(index, left)` of a chip held by the pointer: skipped in its slot and
+    /// drawn last at `left` (the data model is already reordered).
+    pub drag: Option<(usize, i32)>,
+    /// Chip under the pointer, painted with the hover fill.
+    pub hover: Option<usize>,
+    /// Whether the right-end settings gear is under the pointer.
+    pub settings_hover: bool,
+}
+
 /// Paint the toolbar row. `top` is where the row starts (= TABBAR_HEIGHT).
 /// Bookmarks are drawn left-to-right as chips; the settings glyph owns the
 /// right edge. With no bookmarks a hint reminds the user where to add them.
-///
-/// `drag` is `(index, left)` of a chip held by the pointer: it is skipped in
-/// its slot and drawn last at `left`, above its neighbours (the data model has
-/// already been reordered, exactly like the tab strip's drag).
-/// `hover_index` is the chip under the pointer, painted with the hover fill.
 pub unsafe fn paint(
     hdc: HDC,
     width: i32,
     top: i32,
     cfg: &Config,
     bookmarks: &[Bookmark],
-    drag: Option<(usize, i32)>,
-    hover_index: Option<usize>,
+    state: PaintState,
 ) {
     let height = super::BOOKMARK_HEIGHT;
     let (r, g, b) = cfg.color(|t| &t.bookmark_bar_background);
-    let bg = COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32);
+    let bg = rgb(r, g, b);
     let brush = CreateSolidBrush(bg);
     let row = RECT { left: 0, top, right: width, bottom: top + height };
     let _ = FillRect(hdc, &row, brush);
@@ -164,13 +173,13 @@ pub unsafe fn paint(
     let _ = SetBkMode(hdc, TRANSPARENT);
 
     let (cr, cg, cb) = cfg.color(|t| &t.tab_active);
-    let chip = COLORREF((cb as u32) << 16 | (cg as u32) << 8 | cr as u32);
+    let chip = rgb(cr, cg, cb);
     let (ir, ig, ib) = cfg.color(|t| &t.tab_text_active);
-    let ink = COLORREF((ib as u32) << 16 | (ig as u32) << 8 | ir as u32);
+    let ink = rgb(ir, ig, ib);
     let (hr, hg, hb) = cfg.color(|t| &t.tab_hover);
-    let hover = COLORREF((hb as u32) << 16 | (hg as u32) << 8 | hr as u32);
+    let hover = rgb(hr, hg, hb);
     let (hir, hig, hib) = cfg.color(|t| &t.tab_text);
-    let hover_ink = COLORREF((hib as u32) << 16 | (hig as u32) << 8 | hir as u32);
+    let hover_ink = rgb(hir, hig, hib);
 
     let n = visible_bookmarks(width, bookmarks.len());
     if n == 0 {
@@ -179,17 +188,17 @@ pub unsafe fn paint(
         let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
         let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
         let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
-        let _ = SetTextColor(hdc, COLORREF((tb as u32) << 16 | (tg as u32) << 8 | tr as u32));
+        let _ = SetTextColor(hdc, rgb(tr, tg, tb));
         let mut text = RECT { left: 10, top, right: settings_button_x(width) - 4, bottom: top + height };
         let mut label: Vec<u16> = "收藏夹：在标签上点右键即可收藏".encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
         for (i, bm) in bookmarks.iter().take(n).enumerate() {
-            if drag.map(|d| d.0 == i).unwrap_or(false) {
+            if state.drag.map(|d| d.0 == i).unwrap_or(false) {
                 continue; // drawn last, at the pointer position
             }
             if let Some(rect) = bookmark_rect(i, width) {
-                if hover_index == Some(i) {
+                if state.hover == Some(i) {
                     paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
                 } else {
                     paint_chip(hdc, &rect, &bm.label, chip, ink);
@@ -197,7 +206,7 @@ pub unsafe fn paint(
             }
         }
         // Held chip last, on top, with a lifted fill.
-        if let Some((index, left)) = drag {
+        if let Some((index, left)) = state.drag {
             if let Some(bm) = bookmarks.get(index) {
                 let rect = RECT {
                     left,
@@ -212,7 +221,19 @@ pub unsafe fn paint(
     let _ = SelectObject(hdc, old_font);
 
     // Settings glyph at the right edge, drawn with the same 1px-line approach
-    // as the caption buttons (no font dependency, DPI-stable).
+    // as the caption buttons (no font dependency, DPI-stable). Hover lights
+    // the whole button cell, matching the caption buttons' feedback.
+    if state.settings_hover {
+        let cell = RECT {
+            left: settings_button_x(width),
+            top,
+            right: width,
+            bottom: top + height,
+        };
+        let brush = CreateSolidBrush(hover);
+        let _ = FillRect(hdc, &cell, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
     let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
     paint_hexagon(
         hdc,
@@ -220,7 +241,7 @@ pub unsafe fn paint(
         top,
         super::SETTINGS_BTN_W,
         height,
-        COLORREF((sb as u32) << 16 | (sg as u32) << 8 | sr as u32),
+        rgb(sr, sg, sb),
     );
 }
 
@@ -275,11 +296,6 @@ unsafe fn paint_hexagon(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORRE
     line(hdc, cx - 1, cy, cx + 1, cy);
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(pen.0));
-}
-
-unsafe fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
-    let _ = MoveToEx(hdc, x1, y1, None);
-    let _ = LineTo(hdc, x2, y2);
 }
 
 #[cfg(test)]

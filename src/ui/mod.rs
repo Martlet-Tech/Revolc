@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod chrome;
 pub mod dwm;
+pub mod gdi;
 pub mod reorder;
 pub mod settings;
 pub mod tabbar;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
@@ -351,6 +352,8 @@ pub(crate) struct App {
     bookmark_drag: Option<reorder::Drag>,
     /// Chip under the pointer on the toolbar row; painted with the hover fill.
     bookmark_hover: Option<usize>,
+    /// Whether the right-end settings gear is under the pointer.
+    settings_hover: bool,
 }
 
 pub struct MainWindow {
@@ -653,6 +656,7 @@ impl App {
             bookmark_press: None,
             bookmark_drag: None,
             bookmark_hover: None,
+            settings_hover: false,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -717,8 +721,8 @@ impl App {
             return;
         }
         let rc = self.client();
-        let (r, g, bl) = self.cfg.get().color(|t| &t.window_border);
-        let color = COLORREF((bl as u32) << 16 | (g as u32) << 8 | r as u32);
+        let (r, g, border_rgb_b) = self.cfg.get().color(|t| &t.window_border);
+        let color = gdi::rgb(r, g, border_rgb_b);
         let strips = [
             RECT { left: 0, top: 0, right: rc.right, bottom: b },
             RECT { left: 0, top: rc.bottom - b, right: rc.right, bottom: rc.bottom },
@@ -775,10 +779,7 @@ impl App {
                     TABBAR_HEIGHT,
                     &self.cfg.get(),
                     self.bookmarks.items(),
-                    self.bookmark_drag.map(|d| {
-                        (d.from, chrome::clamped_drag_left(d.raw, w))
-                    }),
-                    self.bookmark_hover,
+                    self.chrome_paint_state(w),
                 );
                 return;
             }
@@ -790,10 +791,7 @@ impl App {
                 TABBAR_HEIGHT,
                 &self.cfg.get(),
                 self.bookmarks.items(),
-                self.bookmark_drag.map(|d| {
-                    (d.from, chrome::clamped_drag_left(d.raw, w))
-                }),
-                self.bookmark_hover,
+                self.chrome_paint_state(w),
             );
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
@@ -875,6 +873,18 @@ impl App {
             // invalidate the window that actually paints them.
             let target = if self.tabbar_hwnd.0.is_null() { self.main_hwnd } else { self.tabbar_hwnd };
             let _ = InvalidateRect(target, Some(&band), false);
+        }
+    }
+
+    /// Gather the toolbar row's transient interaction state in one value,
+    /// shared by both paint paths (with and without a back buffer).
+    fn chrome_paint_state(&self, width: i32) -> chrome::PaintState {
+        chrome::PaintState {
+            drag: self.bookmark_drag.map(|d| {
+                (d.from, chrome::clamped_drag_left(d.raw, width))
+            }),
+            hover: self.bookmark_hover,
+            settings_hover: self.settings_hover,
         }
     }
 
@@ -972,22 +982,23 @@ impl App {
         let want = caption::hit(x, y, width);
         // The tab strip and the toolbar row are mutually exclusive vertical
         // bands. Resolve one hit and feed each painter only its own state.
-        let (over_tab, over_plus, over_bookmark) = if y < TABBAR_HEIGHT {
+        let (over_tab, over_plus, over_bookmark, over_settings) = if y < TABBAR_HEIGHT {
             match self.tabbar.hit(x, y, width) {
-                tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => (Some(i), false, None),
-                tabbar::Hit::Plus => (None, true, None),
-                _ => (None, false, None),
+                tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => (Some(i), false, None, false),
+                tabbar::Hit::Plus => (None, true, None, false),
+                _ => (None, false, None, false),
             }
         } else if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
             let total = self.bookmarks.items().len();
-            let over_settings = chrome::hit_settings(x, y, width);
+            let settings = chrome::hit_settings(x, y, width);
             (
                 None,
                 false,
-                if over_settings { None } else { chrome::hit_bookmark(x, y, width, total) },
+                if settings { None } else { chrome::hit_bookmark(x, y, width, total) },
+                settings,
             )
         } else {
-            (None, false, None)
+            (None, false, None, false)
         };
         let maximized = self.is_maximized();
         let active = self.active;
@@ -1002,10 +1013,18 @@ impl App {
             self.bookmark_hover = over_bookmark;
             dirty = true;
         }
+        if self.settings_hover != over_settings {
+            self.settings_hover = over_settings;
+            dirty = true;
+        }
         if dirty {
             self.invalidate_band();
         }
-        if (want.is_some() || over_tab.is_some() || over_plus || over_bookmark.is_some())
+        if (want.is_some()
+            || over_tab.is_some()
+            || over_plus
+            || over_bookmark.is_some()
+            || over_settings)
             && !self.hover_tracking
         {
             self.hover_tracking = true;
@@ -1042,6 +1061,10 @@ impl App {
             dirty = true;
         }
         if self.bookmark_hover.take().is_some() {
+            dirty = true;
+        }
+        if self.settings_hover {
+            self.settings_hover = false;
             dirty = true;
         }
         if dirty {
@@ -3080,7 +3103,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let (r, g, b) = app.cfg.get().color(|t| &t.tabbar_background);
             unsafe {
-                let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
+                let brush = CreateSolidBrush(gdi::rgb(r, g, b));
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let _ = FillRect(HDC(wp.0 as *mut _), &rc, brush);

@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::Config;
 
+use super::gdi::rgb;
+
 const RAIL_W: i32 = 140;
 const ROW_H: i32 = 52;
 const ROW_GAP: i32 = 8;
@@ -119,7 +121,7 @@ impl SettingsPanel {
 
     fn color(cfg: &Config, key: impl FnOnce(&crate::config::Theme) -> &str) -> COLORREF {
         let (r, g, b) = cfg.color(key);
-        COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32)
+        rgb(r, g, b)
     }
 
     /// Pick legible text on an arbitrary background: light bg -> dark ink and
