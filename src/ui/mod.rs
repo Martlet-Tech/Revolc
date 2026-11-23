@@ -368,8 +368,6 @@ pub(crate) struct App {
     /// Measured card + screen position, computed when content changes.
     tooltip_layout: Option<tooltip::Layout>,
     tooltip_at: POINT,
-    /// Fonts for the card; released with the App (stock title + owned small).
-    tooltip_fonts: tooltip::Fonts,
 }
 
 pub struct MainWindow {
@@ -727,7 +725,6 @@ impl App {
             tooltip_content: None,
             tooltip_layout: None,
             tooltip_at: POINT { x: 0, y: 0 },
-            tooltip_fonts: unsafe { tooltip::Fonts::new() },
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -1063,13 +1060,15 @@ impl App {
             return;
         };
         unsafe {
-            tooltip::paint(hdc, content, &self.cfg.get(), layout, &self.tooltip_fonts);
+            tooltip::paint(hdc, content, &self.cfg.get(), layout);
         }
     }
 
     /// Show a tooltip anchored at a point in main-window client coordinates.
-    /// `None` hides it. Content changes are measured on the popup's own DC so
-    /// the font metrics match exactly what `paint_tooltip` will draw.
+    /// `None` hides it. The position is computed once when the content first
+    /// appears and then locked: moving the pointer within the same chip/tab
+    /// does not drag the card around (the behaviour of browsers, VS Code and
+    /// WorkBuddy itself). Only a different target re-anchors it.
     fn set_tooltip(&mut self, content: Option<tooltip::Content>, anchor_client: POINT) {
         if self.tooltip_hwnd.0.is_null() {
             return;
@@ -1082,11 +1081,8 @@ impl App {
             }
             return;
         };
-        // Same card -> just follow the pointer, no re-measure/repaint needed.
+        // Same target -> keep the locked position, do not follow the pointer.
         if self.tooltip_content.as_ref() == Some(&content) {
-            self.tooltip_at = self.tooltip_screen_anchor(anchor_client);
-            let Some(layout) = self.tooltip_layout else { return };
-            self.move_tooltip(layout, self.tooltip_at);
             return;
         }
 
@@ -1095,7 +1091,7 @@ impl App {
             if hdc.is_invalid() {
                 return;
             }
-            let layout = tooltip::measure(hdc, &content, &self.tooltip_fonts);
+            let layout = tooltip::measure(hdc, &content);
             let _ = ReleaseDC(self.tooltip_hwnd, hdc);
 
             // Round the popup itself so no square corner shows behind the
@@ -1155,10 +1151,11 @@ impl App {
         }
     }
 
-    /// Build the tooltip content for the current hover targets. Single line for
-    /// caption buttons and the gear; two lines (title + full path) for tabs and
-    /// bookmark chips. Paths come from the tab model — never `folder_path_of`,
-    /// which consumes cached BHO pushes and would corrupt navigation on hover.
+    /// Build the tooltip content for the current hover targets. Always one
+    /// line: the full path for tabs and bookmark chips, a short label for the
+    /// caption buttons and the gear. Paths come from the tab model — never
+    /// `folder_path_of`, which consumes cached BHO pushes and would corrupt
+    /// navigation on hover.
     fn hover_tooltip(
         &self,
         caption_btn: Option<caption::Button>,
@@ -1169,16 +1166,14 @@ impl App {
     ) -> Option<tooltip::Content> {
         if let Some(i) = over_bookmark {
             let bm = self.bookmarks.items().get(i)?;
-            let title = if bm.label.is_empty() { short_label(&bm.path) } else { bm.label.clone() };
-            return Some(tooltip::Content::TwoLine { title, path: bm.path.clone() });
+            return Some(tooltip::Content(bm.path.clone()));
         }
         if let Some(i) = over_tab {
             let tab = self.tabs.get(i)?;
-            let title = if tab.label.is_empty() { short_label(&tab.path) } else { tab.label.clone() };
-            return Some(tooltip::Content::TwoLine { title, path: tab.path.clone() });
+            return Some(tooltip::Content(tab.path.clone()));
         }
         if over_settings {
-            return Some(tooltip::Content::Single("设置".into()));
+            return Some(tooltip::Content("设置".into()));
         }
         let label = match caption_btn? {
             caption::Button::Minimize => "最小化",
@@ -1186,7 +1181,7 @@ impl App {
             caption::Button::Maximize => "最大化",
             caption::Button::Close => "关闭",
         };
-        Some(tooltip::Content::Single(label.into()))
+        Some(tooltip::Content(label.into()))
     }
 
     /// Track which caption button the cursor is over. Driven from

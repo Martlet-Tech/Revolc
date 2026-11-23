@@ -1,14 +1,14 @@
 //! Self-drawn tooltip card for the chrome strip.
 //!
-//! A top-level owned popup (see `ui/mod.rs`) paints this card below the
-//! pointer. Two shapes:
-//! * `Single` — one line, used by the caption buttons and the settings gear;
-//! * `TwoLine` — title + small full path, used by bookmark chips and tabs.
+//! A top-level owned popup (see `ui/mod.rs`) paints a single line of text
+//! below the pointer: the full path for bookmark chips and tabs, a short
+//! label for the caption buttons and the settings gear. One font throughout —
+//! the stock GUI font — so long paths stay readable.
 //!
 //! Layout is split into pure functions (`card_size`, `place`) so the geometry
 //! can be unit-tested without a window. `measure` is the only part that needs
 //! an HDC (font metrics); `paint` consumes the measured `Layout`, keeping the
-//! text rectangles identical between measuring and drawing.
+//! text rectangle identical between measuring and drawing.
 //!
 //! Theme colours are borrowed from the existing palette — no new config keys.
 //! Contrast is derived from the card background so every bundled preset stays
@@ -16,10 +16,10 @@
 
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRgn,
-    FrameRgn, GetObjectW, GetStockObject, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT,
-    DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
-    HGDIOBJ, HFONT, HRGN, LOGFONTW, TRANSPARENT,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRgn, FrameRgn,
+    GetStockObject, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_CALCRECT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, HFONT,
+    HRGN, TRANSPARENT,
 };
 
 use crate::config::Config;
@@ -31,13 +31,11 @@ const PAD_X: i32 = 10;
 const PAD_Y: i32 = 7;
 /// Extra width beyond the measured text. `DrawTextW` with DT_END_ELLIPSIS
 /// treats "text width == rect width" as overflow and drops glyphs for the
-/// ellipsis; a slack keeps short titles/paths intact without a visible gap.
+/// ellipsis; a slack keeps short labels intact without a visible gap.
 const TEXT_SLACK: i32 = 12;
-/// Gap between the title and the path on a two-line card.
-const GAP: i32 = 2;
 /// Corner radius of the rounded card.
 const RADIUS: i32 = 6;
-/// Upper bound on card width; long paths get an ellipsis instead of a
+/// Upper bound on card width; very long paths get an ellipsis instead of a
 /// screen-wide banner.
 const MAX_W: i32 = 480;
 /// Lower bound so an empty label still yields a visible card.
@@ -47,79 +45,27 @@ const OFFSET: i32 = 16;
 /// Extra inset when a card is flipped to avoid the monitor edge.
 const EDGE: i32 = 4;
 
-/// What the tooltip shows.
+/// What the tooltip shows — always a single line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Content {
-    /// One line (caption buttons, settings gear).
-    Single(String),
-    /// Title + small full path (bookmark chips, tabs).
-    TwoLine { title: String, path: String },
+pub struct Content(pub String);
+
+/// The one font used by the card (system-owned, never destroyed).
+unsafe fn font() -> HFONT {
+    HFONT(GetStockObject(DEFAULT_GUI_FONT).0)
 }
 
-/// Fonts used by the card. The title font is the stock GUI font (system-owned,
-/// never destroyed); the small font is ours and released on drop.
-pub struct Fonts {
-    title: HFONT,
-    small: HFONT,
-}
-
-impl Fonts {
-    /// # Safety
-    /// Calls GDI object queries; `DEFAULT_GUI_FONT` is always available.
-    pub unsafe fn new() -> Self {
-        let stock = GetStockObject(DEFAULT_GUI_FONT);
-        let title = HFONT(stock.0);
-        let mut lf = LOGFONTW::default();
-        GetObjectW(
-            HGDIOBJ(title.0),
-            std::mem::size_of::<LOGFONTW>() as i32,
-            Some(&mut lf as *mut _ as *mut _),
-        );
-        // Shrink the GUI font by ~20%, but keep it at least 9px tall so the
-        // path stays legible at 100% DPI.
-        let base = lf.lfHeight.abs().max(11);
-        lf.lfHeight = -((base * 4 / 5).max(9));
-        let small = CreateFontIndirectW(&lf);
-        let small = if small.is_invalid() { title } else { small };
-        Self { title, small }
-    }
-
-    pub fn title(&self) -> HFONT {
-        self.title
-    }
-
-    pub fn small(&self) -> HFONT {
-        self.small
-    }
-}
-
-impl Drop for Fonts {
-    fn drop(&mut self) {
-        if self.small.0 != self.title.0 {
-            let _ = unsafe { DeleteObject(HGDIOBJ(self.small.0)) };
-        }
-    }
-}
-
-/// Measured card: outer size plus the text rectangles, shared by paint.
+/// Measured card: outer size plus the text rectangle, shared by paint.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout {
     pub size: SIZE,
-    pub first: RECT,
-    pub second: Option<RECT>,
+    pub text: RECT,
 }
 
-/// Pure: derive the card size from the two measured text extents.
-pub fn card_size(first: SIZE, second: Option<SIZE>) -> SIZE {
-    match second {
-        Some(s) => SIZE {
-            cx: (first.cx.max(s.cx) + PAD_X * 2 + TEXT_SLACK).clamp(MIN_W, MAX_W),
-            cy: PAD_Y + first.cy + GAP + s.cy + PAD_Y,
-        },
-        None => SIZE {
-            cx: (first.cx + PAD_X * 2 + TEXT_SLACK).clamp(MIN_W, MAX_W),
-            cy: PAD_Y + first.cy + PAD_Y,
-        },
+/// Pure: derive the card size from the measured text extent.
+pub fn card_size(text: SIZE) -> SIZE {
+    SIZE {
+        cx: (text.cx + PAD_X * 2 + TEXT_SLACK).clamp(MIN_W, MAX_W),
+        cy: PAD_Y + text.cy + PAD_Y,
     }
 }
 
@@ -144,8 +90,9 @@ pub fn place(anchor: POINT, size: SIZE, work: RECT) -> POINT {
 /// disagree about glyph widths. DT_CALCRECT returns the required rect without
 /// drawing; the flags match `paint` minus the ellipsis (which must not affect
 /// the measurement of a string that is going to fit).
-unsafe fn text_size(hdc: HDC, text: &str, font: HFONT) -> SIZE {
-    let old = SelectObject(hdc, HGDIOBJ(font.0));
+unsafe fn text_size(hdc: HDC, text: &str) -> SIZE {
+    let f = font();
+    let old = SelectObject(hdc, HGDIOBJ(f.0));
     let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     let _ = DrawTextW(
@@ -158,31 +105,20 @@ unsafe fn text_size(hdc: HDC, text: &str, font: HFONT) -> SIZE {
     SIZE { cx: rc.right - rc.left, cy: rc.bottom - rc.top }
 }
 
-/// Measure the card with the given HDC and fonts.
+/// Measure the card with the given HDC.
 ///
 /// # Safety
-/// `hdc` and the fonts must be valid for the duration of the call.
-pub unsafe fn measure(hdc: HDC, content: &Content, fonts: &Fonts) -> Layout {
-    let (first_text, second_text) = match content {
-        Content::Single(text) => (text.as_str(), None),
-        Content::TwoLine { title, path } => (title.as_str(), Some(path.as_str())),
-    };
-    let first_sz = text_size(hdc, first_text, fonts.title());
-    let second_sz = second_text.map(|t| text_size(hdc, t, fonts.small()));
-    let size = card_size(first_sz, second_sz);
-    let first = RECT {
+/// `hdc` must be valid for the duration of the call.
+pub unsafe fn measure(hdc: HDC, content: &Content) -> Layout {
+    let text_sz = text_size(hdc, &content.0);
+    let size = card_size(text_sz);
+    let text = RECT {
         left: PAD_X,
         top: PAD_Y,
         right: size.cx - PAD_X,
-        bottom: PAD_Y + first_sz.cy,
+        bottom: PAD_Y + text_sz.cy,
     };
-    let second = second_sz.map(|s| RECT {
-        left: PAD_X,
-        top: first.bottom + GAP,
-        right: size.cx - PAD_X,
-        bottom: first.bottom + GAP + s.cy,
-    });
-    Layout { size, first, second }
+    Layout { size, text }
 }
 
 /// Linear blend between two `COLORREF`s (`t = 0` → `a`, `t = 1` → `b`).
@@ -199,13 +135,12 @@ fn mix(a: COLORREF, b: COLORREF, t: i32) -> COLORREF {
 /// Paint the card into `hdc` at local origin (0,0), sized by `layout`.
 ///
 /// # Safety
-/// `hdc` and the fonts must be valid for the duration of the call.
-pub unsafe fn paint(hdc: HDC, content: &Content, cfg: &Config, layout: Layout, fonts: &Fonts) {
+/// `hdc` must be valid for the duration of the call.
+pub unsafe fn paint(hdc: HDC, content: &Content, cfg: &Config, layout: Layout) {
     let (r, g, b) = cfg.color(|t| &t.tabbar_background);
     let bg = rgb(r, g, b);
     let ink = gdi::contrast_text(bg);
     let border = mix(bg, ink, 35);
-    let dim = mix(bg, ink, 78);
 
     let _ = SetBkMode(hdc, TRANSPARENT);
 
@@ -225,34 +160,17 @@ pub unsafe fn paint(hdc: HDC, content: &Content, cfg: &Config, layout: Layout, f
     let _ = DeleteObject(HGDIOBJ(border_brush.0));
     let _ = DeleteObject(HGDIOBJ(rgn.0));
 
-    let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-    match content {
-        Content::Single(text) => {
-            let old_font = SelectObject(hdc, HGDIOBJ(fonts.title().0));
-            let _ = SetTextColor(hdc, ink);
-            let mut rc = layout.first;
-            let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-            let _ = DrawTextW(hdc, &mut wide, &mut rc, flags);
-            SelectObject(hdc, old_font);
-        }
-        Content::TwoLine { title, path } => {
-            let old_font = SelectObject(hdc, HGDIOBJ(fonts.title().0));
-            let _ = SetTextColor(hdc, ink);
-            let mut rc = layout.first;
-            let mut wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-            let _ = DrawTextW(hdc, &mut wide, &mut rc, flags);
-            SelectObject(hdc, old_font);
-
-            if let Some(second) = layout.second {
-                let old_font = SelectObject(hdc, HGDIOBJ(fonts.small().0));
-                let _ = SetTextColor(hdc, dim);
-                let mut rc = second;
-                let mut wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-                let _ = DrawTextW(hdc, &mut wide, &mut rc, flags);
-                SelectObject(hdc, old_font);
-            }
-        }
-    }
+    let old_font = SelectObject(hdc, HGDIOBJ(font().0));
+    let _ = SetTextColor(hdc, ink);
+    let mut rc = layout.text;
+    let mut wide: Vec<u16> = content.0.encode_utf16().chain(Some(0)).collect();
+    let _ = DrawTextW(
+        hdc,
+        &mut wide,
+        &mut rc,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old_font);
 }
 
 #[cfg(test)]
@@ -260,24 +178,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_card_is_one_line_tall() {
-        let sz = card_size(SIZE { cx: 80, cy: 16 }, None);
+    fn card_is_one_line_tall() {
+        let sz = card_size(SIZE { cx: 80, cy: 16 });
         assert_eq!(sz.cy, PAD_Y * 2 + 16);
         assert_eq!(sz.cx, 80 + PAD_X * 2 + TEXT_SLACK);
     }
 
     #[test]
-    fn two_line_card_stacks_title_and_path() {
-        let sz = card_size(SIZE { cx: 60, cy: 16 }, Some(SIZE { cx: 200, cy: 12 }));
-        assert_eq!(sz.cy, PAD_Y * 2 + 16 + GAP + 12);
-        assert_eq!(sz.cx, 200 + PAD_X * 2 + TEXT_SLACK);
-    }
-
-    #[test]
     fn card_width_is_capped() {
-        let sz = card_size(SIZE { cx: 2000, cy: 16 }, None);
+        let sz = card_size(SIZE { cx: 2000, cy: 16 });
         assert_eq!(sz.cx, MAX_W);
-        assert!(card_size(SIZE { cx: 1, cy: 16 }, None).cx >= MIN_W);
+        assert!(card_size(SIZE { cx: 1, cy: 16 }).cx >= MIN_W);
     }
 
     #[test]
