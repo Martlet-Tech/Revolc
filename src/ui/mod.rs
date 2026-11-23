@@ -2600,13 +2600,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        // Double click on the empty strip = maximize / restore, matching what
-        // a real caption does (the window class needs CS_DBLCLKS for this).
+        // Double click on the empty *chrome* strip = maximize / restore,
+        // matching what a real caption does (the class needs CS_DBLCLKS).
+        // Only the band ABOVE the view rect counts: a double-click on a
+        // Painted page (settings) or in a folder view must not maximize the
+        // window. tabbar.hit() reports Band for every y >= TABBAR_HEIGHT, so
+        // without the y guard the whole content area toggled maximize.
         WM_LBUTTONDBLCLK => {
             let app = app_from(hwnd);
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
-            if app.tabbar.hit(x, y, width) == tabbar::Hit::Band {
+            if chrome::is_chrome_double_click(y)
+                && app.tabbar.hit(x, y, width) == tabbar::Hit::Band
+            {
                 app.toggle_maximize();
             }
             LRESULT(0)

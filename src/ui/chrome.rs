@@ -55,6 +55,14 @@ pub fn route_click(y: i32, painted_active: bool) -> ClickRoute {
     }
 }
 
+/// Only a double-click in the chrome band may toggle maximize. The tab bar's
+/// hit test reports `Band` for the whole content area (y >= TABBAR_HEIGHT),
+/// so double-clicking a painted settings page would otherwise maximize the
+/// window. Gate on the chrome band first.
+pub fn is_chrome_double_click(y: i32) -> bool {
+    y < super::CHROME_HEIGHT
+}
+
 /// Paint the toolbar row. `top` is where the row starts (= TABBAR_HEIGHT).
 pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config) {
     let height = super::BOOKMARK_HEIGHT;
@@ -152,5 +160,14 @@ mod tests {
         let y = CHROME_HEIGHT + 10;
         assert_eq!(route_click(y, true), ClickRoute::PaintedPage);
         assert_eq!(route_click(y, false), ClickRoute::FolderView);
+    }
+
+    #[test]
+    fn double_click_in_view_rect_never_maximizes() {
+        // Regression: tabbar.hit() reports Band for y >= TABBAR_HEIGHT, so a
+        // double-click on the settings page used to toggle maximize.
+        assert!(is_chrome_double_click(caption::HEIGHT / 2));
+        assert!(!is_chrome_double_click(CHROME_HEIGHT));
+        assert!(!is_chrome_double_click(CHROME_HEIGHT + 50));
     }
 }

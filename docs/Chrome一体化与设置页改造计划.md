@@ -216,3 +216,5 @@ PaintedPage（开放枚举）
 **修复**：路由改为先按垂直分段（`chrome::route_click(y, painted_active)`）——y < CHROME_HEIGHT(62) 一律归 chrome（caption 按钮 + 标签 + 工具栏），只有 view_rect 内（y≥62）才在 Painted tab 时交给设置面板。加了 3 个回归单测覆盖"设置页活动时 caption 行仍归 chrome"。
 
 **教训**：输入路由必须按**空间区域**分段，不能按"当前页面类型"一刀切吞掉所有消息。
+
+**同类瑕疵（已修复）**：双击设置页空白会让窗口在最大化/还原间切换。`WM_LBUTTONDBLCLK` 里 `tabbar.hit()` 对 y ≥ TABBAR_HEIGHT 一律返回 `Band`，导致内容区双击也触发 `toggle_maximize()`。修复：加 `chrome::is_chrome_double_click(y)`（y < CHROME_HEIGHT）门禁，只有 chrome 带的双击才 toggle。同样加了回归单测。
