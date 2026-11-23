@@ -52,12 +52,28 @@ impl SettingsPanel {
         COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32)
     }
 
+    /// Pick legible text on an arbitrary background: light bg -> dark ink and
+    /// vice versa. The theme's tab_text is tuned for tabs, not for this page,
+    /// so we derive contrast instead of reusing it blindly.
+    fn ink_on(bg: COLORREF) -> COLORREF {
+        let r = (bg.0 & 0xff) as u32;
+        let g = ((bg.0 >> 8) & 0xff) as u32;
+        let b = ((bg.0 >> 16) & 0xff) as u32;
+        let luma = r * 299 / 1000 + g * 587 / 1000 + b * 114 / 1000;
+        if luma > 128 {
+            COLORREF(0x0010_1010) // near-black
+        } else {
+            COLORREF(0x00F5_F5F5) // near-white
+        }
+    }
+
     /// Paint the settings page into `rc` (already the view rect).
     pub unsafe fn paint(&self, hdc: HDC, rc: RECT, cfg: &Config) {
         let bg = Self::color(cfg, |t| &t.tabbar_background);
         let fill = Self::color(cfg, |t| &t.tab_active);
-        let ink = Self::color(cfg, |t| &t.tab_text);
         let rail_bg = Self::color(cfg, |t| &t.bookmark_bar_background);
+        let page_ink = Self::ink_on(bg);
+        let rail_ink = Self::ink_on(rail_bg);
 
         // Whole page background + left rail.
         let brush = CreateSolidBrush(bg);
@@ -87,9 +103,9 @@ impl SettingsPanel {
                 let brush = CreateSolidBrush(fill);
                 let _ = FillRect(hdc, &row, brush);
                 let _ = DeleteObject(HGDIOBJ(brush.0));
-                let _ = SetTextColor(hdc, Self::color(cfg, |t| &t.tab_text_active));
+                let _ = SetTextColor(hdc, Self::ink_on(fill));
             } else {
-                let _ = SetTextColor(hdc, ink);
+                let _ = SetTextColor(hdc, rail_ink);
             }
             let mut text = row;
             text.left += 12;
@@ -107,21 +123,21 @@ impl SettingsPanel {
         let mut y = rc.top + 40;
         match self.category {
             0 => {
-                self.text(hdc, pane_left, &mut y, rc.right - 24, "常规", cfg, true);
+                self.text(hdc, pane_left, &mut y, rc.right - 24, "常规", page_ink, true);
                 self.row(hdc, pane_left, &mut y, rc.right - 24, "接管模式", &self.takeover_value(cfg), cfg);
                 self.row(hdc, pane_left, &mut y, rc.right - 24, "标签圆角", &cfg.theme.tab_radius.to_string(), cfg);
-                self.note(hdc, pane_left, &mut y, rc.right - 24, "点击行右侧的值可切换", cfg);
+                self.note(hdc, pane_left, &mut y, rc.right - 24, "点击行右侧的值可切换", page_ink);
             }
             1 => {
-                self.text(hdc, pane_left, &mut y, rc.right - 24, "主题", cfg, true);
+                self.text(hdc, pane_left, &mut y, rc.right - 24, "主题", page_ink, true);
                 self.row(hdc, pane_left, &mut y, rc.right - 24, "配色预设", &self.theme_preset_name(cfg), cfg);
                 self.row(hdc, pane_left, &mut y, rc.right - 24, "标签圆角", &cfg.theme.tab_radius.to_string(), cfg);
-                self.note(hdc, pane_left, &mut y, rc.right - 24, "配色与圆角改动会立即生效", cfg);
+                self.note(hdc, pane_left, &mut y, rc.right - 24, "配色与圆角改动会立即生效", page_ink);
             }
             _ => {
-                self.text(hdc, pane_left, &mut y, rc.right - 24, "关于 Revolc", cfg, true);
-                self.note(hdc, pane_left, &mut y, rc.right - 24, "把 Windows 资源管理器改造成多标签浏览器", cfg);
-                self.note(hdc, pane_left, &mut y, rc.right - 24, "Clover 的原生重制版 · MPL-2.0", cfg);
+                self.text(hdc, pane_left, &mut y, rc.right - 24, "关于 Revolc", page_ink, true);
+                self.note(hdc, pane_left, &mut y, rc.right - 24, "把 Windows 资源管理器改造成多标签浏览器", page_ink);
+                self.note(hdc, pane_left, &mut y, rc.right - 24, "Clover 的原生重制版 · MPL-2.0", page_ink);
             }
         }
 
@@ -136,18 +152,18 @@ impl SettingsPanel {
         y: &mut i32,
         right: i32,
         s: &str,
-        cfg: &Config,
+        ink: COLORREF,
         heading: bool,
     ) {
-        let _ = SetTextColor(hdc, Self::color(cfg, |t| &t.tab_text_active));
+        let _ = SetTextColor(hdc, ink);
         let mut rc = RECT { left: x, top: *y, right, bottom: *y + (if heading { 30 } else { 24 }) };
         let mut wide: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         *y += if heading { 36 } else { 28 };
     }
 
-    unsafe fn note(&self, hdc: HDC, x: i32, y: &mut i32, right: i32, s: &str, cfg: &Config) {
-        let _ = SetTextColor(hdc, Self::color(cfg, |t| &t.tab_text));
+    unsafe fn note(&self, hdc: HDC, x: i32, y: &mut i32, right: i32, s: &str, ink: COLORREF) {
+        let _ = SetTextColor(hdc, ink);
         let mut rc = RECT { left: x, top: *y, right, bottom: *y + 24 };
         let mut wide: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -157,10 +173,11 @@ impl SettingsPanel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn row(&self, hdc: HDC, x: i32, y: &mut i32, right: i32, label: &str, value: &str, cfg: &Config) {
         let rc = RECT { left: x, top: *y, right, bottom: *y + ROW_H };
-        let brush = CreateSolidBrush(Self::color(cfg, |t| &t.tab_inactive));
+        let row_bg = Self::color(cfg, |t| &t.tab_inactive);
+        let brush = CreateSolidBrush(row_bg);
         let _ = FillRect(hdc, &rc, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
-        let _ = SetTextColor(hdc, Self::color(cfg, |t| &t.tab_text_active));
+        let _ = SetTextColor(hdc, Self::ink_on(row_bg));
         let mut lrc = RECT { left: x + 12, top: *y, right: x + 180, bottom: *y + ROW_H };
         let mut lwide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut lwide, &mut lrc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);

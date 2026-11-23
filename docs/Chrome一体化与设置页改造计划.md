@@ -196,5 +196,13 @@ PaintedPage（开放枚举）
 | 计划文档 + 分支 | ✅ 完成 | 2026-11-23 | `409471a` |
 | A · View 抽象 | ✅ 完成 | 2026-11-23 | `ee3e1af` · 20 tests pass |
 | B · 一体绘制 + 设置按钮 | ✅ 完成 | 2026-11-23 | `56d7dc0` · 20 tests pass |
-| C · 设置页内容 | ⬜ 待开始 | | |
-| D · 收尾验证 | ⬜ 待开始 | | |
+| C · 设置页内容 | ✅ 完成 | 2026-11-23 | `7963ae2` · 23 tests pass |
+| D · 收尾验证 | ✅ 完成 | 2026-11-23 | 配色对比修复 + README/TODO 更新 · release build OK · 23 tests pass |
+
+## 七、实施后记（2026-11-23）
+
+- 阶段 A：`Option<Absorbed>` → `View { Pending, Hosted, Painted }`，约 18 处遍历逐处按语义改写；`expire_reserved` 只数 Pending、`tab_by_label_tail` 只匹配 Hosted 是关键陷阱，均已处理。
+- 阶段 B：合并两个 owned popup 为一个 62px chrome popup，`view_rect.top` 固定；收藏栏"可隐藏"从此消失，右端齿轮走 `chrome::hit_settings`。
+- 阶段 C：`SettingsPanel` 三类设置，点击值切换；`set_toml_value` 按行写回保留注释；写入后现有 watcher 自动热刷新。设置页文字颜色用亮度自适应（`ink_on`），避免深色字画在深绿底上。
+- 已知限制（本次范围外）：设置页暂无键盘导航；收藏目录仍是占位文字（TODO Phase 3）；主题预设只有绿/深灰蓝两档；设置页关闭走 `Ctrl+W`（keymap 无 Esc 绑定）。
+- `cargo fmt --check` 报告的是仓库原有文件的格式差异，本次未做全局格式化以免污染无关文件。
