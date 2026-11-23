@@ -9,6 +9,16 @@
 > `ui/view.rs`（`Pending / Hosted / Painted`）与 `docs/Chrome一体化与设置页改造计划.md`。
 > 本文件下面的历史项仍有效；其中「收藏栏可关闭」相关描述已被本次改动取代。
 
+> **2026-11-23 下午 · 设置项集中化（未提交，工作区）**：所有用户可见设置由
+> `common/src/settings.rs::SettingId` 单一注册，新增 3 项：
+> ① `[tray].autostart`（HKCU Run，任务管理器「启动应用」可见，启动 `revolc.exe`）；
+> ② `[tray].enabled` 实时显隐托盘（关闭后托盘进程退出，主程序在重新打开时拉起）；
+> ③ `[tray].close_action`（`exit` / `hide`；hide 只在托盘可见时生效，窗口 X 变为
+> `SW_HIDE`，托盘「窗口列表」发 `WM_APP_RESTORE` 恢复）。`SettingId` 持有
+> section/key/校验/cycle/预设编辑，设置页从 `SettingId::ALL` 生成行，不再硬编码
+> `(section,key,value)`。主题预设迁至 `common/src/theme_presets.rs`。
+> 真相源仍是 TOML：在任务管理器禁用自启项后，下次配置变更会把 Run 项写回。
+
 ## P0 — 已知缺陷
 
 1. **启动期吸收「已打开的窗口」是串行的，每个窗口约 100–150ms**

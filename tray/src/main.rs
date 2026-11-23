@@ -13,14 +13,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use revolc_common::config::{config_path, ConfigHandle};
 use revolc_common::ledger::Ledger;
-use revolc_common::messages::{absorb_msg, WM_APP_QUIT, WM_APP_TRAY};
+use revolc_common::messages::{absorb_msg, WM_APP_QUIT, WM_APP_RESTORE, WM_APP_TRAY};
 use revolc_common::takeover::ensure_bho_registered;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -38,9 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
     GetMessageW, GetWindowTextW, IsWindow, LoadCursorW, MF_SEPARATOR, MF_STRING,
     MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    ShowWindow, TrackPopupMenuEx, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    TrackPopupMenuEx, TranslateMessage, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
-    WNDCLASSEXW, SW_RESTORE, TPM_RETURNCMD, IDC_ARROW,
+    WNDCLASSEXW, TPM_RETURNCMD, IDC_ARROW,
 };
 
 const TRAY_CLASS: PCWSTR = w!("RevolcResident");
@@ -56,6 +56,9 @@ static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 static EXE_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Set when the config watcher asks the tray to hide, so WM_APP_QUIT knows to
+/// keep BHO registration (takeover stays on) instead of tearing everything down.
+static HIDDEN_BY_CONFIG: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     revolc_common::crash::install();
@@ -376,14 +379,22 @@ unsafe fn popup_window_list(hwnd: HWND) -> Option<HWND> {
     }
 }
 
-unsafe fn quit(hwnd: HWND, unregister: bool) {
+/// Tear down the tray. The two flags are independent:
+/// - `unregister_bho`: menu `--shutdown` disables takeover; a config-driven
+///   hide or logoff must leave the registration intact.
+/// - `quit_windows`: tell window processes to restore their panes. A config
+///   hide must NOT do this (the user's folders stay open), but logoff/shutdown
+///   must (otherwise Explorer keeps dangling refs to re-parented windows).
+unsafe fn quit(hwnd: HWND, unregister_bho: bool, quit_windows: bool) {
     tray_icon_remove(hwnd);
     unhook();
-    if unregister {
+    if unregister_bho {
         ensure_bho_registered("off");
     }
-    for (h, _) in our_windows() {
-        let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+    if quit_windows {
+        for (h, _) in our_windows() {
+            let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+        }
     }
     if let Some(l) = LEDGER.get() {
         if let Ok(l) = l.lock() {
@@ -410,11 +421,29 @@ fn spawn_config_watcher(cfg: Arc<ConfigHandle>) -> Option<RecommendedWatcher> {
                 }
                 last = now;
                 cfg.reload();
-                let new_mode = cfg.get().takeover.mode.clone();
+                let snapshot = cfg.get();
+                let new_mode = snapshot.takeover.mode.clone();
                 if new_mode != mode {
                     tracing::info!(%new_mode, "takeover mode changed, re-registering BHO");
                     ensure_bho_registered(&new_mode);
                     mode = new_mode;
+                }
+                // Tray hidden from the settings page: leave the process so the
+                // icon and foreground hook disappear. The main process will
+                // spawn us again if the user turns it back on.
+                if !snapshot.tray.enabled {
+                    tracing::info!("tray disabled in config, exiting");
+                    HIDDEN_BY_CONFIG.store(true, Ordering::SeqCst);
+                    // Win32 windows are thread-affine: ask the tray thread to
+                    // quit via its message loop, never call DestroyWindow here.
+                    // HWND is not Send, so read it from the atomic instead of
+                    // capturing it in this watcher closure.
+                    let raw = TRAY_HWND.load(Ordering::SeqCst);
+                    if raw != 0 {
+                        unsafe {
+                            let _ = PostMessageW(HWND(raw as _), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+                        }
+                    }
                 }
             }
             Err(e) => tracing::error!(error = %e, "config watcher error"),
@@ -448,8 +477,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     CMD_WINDOW_LIST => {
                         if let Some(target) = popup_window_list(hwnd) {
                             if IsWindow(target).as_bool() {
-                                let _ = ShowWindow(target, SW_RESTORE);
-                                let _ = SetForegroundWindow(target);
+                                // Ask the window to surface itself: it knows
+                                // whether it is hidden (close="hide") or
+                                // minimized, and keeps its maximized state.
+                                let _ = PostMessageW(
+                                    target,
+                                    WM_APP_RESTORE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
                             }
                         }
                     }
@@ -458,7 +494,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
                         }
                     }
-                    CMD_EXIT => quit(hwnd, true),
+                    CMD_EXIT => quit(hwnd, true, true),
                     _ => {}
                 },
                 _ => {}
@@ -466,12 +502,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         m if m == WM_APP_QUIT => {
-            quit(hwnd, true);
+            // CLI --shutdown / menu exit tears down takeover (unregister BHO);
+            // a config-driven hide only removes the icon, leaving takeover on.
+            let hidden = HIDDEN_BY_CONFIG.swap(false, Ordering::SeqCst);
+            quit(hwnd, !hidden, !hidden);
             LRESULT(0)
         }
         WM_ENDSESSION => {
             if wp.0 != 0 {
-                quit(hwnd, false);
+                // Logoff: keep the BHO registered (it will be inert after
+                // reboot anyway) but must tell windows to restore their panes.
+                quit(hwnd, false, true);
             }
             LRESULT(0)
         }

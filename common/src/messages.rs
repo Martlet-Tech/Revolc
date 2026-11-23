@@ -9,6 +9,8 @@ use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 pub const WM_APP_QUIT: u32 = 0x8010;
 /// Tray icon callback (private to the tray window).
 pub const WM_APP_TRAY: u32 = 0x8004;
+/// Tray -> hidden window: show it again (close button set to "hide").
+pub const WM_APP_RESTORE: u32 = 0x8011;
 /// BHO → Revolc: "a folder window was created". Registered so every process
 /// sees the same ID, including the low-integrity Explorer/BHO process.
 pub fn absorb_msg() -> u32 {

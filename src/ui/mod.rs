@@ -66,10 +66,12 @@ use revolc_common::ledger::Ledger;
 use self::view::{PaintedPage, View};
 
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
-/// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
-/// to the tray in redirect mode, so shutdown paths (tray is direct, console
-/// handler and `--shutdown` post this) need their own message.
+/// Quit for real: restore every absorbed window and exit. Shutdown paths
+/// (tray, console handler, `--shutdown`) post this; WM_CLOSE only hides when
+/// the close action is "hide".
 pub const WM_APP_QUIT: u32 = 0x8010;
+/// Tray -> hidden window: show it again. Must match common::messages.
+pub const WM_APP_RESTORE: u32 = 0x8011;
 /// WM_COPYDATA tag from the BHO for navigation events ("RNAV"). Payload is
 /// UTF-8 "HWND<TAB>url"; must match NAV_COPYDATA_TAG in bho/src/nav.rs.
 const NAV_COPYDATA_TAG: usize = 0x524E4156;
@@ -2376,9 +2378,11 @@ impl App {
         tracing::info!(tab = at, "settings tab opened");
     }
 
-    /// Apply a settings-panel click. Config writes go through `set_toml_value`
-    /// (line-preserving), and the existing watcher repaints both the settings
-    /// tab and the main window via WM_APP_CONFIG_CHANGED.
+    /// Apply a settings-panel click. The value, validation and TOML keys all
+    /// come from the `SettingId` registry; this method only reads the current
+    /// config, asks the registry for the next value, and writes the file once.
+    /// The watcher repaints both the settings tab and the main window via
+    /// WM_APP_CONFIG_CHANGED.
     fn handle_settings_hit(&mut self, hit: settings::SettingsHit) {
         use settings::SettingsHit::*;
         match hit {
@@ -2390,47 +2394,24 @@ impl App {
                     self.invalidate_view();
                 }
             }
-            TakeoverMode => {
-                let next = if self.cfg.get().takeover.mode == "redirect" { "off" } else { "redirect" };
-                self.write_config("takeover", "mode", &format!("\"{next}\""));
-            }
-            TabRadius => {
-                let cur = self.cfg.get().theme.tab_radius;
-                let next = match cur { 0 => 4, 4 => 6, 6 => 10, _ => 0 };
-                self.write_config("theme", "tab_radius", &next.to_string());
-            }
-            ThemePreset => {
-                // Cycle between the two COMPLETE colour schemes in one file
-                // write. Writing a partial set used to leave a green/grey
-                // hybrid (the "3 shapes" bug); one write also means one
-                // watcher reload, so there is no half-applied visible state.
-                let next = match settings::current_preset(&self.cfg.get()) {
-                    Some("绿色") => settings::DARK_THEME,
-                    _ => settings::GREEN_THEME,
+            Setting(id) => {
+                let path = self.cfg.path().clone();
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "settings: failed to read config");
+                        return;
+                    }
                 };
-                self.write_config_values(next);
+                match revolc_common::settings::apply(&self.cfg.get(), &text, id) {
+                    Ok(updated) => {
+                        if let Err(e) = std::fs::write(&path, updated) {
+                            tracing::error!(error = %e, "settings: failed to write config");
+                        }
+                    }
+                    Err(label) => tracing::warn!(setting = label, "settings: invalid value rejected"),
+                }
             }
-        }
-    }
-
-    fn write_config(&self, section: &str, key: &str, value: &str) {
-        self.write_config_values(&[(section, key, value)]);
-    }
-
-    /// Apply a batch of config edits with a single read-modify-write, so the
-    /// watcher sees one change and the user never sees a half-applied theme.
-    fn write_config_values(&self, edits: &[(&str, &str, &str)]) {
-        let path = self.cfg.path().clone();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(error = %e, "settings: failed to read config");
-                return;
-            }
-        };
-        let updated = crate::config::set_toml_values(&text, edits);
-        if let Err(e) = std::fs::write(&path, updated) {
-            tracing::error!(error = %e, "settings: failed to write config");
         }
     }
 
@@ -3378,6 +3359,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
+            // "hide" close action: the window just disappears from view; its
+            // tabs and absorbed panes stay alive, and the tray can bring it
+            // back with WM_APP_RESTORE. Only meaningful with the tray visible
+            // (otherwise there is no way to restore), and `next_edits`
+            // already forces "exit" when the tray is off — check again here
+            // so a stale config can never strand a hidden window.
+            let hide = {
+                let app = app_from(hwnd);
+                app.cfg.get().tray.close_action == "hide" && app.cfg.get().tray.enabled
+            };
+            if hide {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                tracing::info!("window hidden to tray");
+                return LRESULT(0);
+            }
+
             // Browser semantics (docs/双进程架构设计.md): several tabs → ask
             // first; confirming closes every FE window, then the frame. The
             // released-panes table keeps any survivor from re-adopting them.
@@ -3401,6 +3398,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+            LRESULT(0)
+        }
+        m if m == WM_APP_RESTORE => {
+            // Close button set to "hide": the tray asked us to come back.
+            let app = app_from(hwnd);
+            app.surface();
+            let _ = SetForegroundWindow(hwnd);
             LRESULT(0)
         }
         m if m == WM_APP_QUIT => {

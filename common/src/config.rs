@@ -31,17 +31,29 @@ impl Default for Bookmarks {
     }
 }
 
-/// Tray icon (Phase 1 of docs/双进程架构设计.md). Read at startup only:
-/// changing `enabled` requires a restart until the tray becomes its own exe.
+/// Tray icon and session-level launcher.
+///
+/// `enabled` is hot-reloaded: the tray process stays alive and adds/removes the
+/// icon in place (see `tray/src/main.rs`). `autostart` is a HKCU Run entry, so
+/// Task Manager's Startup apps page shows it and the user can remove it there.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Tray {
     pub enabled: bool,
+    /// Register `revolc-tray.exe` under HKCU\...\Run.
+    pub autostart: bool,
+    /// What the window X does while the tray is visible: "exit" | "hide".
+    /// "hide" is ignored when the tray is off (there would be no way back).
+    pub close_action: String,
 }
 
 impl Default for Tray {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            autostart: false,
+            close_action: "exit".into(),
+        }
     }
 }
 
@@ -254,7 +266,11 @@ mode = "off"             # "off" | "redirect"
                          # redirect: 新 Explorer 文件夹窗口自动改由 Revolc 打开
 
 [tray]
-enabled = true           # revolc-tray.exe 是否注册/运行（改后需重启 tray）
+enabled = true           # 显示托盘图标（热更新，无需重启）
+autostart = false        # 开机自启（写入 HKCU Run，任务管理器「启动应用」可见）
+                         # 启动的是 revolc.exe；托盘按需由主程序拉起
+close_action = "exit"    # 窗口 X 的行为："exit" 退出 | "hide" 隐藏到托盘
+                         # 托盘隐藏时 "hide" 无效，强制退出
 
 [bookmarks]
 enabled = true           # 标签栏下方的收藏栏（热重载即时生效）
