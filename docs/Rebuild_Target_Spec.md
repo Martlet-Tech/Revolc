@@ -11,8 +11,8 @@
   （`revolc_bho.dll`）：Explorer 加载它后，新文件夹窗口创建时通过
   `WM_APP_ABSORB` 报告给 Revolc；此外有一个自适应后台扫描兜底（通知会丢）
 - 组件：`revolc.exe`（每窗口一进程）+ 可选 `revolc-tray.exe`（托盘遥控器，
-  不装也能用）+ 可选 BHO DLL（接管模式依赖；`[bookmarks].enabled` 时还负责
-  推送导航事件）。无浏览器内核、无常驻服务进程
+  不装也能用）+ 可选 BHO DLL（接管模式依赖；导航事件订阅由 tray 写的标记文件
+  驱动，见 TODO.md §4b）。无浏览器内核、无常驻服务进程
 - 路线变更记录（2026-11-20 对齐）：初版规格曾计划 IExplorerBrowser COM 嵌入
   且"不做运行时 re-parent"；实际实现走了**吸收真实 Explorer 窗口**的 B2 路线，
   Ribbon 等 UI 天然完整（原 §8 开放问题就此关闭）。本文以下各节已按此路线改写
@@ -45,9 +45,12 @@
 - 崩溃恢复：启动时检测上次非正常退出标志，提示"恢复上次会话"
 - 启动行为设置项：恢复上次会话 / 打开新 tab / 打开固定路径列表（对应原版 `session.restore_on_startup` 三态）
 
-### 3.3 书签栏（⬜ 三期进行中：UI 空壳已就位，模型+持久化未做）
-- tab 条下方可选书签栏（`[bookmarks].enabled`，热重载即时生效；UI 空壳已实现，
-  `ui/mod.rs` 独立 owned popup，高 28px，主题项 `bookmark_bar_background`）
+### 3.3 书签栏（⬜ 三期进行中：工具栏已就位，书签项模型+持久化未做）
+- tab 条下方的工具栏**现已与标签栏一体绘制**：同为 62px chrome 条的一部分
+  （owned popup `RevolcOwnedTabBar`，`ui/chrome.rs` 画工具栏行），**不可隐藏**。
+  2026-11-23 前的"独立 owned popup `[bookmarks].enabled` 开关"已废除，见
+  `docs/Chrome一体化与设置页改造计划.md`；工具栏右端是设置入口（六边形图标）
+- 工具栏目前仍只显示"收藏夹"占位文字，真实书签项待三期实现
 - 书签 = 文件系统路径；层级/右键管理菜单随三期数据模型一起做，范围到时候按
   TODO.md 的排期定（倾向扁平列表起步，文件夹层级后置）
 - 保存格式：JSON（自定 schema，带 version 字段便于迁移），文件名 `bookmarks.json`
@@ -67,6 +70,18 @@
 - MVP 不做键位绑定设置页，但改配置文件中的键位表即可生效
 - 默认键位沿用 §3.1 所列（Ctrl+T/Ctrl+W/Ctrl+Tab 等）
 
+### 3.6 设置页（✅ 2026-11-23 实现）
+- 入口：工具栏右端六边形按钮 → 打开一个 **Painted 标签页**（单例：已存在则激活）
+- 形态：`View::Painted(PaintedPage::Settings)`——无 HWND、由主窗口 GDI 自绘，
+  与 `Hosted`（被接管的 Explorer 窗口）并列；抽象见 `ui/view.rs`
+- 分类：常规（接管模式 off/redirect、标签圆角）/ 主题（绿 ↔ 深灰蓝预设、圆角）/ 关于
+- 写回：`config::set_toml_values` 按行替换，保留用户注释与排版；一次写入触发一次
+  watcher reload，主窗口与设置页同步刷新（**无重启**）
+- 不暴露死配置：`startup_mode` / `startup_paths` / `hover_switch`（代码从不读取）
+- 输入路由按**垂直分区**：y < 62（chrome 带：标签、caption 按钮）永远归窗口；
+  只有 view_rect（y ≥ 62）才归设置页——见 `ui/chrome.rs::route_click`
+  （踩坑：按"当前页面类型"一刀切曾导致设置页活动时窗口 X 失灵、双击误最大化）
+
 ## 4. UI 规格
 
 ### 4.0 配置文件
@@ -76,9 +91,10 @@
 - 缺省值内置，配置文件可以从零开始只有两行也能跑
 
 ### 4.1 主题
-- **运行时可改配色**：改配置文件或后续的设置页均可，立即生效、无需重启
-- 主题项至少包含：tab 条背景/前景、tab 激活/非激活色、书签栏配色、字体
-- 内置亮/暗两套预设 + 用户自定义
+- **运行时可改配色**：改配置文件或设置页均可，立即生效、无需重启
+- 主题项至少包含：tab 条背景/前景、tab 激活/非激活色、工具栏配色、字体
+- 内置两套预设（绿色 / 深灰蓝）+ 用户自定义；设置页「主题」分类里一键切换，
+  切换写完整 11 个主题键、一次落盘（见 `ui/settings.rs` 的 `GREEN_THEME`/`DARK_THEME`）
 
 ### 4.2 标签页视觉
 - 支持透明通道 + 圆角；实现层用分层窗口/自绘，Win7 等不支持的环境自动回退直角纯色
@@ -86,16 +102,20 @@
 
 ### 4.2.1 Chrome 式一体化标题栏（用户明确要求，高优先）
 - tab 条与窗口按钮（最小化 `_` / 最大化 `□` / 关闭 `X`）在同一行，浏览器风格
-- 实现方向：去掉系统标题栏（WS_POPUP + 自绘客户区 + WM_NCHITTEST 自定义拖拽/按钮区）
 - **实现于 M3 第一阶段**（2026-11-18，分支 `m3-integrated-titlebar`）：
   `WS_POPUP|WS_THICKFRAME|WS_MIN/MAXBOX|WS_SYSMENU` + `WM_NCCALCSIZE` 返回 0，
-  标题栏与 tab 条由主窗口自绘（`ui/tabbar.rs` + `ui/caption.rs`），
-  `WM_NCHITTEST` 出 `HTCAPTION`（空白条带）与缩放边框；三个标题栏按钮**按客户区自己处理**
-  （上报成 `HTMIN/MAX/CLOSE` 会走 `DefWindowProc`，无 NC 区的窗口上点击失效还会冒出白色方块）。
-  原计划放 M4，现提前；M4 只做主题化（配色/圆角半径/暗色）
+  tab 条与按钮由一个 **owned popup** 绘制（`RevolcOwnedTabBar`，`ui/tabbar.rs` +
+  `ui/caption.rs`）。注意：早期注释说"主窗口自绘"，实际代码是独立 popup——
+  owned popup 的 Z 序保证 Explorer 子窗格盖不住标题栏。
+  `WM_NCHITTEST` 由主窗口回答 `HTCAPTION`（空白条带）与缩放边框；三个标题栏按钮
+  **报 `HTCLIENT` 自己处理点击**（上报成 `HTMIN/MAX/CLOSE` 会让 Win11 Snap Layouts
+  浮层错位、吃掉点击、留白块，2026-11-18 实测）。
+- **2026-11-23 扩展**：工具栏并入同一 popup，`ui/chrome.rs` 画 28px 工具栏行，
+  整体 62px；右端加设置按钮（六边形 glyph）。见改造计划文档
 
 ### 4.3 布局
-- tab 条 + 可选书签栏 + Shell 视图填充剩余区域
+- 62px chrome 条（34px tab 行 + 28px 工具栏行）+ Shell 视图填充剩余区域；
+  `view_rect.top` 固定为 `CHROME_HEIGHT`（工具栏不可隐藏）
 - 窗口几何记忆（位置/大小/最大化状态）
 
 ## 5. 日志与故障排查
@@ -117,10 +137,12 @@
   - M3：一体化标题栏（✅ 第一阶段，分支 `m3-integrated-titlebar`）+
     ⬜ tab 拖拽分窗/合并（第二阶段，见 §3.1）
     附带完成：标签右键菜单一期、BHO 导航事件推送（TODO.md §4b）
-  - ⬜ M4：主题系统（含圆角/透明与降级）
+  - ⬜ M4：主题系统（含圆角/透明与降级）。部分完成：2026-11-23 设置页已实现
+    （主题预设/圆角/接管模式切换 + TOML 按行写回 + 热生效），见 §4.1 与 §3.6
   - ⬜ M5：安装包（x64+x86）+ 更新检查
   - ⬜ M6：文件夹打开接管（§7）——BHO 接管机制已随日常使用落地，
-    M6 剩余工作：`associate` 模式、接管开关设置页、安全软件误报的降级提示
+    M6 剩余工作：`associate` 模式、安全软件误报的降级提示
+    （接管开关设置页已随 2026-11-23 设置页落地：常规分类里切换 off/redirect）
 
 ## 7. 系统文件夹打开接管（机制已落地为 BHO；调查见 docs/Takeover_Research.md）
 

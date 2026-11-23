@@ -3,7 +3,7 @@
 > 排序 = 建议执行顺序。历史项与踩坑记录见 `../Revolc_交接文档.md`，行为规格见
 > `Rebuild_Target_Spec.md`（里程碑 M0–M6），本文件只留“还没做、以及为什么做”。
 
-> **2026-11-23 更新（分支 `feat/unified-chrome-settings`）**：收藏栏与标签栏已合并为一条
+> **2026-11-23 更新（已合并入 master，合并提交 `a9874a6`）**：收藏栏与标签栏已合并为一条
 > 62px chrome 条、不可隐藏；右端新增设置按钮，点开一个 `Painted` 设置标签页（单例），
 > 可切换接管模式 / 主题预设 / 标签圆角，改动按行写回 TOML 并热生效。抽象见
 > `ui/view.rs`（`Pending / Hosted / Painted`）与 `docs/Chrome一体化与设置页改造计划.md`。
@@ -29,6 +29,8 @@
 4b. **标签右键菜单（2026-11-20 分支 `feat/tab-context-menu`）**：
    - ✅ 一期（`f175501`）：菜单骨架 + 在新窗口打开 / 关闭 / 关其他 / 关右侧 / 右侧新建。
    - ✅ 二期（`694371f`）：收藏栏 UI 空壳（`[bookmarks] enabled` 开关，热重载；独立 owned popup）。
+     **2026-11-23 起已变更**：收藏栏并入标签栏的 62px chrome 条、不可隐藏，
+     该开关不再控制显隐；见 `docs/Chrome一体化与设置页改造计划.md`。
    - ✅ 2.5（`5879be7`~`2dc9f91`）：**BHO 导航事件推送**——DWebBrowserEvents2 订阅 +
      WM_COPYDATA 推送 + **label 匹配**。踩坑记录（重要）：
      ①DISPID 250=BeforeNavigate2，NavigateComplete2=**252**，DocumentComplete=**259**；
@@ -45,10 +47,11 @@
    若日后要做：见 `src/tabs/mod.rs::Tab` 与 `src/ui/mod.rs::close_tab`。
 5. **M3 第一阶段（已做，分支 `m3-integrated-titlebar`）：Chrome 式一体化标题栏**
    —— 窗口去掉 `WS_CAPTION`，`WM_NCCALCSIZE` 返回 0（客户区 = 窗口矩形），
-   标题栏由主窗口自绘（`ui/caption.rs` 三个按钮 + `ui/tabbar.rs` 标签条），
-   `WM_NCHITTEST` 自己回答 `HTCAPTION` / `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE`
-   + 8 条缩放边框。tab 条 34px、圆角只在顶部、底部与内容区齐平。
-   主题新增 `caption_hover` / `caption_close_hover`。
+   标题栏由 owned popup 绘制（`ui/tabbar.rs` 标签条 + `ui/caption.rs` 三个按钮），
+   `WM_NCHITTEST` 回答 `HTCAPTION`（空白条带）+ 8 条缩放边框；三个按钮报 `HTCLIENT`
+   自己处理点击（报 `HTMIN/MAX/CLOSE` 会触发 Win11 Snap Layouts 浮层错位，实测）。
+   tab 条 34px、圆角只在顶部、底部与内容区齐平。主题新增 `caption_hover` / `caption_close_hover`。
+   **2026-11-23 扩展**：工具栏并入同一 popup（总 62px），见文件头更新说明。
 5b. **标签占满行为的两条支线（未做，先记下要改哪里）**：
    a) 单行缩窄 —— 现在已经是 `TAB_MIN_W=90` / `TAB_MAX_W=190` 的折中，要更彻底地缩窄得配合文字省略策略。
    b) 多行标签 —— 需要 **band 高度动态化**。目前当成常量 34 的地方：`ui/mod.rs` 的 `TABBAR_HEIGHT`
