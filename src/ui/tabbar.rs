@@ -303,6 +303,21 @@ impl TabBar {
         GUTTER + i as i32 * (self.tab_w + TAB_GAP)
     }
 
+    /// Rectangle of tab `i` in bar-client coords. Shared with the tooltip so
+    /// the card anchors to the tab, not to where the pointer crossed its edge.
+    pub fn tooltip_rect(&self, i: usize) -> Option<RECT> {
+        if i >= self.labels.len() {
+            return None;
+        }
+        let left = self.tab_x(i);
+        Some(RECT {
+            left,
+            top: TAB_TOP,
+            right: left + self.tab_w,
+            bottom: TAB_BOTTOM,
+        })
+    }
+
     fn plus_x(&self) -> i32 {
         self.tab_x(self.labels.len())
     }

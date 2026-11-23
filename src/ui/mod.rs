@@ -365,9 +365,8 @@ pub(crate) struct App {
     tooltip_hwnd: HWND,
     /// Current tooltip content, or None when nothing is hovered.
     tooltip_content: Option<tooltip::Content>,
-    /// Measured card + screen position, computed when content changes.
+    /// Measured card, computed when the hovered target changes.
     tooltip_layout: Option<tooltip::Layout>,
-    tooltip_at: POINT,
 }
 
 pub struct MainWindow {
@@ -724,7 +723,6 @@ impl App {
             tooltip_hwnd: HWND::default(),
             tooltip_content: None,
             tooltip_layout: None,
-            tooltip_at: POINT { x: 0, y: 0 },
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -1064,16 +1062,17 @@ impl App {
         }
     }
 
-    /// Show a tooltip anchored at a point in main-window client coordinates.
-    /// `None` hides it. The position is computed once when the content first
-    /// appears and then locked: moving the pointer within the same chip/tab
-    /// does not drag the card around (the behaviour of browsers, VS Code and
-    /// WorkBuddy itself). Only a different target re-anchors it.
-    fn set_tooltip(&mut self, content: Option<tooltip::Content>, anchor_client: POINT) {
+    /// Show a tooltip for a target: its content plus the target's rectangle in
+    /// frame-client coordinates. `None` hides it. The card is anchored to the
+    /// control (below its bottom edge, left-aligned), never to the pointer —
+    /// so it appears in the same place no matter which direction the cursor
+    /// entered from. The position is computed once on first appearance and
+    /// locked while the same target stays hovered.
+    fn set_tooltip(&mut self, target: Option<(tooltip::Content, RECT)>) {
         if self.tooltip_hwnd.0.is_null() {
             return;
         }
-        let Some(content) = content else {
+        let Some((content, control_client)) = target else {
             self.tooltip_content = None;
             self.tooltip_layout = None;
             unsafe {
@@ -1101,27 +1100,32 @@ impl App {
             );
             let _ = SetWindowRgn(self.tooltip_hwnd, rgn, true);
 
+            // Control rect: strip client -> frame client (they share an
+            // origin) -> screen. ClientToScreen on the frame handles DPI and
+            // window placement in one step.
+            let mut tl = POINT { x: control_client.left, y: control_client.top };
+            let mut br = POINT { x: control_client.right, y: control_client.bottom };
+            let _ = ClientToScreen(self.main_hwnd, &mut tl);
+            let _ = ClientToScreen(self.main_hwnd, &mut br);
+            let control_screen = RECT {
+                left: tl.x,
+                top: tl.y,
+                right: br.x,
+                bottom: br.y,
+            };
+
             self.tooltip_content = Some(content);
             self.tooltip_layout = Some(layout);
-            self.tooltip_at = self.tooltip_screen_anchor(anchor_client);
-            self.move_tooltip(layout, self.tooltip_at);
+            self.move_tooltip(layout, control_screen);
             let _ = InvalidateRect(self.tooltip_hwnd, None, true);
             let _ = ShowWindow(self.tooltip_hwnd, SW_SHOWNA);
         }
     }
 
-    /// Client point on the frame -> screen point on the monitor work area.
-    fn tooltip_screen_anchor(&self, client: POINT) -> POINT {
-        let mut p = client;
-        unsafe {
-            let _ = ClientToScreen(self.main_hwnd, &mut p);
-        }
-        p
-    }
-
-    /// Position the popup at `screen`, flipping near the monitor edge and
-    /// resizing to the measured card. SWP_NOACTIVATE keeps focus untouched.
-    fn move_tooltip(&self, layout: tooltip::Layout, screen: POINT) {
+    /// Position the popup relative to `control` (screen coords), flipping near
+    /// the monitor edge and resizing to the measured card. SWP_NOACTIVATE
+    /// keeps focus untouched.
+    fn move_tooltip(&self, layout: tooltip::Layout, control: RECT) {
         unsafe {
             let monitor = MonitorFromWindow(self.main_hwnd, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
@@ -1129,7 +1133,7 @@ impl App {
                 ..Default::default()
             };
             let _ = GetMonitorInfoW(monitor, &mut mi);
-            let at = tooltip::place(screen, layout.size, mi.rcWork);
+            let at = tooltip::place(control, layout.size, mi.rcWork);
             let _ = SetWindowPos(
                 self.tooltip_hwnd,
                 HWND_TOP,
@@ -1151,37 +1155,42 @@ impl App {
         }
     }
 
-    /// Build the tooltip content for the current hover targets. Always one
-    /// line: the full path for tabs and bookmark chips, a short label for the
-    /// caption buttons and the gear. Paths come from the tab model — never
-    /// `folder_path_of`, which consumes cached BHO pushes and would corrupt
-    /// navigation on hover.
-    fn hover_tooltip(
+    /// Build the tooltip target for the current hover state: the one-line
+    /// content plus the hovered control's rectangle in strip-client coords.
+    /// The rectangle anchors the card to the control, not the pointer, so the
+    /// position is identical however the cursor approached it. Paths come
+    /// from the tab model — never `folder_path_of`, which consumes cached BHO
+    /// pushes and would corrupt navigation on hover.
+    fn hover_tooltip_target(
         &self,
         caption_btn: Option<caption::Button>,
         over_tab: Option<usize>,
         over_bookmark: Option<usize>,
         over_settings: bool,
         maximized: bool,
-    ) -> Option<tooltip::Content> {
+        width: i32,
+    ) -> Option<(tooltip::Content, RECT)> {
         if let Some(i) = over_bookmark {
             let bm = self.bookmarks.items().get(i)?;
-            return Some(tooltip::Content(bm.path.clone()));
+            let rect = chrome::bookmark_rect(i, width)?;
+            return Some((tooltip::Content(bm.path.clone()), rect));
         }
         if let Some(i) = over_tab {
             let tab = self.tabs.get(i)?;
-            return Some(tooltip::Content(tab.path.clone()));
+            let rect = self.tabbar.tooltip_rect(i)?;
+            return Some((tooltip::Content(tab.path.clone()), rect));
         }
         if over_settings {
-            return Some(tooltip::Content("设置".into()));
+            return Some((tooltip::Content("设置".into()), chrome::settings_rect(width)));
         }
-        let label = match caption_btn? {
+        let b = caption_btn?;
+        let label = match b {
             caption::Button::Minimize => "最小化",
             caption::Button::Maximize if maximized => "向下还原",
             caption::Button::Maximize => "最大化",
             caption::Button::Close => "关闭",
         };
-        Some(tooltip::Content(label.into()))
+        Some((tooltip::Content(label.into()), caption::rect(b, width)))
     }
 
     /// Track which caption button the cursor is over. Driven from
@@ -1192,7 +1201,7 @@ impl App {
         // While a row is being dragged the highlight belongs to the item in
         // hand: repainting hover fills underneath it makes the band flicker.
         if self.tabbar.drag().is_some() || self.bookmark_drag.is_some() {
-            self.set_tooltip(None, POINT { x, y });
+            self.set_tooltip(None);
             return;
         }
         let want = caption::hit(x, y, width);
@@ -1241,8 +1250,10 @@ impl App {
         // buttons and the gear get a single line; tabs and bookmark chips get
         // title + full path. Built as owned values so set_tooltip can compare
         // without borrowing self twice.
-        let tip = self.hover_tooltip(want, over_tab, over_bookmark, over_settings, maximized);
-        self.set_tooltip(tip, POINT { x, y });
+        let target = self.hover_tooltip_target(
+            want, over_tab, over_bookmark, over_settings, maximized, width,
+        );
+        self.set_tooltip(target);
 
         if (want.is_some()
             || over_tab.is_some()
@@ -1294,7 +1305,7 @@ impl App {
         if dirty {
             self.invalidate_band();
         }
-        self.set_tooltip(None, POINT { x: 0, y: 0 });
+        self.set_tooltip(None);
     }
 
     /// Index of the tab with `id`, if it still exists.
@@ -1601,7 +1612,7 @@ impl App {
         }
         // Chip count changed: a stale hover index could light up a neighbour.
         self.bookmark_hover = None;
-        self.set_tooltip(None, POINT { x: 0, y: 0 });
+        self.set_tooltip(None);
         self.refresh_band();
     }
 
@@ -1678,7 +1689,7 @@ impl App {
         }
         self.bookmark_drag = None;
         self.bookmark_hover = None;
-        self.set_tooltip(None, POINT { x: 0, y: 0 });
+        self.set_tooltip(None);
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -1694,7 +1705,7 @@ impl App {
         if self.bookmarks.remove_at(index) {
             tracing::info!(path = ?bm.path, "bookmark removed via chip menu");
             self.bookmark_hover = None;
-            self.set_tooltip(None, POINT { x: 0, y: 0 });
+            self.set_tooltip(None);
             self.refresh_band();
         }
     }

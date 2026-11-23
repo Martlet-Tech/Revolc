@@ -40,9 +40,9 @@ const RADIUS: i32 = 6;
 const MAX_W: i32 = 480;
 /// Lower bound so an empty label still yields a visible card.
 const MIN_W: i32 = 64;
-/// Offset from the pointer to the card's top-left corner, before edge flips.
-const OFFSET: i32 = 16;
-/// Extra inset when a card is flipped to avoid the monitor edge.
+/// Vertical gap between the control's bottom edge and the card's top.
+const GAP_Y: i32 = 6;
+/// Extra inset when a card is clamped to avoid the monitor edge.
 const EDGE: i32 = 4;
 
 /// What the tooltip shows — always a single line.
@@ -69,17 +69,18 @@ pub fn card_size(text: SIZE) -> SIZE {
     }
 }
 
-/// Pure: screen position of the card given the pointer, its size, and the
-/// monitor work area. Flips to the other side of the pointer near an edge,
-/// then clamps so the card never leaves the work area.
-pub fn place(anchor: POINT, size: SIZE, work: RECT) -> POINT {
-    let mut x = anchor.x + OFFSET;
-    let mut y = anchor.y + OFFSET;
+/// Pure: screen position of the card for a control's screen rectangle.
+/// The card sits just below the control, left-aligned with it — a fixed
+/// position regardless of which direction the pointer entered from. Near an
+/// edge it flips above / shifts left, then clamps inside the work area.
+pub fn place(control: RECT, size: SIZE, work: RECT) -> POINT {
+    let mut x = control.left;
+    let mut y = control.bottom + GAP_Y;
     if x + size.cx > work.right {
-        x = anchor.x - size.cx - OFFSET;
+        x = control.right - size.cx;
     }
     if y + size.cy > work.bottom {
-        y = anchor.y - size.cy - OFFSET;
+        y = control.top - size.cy - GAP_Y;
     }
     x = x.clamp(work.left + EDGE, (work.right - size.cx - EDGE).max(work.left + EDGE));
     y = y.clamp(work.top + EDGE, (work.bottom - size.cy - EDGE).max(work.top + EDGE));
@@ -192,20 +193,24 @@ mod tests {
     }
 
     #[test]
-    fn place_prefers_bottom_right() {
+    fn place_sits_below_and_left_aligns_with_control() {
         let work = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
-        let p = place(POINT { x: 100, y: 100 }, SIZE { cx: 200, cy: 60 }, work);
-        assert_eq!((p.x, p.y), (100 + OFFSET, 100 + OFFSET));
+        let control = RECT { left: 100, top: 20, right: 190, bottom: 50 };
+        let p = place(control, SIZE { cx: 200, cy: 60 }, work);
+        // Left edge of the control, just below it — independent of the pointer.
+        assert_eq!(p.x, control.left);
+        assert_eq!(p.y, control.bottom + GAP_Y);
     }
 
     #[test]
     fn place_flips_near_right_and_bottom_edges() {
         let work = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
         let size = SIZE { cx: 200, cy: 60 };
-        let p = place(POINT { x: 950, y: 780 }, size, work);
+        let control = RECT { left: 950, top: 760, right: 990, bottom: 790 };
+        let p = place(control, size, work);
         // Flipped left/up instead of overflowing the work area.
-        assert_eq!(p.x, 950 - 200 - OFFSET);
-        assert_eq!(p.y, 780 - 60 - OFFSET);
+        assert_eq!(p.x, control.right - size.cx);
+        assert_eq!(p.y, control.top - size.cy - GAP_Y);
         assert!(p.x + size.cx <= work.right);
         assert!(p.y + size.cy <= work.bottom);
     }
@@ -214,7 +219,8 @@ mod tests {
     fn place_clamps_inside_work_area() {
         let work = RECT { left: 0, top: 0, right: 300, bottom: 200 };
         let size = SIZE { cx: 200, cy: 60 };
-        let p = place(POINT { x: 10, y: 10 }, size, work);
+        let control = RECT { left: 10, top: 10, right: 50, bottom: 30 };
+        let p = place(control, size, work);
         assert!(p.x >= work.left + EDGE);
         assert!(p.y >= work.top + EDGE);
         assert!(p.x + size.cx <= work.right - EDGE);
