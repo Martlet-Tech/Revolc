@@ -92,10 +92,10 @@ pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config) {
     );
     let _ = SelectObject(hdc, old_font);
 
-    // Settings gear at the right edge, drawn with the same 1px-line glyph
-    // approach as the caption buttons (no font dependency, DPI-stable).
+    // Settings glyph at the right edge, drawn with the same 1px-line approach
+    // as the caption buttons (no font dependency, DPI-stable).
     let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
-    paint_gear(
+    paint_hexagon(
         hdc,
         settings_button_x(width),
         top,
@@ -105,20 +105,32 @@ pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config) {
     );
 }
 
-/// A simple 8-tooth gear: circle + centre dot + short radial strokes.
-unsafe fn paint_gear(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORREF) {
+/// A regular hexagon outline with a small filled centre dot — the familiar
+/// "settings" glyph, drawn with 1px GDI lines like the caption buttons.
+/// At r=6 the six vertices are (±6,0) and (±3,±5); cos/sin(60°) rounded to
+/// integers, so no floating point is needed and it is pixel-stable.
+unsafe fn paint_hexagon(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORREF) {
     let cx = x + w / 2;
     let cy = y + h / 2;
-    let r = 5;
+    let r = 6;
+    let dx = 3; // r * cos(60°) = 3
+    let dy = 5; // r * sin(60°) ≈ 5.2 -> 5
+    let vertices = [
+        (cx - r, cy),
+        (cx - dx, cy - dy),
+        (cx + dx, cy - dy),
+        (cx + r, cy),
+        (cx + dx, cy + dy),
+        (cx - dx, cy + dy),
+    ];
     let pen = CreatePen(PS_SOLID, 1, color);
     let old = SelectObject(hdc, HGDIOBJ(pen.0));
-    // Approximate a circle with a diamond + cross; at this size it reads as
-    // "settings" without needing Ellipse() maths or a second pen.
-    line(hdc, cx - r, cy, cx + r, cy);
-    line(hdc, cx, cy - r, cx, cy + r);
-    line(hdc, cx - r + 2, cy - r + 2, cx + r - 2, cy + r - 2);
-    line(hdc, cx - r + 2, cy + r - 2, cx + r - 2, cy - r + 2);
-    // Centre dot.
+    for i in 0..vertices.len() {
+        let (x1, y1) = vertices[i];
+        let (x2, y2) = vertices[(i + 1) % vertices.len()];
+        line(hdc, x1, y1, x2, y2);
+    }
+    // Centre dot for the "settings" affordance.
     line(hdc, cx - 1, cy, cx + 1, cy);
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(pen.0));
