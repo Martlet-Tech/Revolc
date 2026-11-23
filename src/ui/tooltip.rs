@@ -17,9 +17,9 @@
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRgn,
-    FrameRgn, GetObjectW, GetStockObject, GetTextExtentPoint32W, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HBRUSH, HDC, HGDIOBJ, HFONT, HRGN, LOGFONTW, TRANSPARENT,
+    FrameRgn, GetObjectW, GetStockObject, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT,
+    DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
+    HGDIOBJ, HFONT, HRGN, LOGFONTW, TRANSPARENT,
 };
 
 use crate::config::Config;
@@ -29,6 +29,10 @@ use super::gdi::{self, rgb};
 /// Horizontal/vertical padding inside the card.
 const PAD_X: i32 = 10;
 const PAD_Y: i32 = 7;
+/// Extra width beyond the measured text. `DrawTextW` with DT_END_ELLIPSIS
+/// treats "text width == rect width" as overflow and drops glyphs for the
+/// ellipsis; a slack keeps short titles/paths intact without a visible gap.
+const TEXT_SLACK: i32 = 12;
 /// Gap between the title and the path on a two-line card.
 const GAP: i32 = 2;
 /// Corner radius of the rounded card.
@@ -109,11 +113,11 @@ pub struct Layout {
 pub fn card_size(first: SIZE, second: Option<SIZE>) -> SIZE {
     match second {
         Some(s) => SIZE {
-            cx: (first.cx.max(s.cx) + PAD_X * 2).clamp(MIN_W, MAX_W),
+            cx: (first.cx.max(s.cx) + PAD_X * 2 + TEXT_SLACK).clamp(MIN_W, MAX_W),
             cy: PAD_Y + first.cy + GAP + s.cy + PAD_Y,
         },
         None => SIZE {
-            cx: (first.cx + PAD_X * 2).clamp(MIN_W, MAX_W),
+            cx: (first.cx + PAD_X * 2 + TEXT_SLACK).clamp(MIN_W, MAX_W),
             cy: PAD_Y + first.cy + PAD_Y,
         },
     }
@@ -136,13 +140,22 @@ pub fn place(anchor: POINT, size: SIZE, work: RECT) -> POINT {
     POINT { x, y }
 }
 
+/// Measure with the very same `DrawTextW` used to paint, so the two can never
+/// disagree about glyph widths. DT_CALCRECT returns the required rect without
+/// drawing; the flags match `paint` minus the ellipsis (which must not affect
+/// the measurement of a string that is going to fit).
 unsafe fn text_size(hdc: HDC, text: &str, font: HFONT) -> SIZE {
     let old = SelectObject(hdc, HGDIOBJ(font.0));
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE::default();
-    let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+    let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let _ = DrawTextW(
+        hdc,
+        &mut wide,
+        &mut rc,
+        DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
+    );
     SelectObject(hdc, old);
-    size
+    SIZE { cx: rc.right - rc.left, cy: rc.bottom - rc.top }
 }
 
 /// Measure the card with the given HDC and fonts.
@@ -250,14 +263,14 @@ mod tests {
     fn single_card_is_one_line_tall() {
         let sz = card_size(SIZE { cx: 80, cy: 16 }, None);
         assert_eq!(sz.cy, PAD_Y * 2 + 16);
-        assert_eq!(sz.cx, 80 + PAD_X * 2);
+        assert_eq!(sz.cx, 80 + PAD_X * 2 + TEXT_SLACK);
     }
 
     #[test]
     fn two_line_card_stacks_title_and_path() {
         let sz = card_size(SIZE { cx: 60, cy: 16 }, Some(SIZE { cx: 200, cy: 12 }));
         assert_eq!(sz.cy, PAD_Y * 2 + 16 + GAP + 12);
-        assert_eq!(sz.cx, 200 + PAD_X * 2);
+        assert_eq!(sz.cx, 200 + PAD_X * 2 + TEXT_SLACK);
     }
 
     #[test]
