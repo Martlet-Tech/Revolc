@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod chrome;
 pub mod dwm;
+pub mod settings;
 pub mod tabbar;
 pub mod view;
 
@@ -333,6 +334,9 @@ pub(crate) struct App {
     /// system drag threshold. `None` once a click is dispatched or a drag
     /// starts.
     tab_press: Option<TabPress>,
+    /// State of the painted settings tab (selected category). Only meaningful
+    /// while a Painted(Settings) view is active.
+    settings_panel: settings::SettingsPanel,
 }
 
 pub struct MainWindow {
@@ -630,6 +634,7 @@ impl App {
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
+            settings_panel: settings::SettingsPanel::new(),
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -1861,6 +1866,13 @@ impl App {
         };
         self.sync_input_queue();
         self.sync_tabbar();
+        // A Painted tab needs our own frame to own the keyboard focus; there is
+        // no Explorer child to hand it to.
+        if self.views.get(i).map(|v| v.is_painted()).unwrap_or(false) {
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.main_hwnd);
+            }
+        }
     }
 
     /// Keep our input queue attached to the active tab's Explorer thread while
@@ -1896,8 +1908,6 @@ impl App {
     }
 
     /// Open the settings tab, or focus it if one is already open (singleton).
-    /// Stage B: creates the tab with a Painted view; stage C fills in the panel
-    /// content and routes its input.
     fn open_settings_tab(&mut self) {
         if let Some(i) = self.views.iter().position(|v| v.is_painted()) {
             self.activate(i);
@@ -1909,6 +1919,78 @@ impl App {
         self.sync_tabbar();
         self.activate(at);
         tracing::info!(tab = at, "settings tab opened");
+    }
+
+    /// Apply a settings-panel click. Config writes go through `set_toml_value`
+    /// (line-preserving), and the existing watcher repaints both the settings
+    /// tab and the main window via WM_APP_CONFIG_CHANGED.
+    fn handle_settings_hit(&mut self, hit: settings::SettingsHit) {
+        use settings::SettingsHit::*;
+        match hit {
+            Category(i) => {
+                // The panel owns its selected category; mutate through a
+                // short-lived &mut borrow, then repaint.
+                if i < crate::ui::settings::CATEGORY_COUNT {
+                    self.settings_panel.select(i);
+                    self.invalidate_view();
+                }
+            }
+            TakeoverMode => {
+                let next = if self.cfg.get().takeover.mode == "redirect" { "off" } else { "redirect" };
+                self.write_config("takeover", "mode", &format!("\"{next}\""));
+            }
+            TabRadius => {
+                let cur = self.cfg.get().theme.tab_radius;
+                let next = match cur { 0 => 4, 4 => 6, 6 => 10, _ => 0 };
+                self.write_config("theme", "tab_radius", &next.to_string());
+            }
+            ThemePreset => {
+                // Cycle between the user's green ramp and the shipped dark
+                // default; each is a set of line-preserving writes.
+                let is_green = self.cfg.get().theme.tabbar_background.to_lowercase() == "#1b3d28";
+                if is_green {
+                    self.write_config("theme", "tabbar_background", "\"#2b2b2b\"");
+                    self.write_config("theme", "tab_active", "\"#4a6984\"");
+                    self.write_config("theme", "tab_inactive", "\"#3c3c3c\"");
+                    self.write_config("theme", "tab_hover", "\"#41474d\"");
+                    self.write_config("theme", "tab_text", "\"#cccccc\"");
+                    self.write_config("theme", "tab_text_active", "\"#ffffff\"");
+                    self.write_config("theme", "tabbar_text", "\"#cccccc\"");
+                } else {
+                    self.write_config("theme", "tabbar_background", "\"#1b3d28\"");
+                    self.write_config("theme", "tab_active", "\"#e8f5e9\"");
+                    self.write_config("theme", "tab_inactive", "\"#a5d6a7\"");
+                    self.write_config("theme", "tab_hover", "\"#c8e6c9\"");
+                    self.write_config("theme", "tab_text", "\"#1b3d28\"");
+                    self.write_config("theme", "tab_text_active", "\"#0f2a1a\"");
+                    self.write_config("theme", "tabbar_text", "\"#d8ecd9\"");
+                }
+            }
+        }
+    }
+
+    fn write_config(&self, section: &str, key: &str, value: &str) {
+        let path = self.cfg.path().clone();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "settings: failed to read config");
+                return;
+            }
+        };
+        let updated = crate::config::set_toml_value(&text, section, key, value);
+        if let Err(e) = std::fs::write(&path, updated) {
+            tracing::error!(error = %e, "settings: failed to write config");
+        }
+    }
+
+    /// Invalidate the main window's view area (the settings page lives there).
+    fn invalidate_view(&self) {
+        let rc = self.view_rect();
+        unsafe {
+            let _ = InvalidateRect(self.main_hwnd, Some(&rc), true);
+            let _ = UpdateWindow(self.main_hwnd);
+        }
     }
 
     fn action(&mut self, a: Action) {
@@ -2471,6 +2553,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
                 return LRESULT(0);
             }
+            // Painted tab owns the whole view rect below the chrome.
+            let is_painted = app
+                .views
+                .get(app.tabs.active_index())
+                .map(|v| v.is_painted())
+                .unwrap_or(false);
+            if is_painted {
+                let rc = app.view_rect();
+                if let Some(hit) = app.settings_panel.hit(x, y, rc) {
+                    app.handle_settings_hit(hit);
+                }
+                return LRESULT(0);
+            }
             match app.tabbar.hit(x, y, width) {
                 tabbar::Hit::Tab(i) => app.begin_tab_press(i, x),
                 tabbar::Hit::Close(i) => {
@@ -2637,6 +2732,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
+            // A Painted tab owns its view rect; Hosted tabs let the Explorer
+            // child cover it (WS_CLIPCHILDREN keeps the two apart).
+            let is_painted = app
+                .views
+                .get(app.tabs.active_index())
+                .map(|v| v.is_painted())
+                .unwrap_or(false);
+            if is_painted {
+                let rc = app.view_rect();
+                app.settings_panel.paint(hdc, rc, &app.cfg.get());
+            }
             app.paint_band(hdc);
             app.paint_frame(hdc);
             let _ = EndPaint(hwnd, &ps);
