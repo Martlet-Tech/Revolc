@@ -57,6 +57,10 @@
        两个状态字段，消息路由在 WM_LBUTTONDOWN/MOUSEMOVE/LBUTTONUP/CAPTURECHANGED。
        单击仍打开（按下即记录 press，抬起未跨阈值才算 click），拖不被误判为打开。
        顺带收紧双击最大化门禁到 caption 行——此前双击书签芯片会最大化窗口。
+     - **悬停高亮（同分支补做）**：书签芯片与标签栏「+」按钮都加鼠标悬停反馈
+       （复用主题 `tab_hover` 配色）。`tabbar.rs` 加 `hover_plus` 状态与 setter；
+       App 的 `update_hover` 按垂直分区解析 tab/+/书签三种 hover（互斥），
+       拖拽期间抑制、离开窗口 `clear_hover` 清除、书签增删后清索引防错位。
      - 顺带修：设置页（Painted tab）活动时新建 tab 曾把字面量"设置"当文件夹
        路径 spawn（log 实锤 `explorer spawned for absorb path="设置"`）；
        `active_folder_path` 现在对非 Hosted tab 回退 home。

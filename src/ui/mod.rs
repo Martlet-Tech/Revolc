@@ -349,6 +349,8 @@ pub(crate) struct App {
     /// strip's `reorder` state machine — only the slot geometry differs.
     bookmark_press: Option<reorder::Press>,
     bookmark_drag: Option<reorder::Drag>,
+    /// Chip under the pointer on the toolbar row; painted with the hover fill.
+    bookmark_hover: Option<usize>,
 }
 
 pub struct MainWindow {
@@ -650,6 +652,7 @@ impl App {
             bookmarks: BookmarkStore::open(crate::bookmarks::bookmarks_path()),
             bookmark_press: None,
             bookmark_drag: None,
+            bookmark_hover: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -775,6 +778,7 @@ impl App {
                     self.bookmark_drag.map(|d| {
                         (d.from, chrome::clamped_drag_left(d.raw, w))
                     }),
+                    self.bookmark_hover,
                 );
                 return;
             }
@@ -789,6 +793,7 @@ impl App {
                 self.bookmark_drag.map(|d| {
                     (d.from, chrome::clamped_drag_left(d.raw, w))
                 }),
+                self.bookmark_hover,
             );
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
@@ -959,20 +964,30 @@ impl App {
     /// whether the point resolves to a client area (tabs) or a non-client one
     /// (caption buttons).
     fn update_hover(&mut self, x: i32, y: i32, width: i32) {
-        // While a tab is being dragged the highlight belongs to the tab in
-        // hand: letting the pointer repaint hover fills underneath it makes
-        // the strip flicker as the drag passes over each slot.
-        if self.tabbar.drag().is_some() {
+        // While a row is being dragged the highlight belongs to the item in
+        // hand: repainting hover fills underneath it makes the band flicker.
+        if self.tabbar.drag().is_some() || self.bookmark_drag.is_some() {
             return;
         }
         let want = caption::hit(x, y, width);
-        // A tab is a client-area target, a caption button a non-client one:
-        // the two hovers are tracked separately and both repaint the band.
-        // The close X belongs to its tab: without that, sliding onto the X
-        // dropped the tab's hover fill and the tab flickered.
-        let over_tab = match self.tabbar.hit(x, y, width) {
-            tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => Some(i),
-            _ => None,
+        // The tab strip and the toolbar row are mutually exclusive vertical
+        // bands. Resolve one hit and feed each painter only its own state.
+        let (over_tab, over_plus, over_bookmark) = if y < TABBAR_HEIGHT {
+            match self.tabbar.hit(x, y, width) {
+                tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => (Some(i), false, None),
+                tabbar::Hit::Plus => (None, true, None),
+                _ => (None, false, None),
+            }
+        } else if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+            let total = self.bookmarks.items().len();
+            let over_settings = chrome::hit_settings(x, y, width);
+            (
+                None,
+                false,
+                if over_settings { None } else { chrome::hit_bookmark(x, y, width, total) },
+            )
+        } else {
+            (None, false, None)
         };
         let maximized = self.is_maximized();
         let active = self.active;
@@ -980,10 +995,19 @@ impl App {
         if self.tabbar.set_hover_tab(over_tab) {
             dirty = true;
         }
+        if self.tabbar.set_hover_plus(over_plus) {
+            dirty = true;
+        }
+        if self.bookmark_hover != over_bookmark {
+            self.bookmark_hover = over_bookmark;
+            dirty = true;
+        }
         if dirty {
             self.invalidate_band();
         }
-        if (want.is_some() || over_tab.is_some()) && !self.hover_tracking {
+        if (want.is_some() || over_tab.is_some() || over_plus || over_bookmark.is_some())
+            && !self.hover_tracking
+        {
             self.hover_tracking = true;
             unsafe {
                 let mut tme = TRACKMOUSEEVENT {
@@ -1012,6 +1036,12 @@ impl App {
         let active = self.active;
         let mut dirty = self.tabbar.set_chrome(None, maximized, active);
         if self.tabbar.set_hover_tab(None) {
+            dirty = true;
+        }
+        if self.tabbar.set_hover_plus(false) {
+            dirty = true;
+        }
+        if self.bookmark_hover.take().is_some() {
             dirty = true;
         }
         if dirty {
@@ -1321,6 +1351,8 @@ impl App {
             self.bookmarks.add(label, path.clone());
             tracing::info!(?path, tab = i, "bookmark added");
         }
+        // Chip count changed: a stale hover index could light up a neighbour.
+        self.bookmark_hover = None;
         self.refresh_band();
     }
 
@@ -1396,6 +1428,7 @@ impl App {
             return;
         }
         self.bookmark_drag = None;
+        self.bookmark_hover = None;
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -1410,6 +1443,7 @@ impl App {
         };
         if self.bookmarks.remove_at(index) {
             tracing::info!(path = ?bm.path, "bookmark removed via chip menu");
+            self.bookmark_hover = None;
             self.refresh_band();
         }
     }

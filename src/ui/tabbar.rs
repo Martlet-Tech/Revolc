@@ -86,6 +86,9 @@ pub struct TabBar {
     /// Index of the tab under the pointer. Independent of `hover`: a tab lives
     /// in the client area, the caption buttons do not.
     hover_tab: Option<usize>,
+    /// Whether the trailing "+" is under the pointer. Tracked separately from
+    /// `hover_tab` so sliding from a tab onto "+" swaps the highlight cleanly.
+    hover_plus: bool,
     /// Set while a tab is being dragged inside the band (reorder only; pulling
     /// a tab out into a new window is a later stage).
     drag: Option<Drag>,
@@ -110,6 +113,7 @@ impl TabBar {
             tab_w: TAB_MAX_W,
             hover: None,
             hover_tab: None,
+            hover_plus: false,
             drag: None,
             maximized: false,
             window_active: true,
@@ -207,6 +211,16 @@ impl TabBar {
         true
     }
 
+    /// Highlight the trailing "+" when the pointer is over it. Returns true
+    /// on change so the caller repaints exactly once.
+    pub fn set_hover_plus(&mut self, hovered: bool) -> bool {
+        if self.hover_plus == hovered {
+            return false;
+        }
+        self.hover_plus = hovered;
+        true
+    }
+
     // ---- tab drag (reorder inside the band) -----------------------------
 
     /// Start dragging tab `i`. `x` is the press point in client coords; the
@@ -218,6 +232,7 @@ impl TabBar {
         let left = self.tab_x(i);
         self.drag = Some(Drag::new(i, x, left));
         self.hover_tab = None;
+        self.hover_plus = false;
     }
 
     pub fn drag(&self) -> Option<Drag> {
@@ -394,7 +409,8 @@ impl TabBar {
                 right: plus_x + PLUS_SIZE,
                 bottom: CENTER + PLUS_SIZE / 2,
             };
-            fill_round(hdc, &plus_rc, self.inactive_bg, self.radius);
+            let plus_bg = if self.hover_plus { self.hover_bg } else { self.inactive_bg };
+            fill_round(hdc, &plus_rc, plus_bg, self.radius);
             let _ = SetTextColor(hdc, self.text_active);
             let _ = DrawTextW(
                 hdc,
@@ -568,6 +584,16 @@ mod tests {
 
     fn landing(center: i32, tab_w: i32, n: usize, from: usize) -> Option<usize> {
         reorder::landing(center, tab_w, TAB_GAP, GUTTER, n, from)
+    }
+
+    #[test]
+    fn plus_hover_toggles_once_per_change() {
+        let mut bar = TabBar::new(&Config::default());
+        assert!(!bar.hover_plus);
+        assert!(bar.set_hover_plus(true), "entering + repaints");
+        assert!(!bar.set_hover_plus(true), "no redundant repaint");
+        assert!(bar.set_hover_plus(false), "leaving + repaints");
+        assert!(!bar.hover_plus);
     }
 
     #[test]

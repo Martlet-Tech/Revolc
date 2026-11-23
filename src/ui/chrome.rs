@@ -141,6 +141,7 @@ pub fn is_chrome_double_click(y: i32) -> bool {
 /// `drag` is `(index, left)` of a chip held by the pointer: it is skipped in
 /// its slot and drawn last at `left`, above its neighbours (the data model has
 /// already been reordered, exactly like the tab strip's drag).
+/// `hover_index` is the chip under the pointer, painted with the hover fill.
 pub unsafe fn paint(
     hdc: HDC,
     width: i32,
@@ -148,6 +149,7 @@ pub unsafe fn paint(
     cfg: &Config,
     bookmarks: &[Bookmark],
     drag: Option<(usize, i32)>,
+    hover_index: Option<usize>,
 ) {
     let height = super::BOOKMARK_HEIGHT;
     let (r, g, b) = cfg.color(|t| &t.bookmark_bar_background);
@@ -187,7 +189,11 @@ pub unsafe fn paint(
                 continue; // drawn last, at the pointer position
             }
             if let Some(rect) = bookmark_rect(i, width) {
-                paint_chip(hdc, &rect, &bm.label, chip, ink);
+                if hover_index == Some(i) {
+                    paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+                } else {
+                    paint_chip(hdc, &rect, &bm.label, chip, ink);
+                }
             }
         }
         // Held chip last, on top, with a lifted fill.
