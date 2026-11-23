@@ -16,7 +16,7 @@ use crate::bookmarks::Bookmark;
 use crate::config::Config;
 
 use super::caption;
-use super::gdi::{line, rgb};
+use super::gdi::{self, line, rgb};
 
 /// Geometry of one bookmark chip. Fixed width keeps paint and hit-test
 /// perfectly in sync (no GDI text measurement needed), at the cost of a
@@ -178,8 +178,9 @@ pub unsafe fn paint(
     let ink = rgb(ir, ig, ib);
     let (hr, hg, hb) = cfg.color(|t| &t.tab_hover);
     let hover = rgb(hr, hg, hb);
-    let (hir, hig, hib) = cfg.color(|t| &t.tab_text);
-    let hover_ink = rgb(hir, hig, hib);
+    // Same contrast rule as the settings gear: a light hover fill needs dark
+    // ink regardless of what the theme's tab_text happens to be.
+    let hover_ink = gdi::contrast_text(hover);
 
     let n = visible_bookmarks(width, bookmarks.len());
     if n == 0 {
@@ -234,14 +235,22 @@ pub unsafe fn paint(
         let _ = FillRect(hdc, &cell, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
     }
-    let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
+    // On hover the glyph must contrast with the *fill*, not with the toolbar
+    // background: the green preset's light `tab_hover` made the themed light
+    // glyph disappear. Derive dark/light ink from the actual cell colour.
+    let glyph_color = if state.settings_hover {
+        gdi::contrast_text(hover)
+    } else {
+        let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
+        rgb(sr, sg, sb)
+    };
     paint_hexagon(
         hdc,
         settings_button_x(width),
         top,
         super::SETTINGS_BTN_W,
         height,
-        rgb(sr, sg, sb),
+        glyph_color,
     );
 }
 

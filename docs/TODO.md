@@ -71,6 +71,12 @@
      - **审查发现但未做（待定）**：设置页（Painted tab）右侧的设置行没有悬停
        反馈——左侧分类有选中态、右侧行没有；且 Painted 页目前不接收
        WM_MOUSEMOVE 路由。属于新一层交互，未在本次 chrome 条一致性范围内。
+     - **悬停对比度修复（用户手测反馈）**：绿色主题下设置齿轮悬停底色是浅绿
+       `tab_hover`(#c8e6c9)，而 glyph 用浅绿 `tabbar_text`，几乎看不见。把
+       `settings.rs` 原有的 `ink_on`（按背景亮度选黑/白字）提升为
+       `gdi::contrast_text()` 公共函数，设置齿轮与书签芯片的 hover 文字都改用它
+       （不再盲用主题色）；非 hover 态仍用主题色不变。3 个单测覆盖 RGB 字节序、
+       浅绿底→深字、深底→浅字。日志复核零 WARN/ERROR。
      - 顺带修：设置页（Painted tab）活动时新建 tab 曾把字面量"设置"当文件夹
        路径 spawn（log 实锤 `explorer spawned for absorb path="设置"`）；
        `active_folder_path` 现在对非 Hosted tab 回退 home。
