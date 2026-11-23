@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod dwm;
 pub mod tabbar;
+pub mod view;
 
 pub use revolc_common::icon;
 
@@ -55,6 +56,8 @@ use crate::shell::host::{self, Absorbed};
 use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
 use revolc_common::ledger::Ledger;
+
+use self::view::View;
 
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
 /// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
@@ -262,7 +265,9 @@ pub(crate) struct App {
     /// delivered to the first one's tab list.
     accel: HACCEL,
     tabs: TabList,
-    views: Vec<Option<Absorbed>>,
+    /// One content slot per tab, by index. `Pending` = waiting for a foreign
+    /// window; `Hosted` = an Explorer pane; `Painted` = drawn by us.
+    views: Vec<View>,
     /// HWNDs we deliberately left on the desktop (closed tabs), with the
     /// instant they were released. Sweep ignores them until EXCLUDE_TTL.
     excluded: Vec<(isize, Instant)>,
@@ -1149,7 +1154,7 @@ impl App {
         }
         // pid fallback (kept as a second opinion; label may lag one sweep).
         let idx = self.views.iter().position(|v| {
-            v.as_ref().map(|v| host::process_id_of(v.top) as isize == pid).unwrap_or(false)
+            v.as_hosted().map(|v| host::process_id_of(v.top) as isize == pid).unwrap_or(false)
         });
         let Some(i) = idx else {
             self.cache_nav(pid, path);
@@ -1182,7 +1187,10 @@ impl App {
             .tabs
             .iter_all()
             .enumerate()
-            .filter(|(i, t)| t.label == want && self.views.get(*i).map(|v| v.is_some()).unwrap_or(false))
+            .filter(|(i, t)| {
+                t.label == want
+                    && self.views.get(*i).and_then(|v| v.as_hosted()).is_some()
+            })
             .map(|(i, _)| i)
             .collect();
         match hits.len() {
@@ -1351,7 +1359,7 @@ impl App {
     fn new_tab(&mut self, path: String) {
         let at = self.tabs.len();
         self.tabs.push(path.clone());
-        self.views.insert(at, None);
+        self.views.insert(at, View::Pending);
         self.launch_tab_view(at, path);
     }
 
@@ -1359,7 +1367,7 @@ impl App {
     fn new_tab_after(&mut self, after: usize, path: String) {
         let at = (after + 1).min(self.tabs.len());
         self.tabs.insert_after(after, path.clone());
-        self.views.insert(at, None);
+        self.views.insert(at, View::Pending);
         self.launch_tab_view(at, path);
     }
 
@@ -1429,11 +1437,11 @@ impl App {
         // thread ~1s (20×50ms retries) — every absorb flashed a full Explorer
         // window for 1.6s (2026-11-17). Clover semantics: re-parent the window
         // immediately; metadata (tab label/path) is filled in after.
-        let idx = match self.views.iter().position(|v| v.is_none()) {
+        let idx = match self.views.iter().position(|v| v.is_pending()) {
             Some(i) => i,
             None => {
                 self.tabs.push(String::new());
-                self.views.push(None);
+                self.views.push(View::Pending);
                 self.views.len() - 1
             }
         };
@@ -1449,7 +1457,7 @@ impl App {
                 return;
             }
         };
-        self.views[idx] = Some(view);
+        self.views[idx] = View::Hosted(view);
         // Absorbing into a hidden/minimized Revolc looks like "nothing
         // happened" - surface the window so the user sees the result. Must not
         // un-maximize: this runs on every `+` click.
@@ -1531,7 +1539,10 @@ impl App {
     }
 
     fn known_tops(&self) -> Vec<isize> {
-        self.views.iter().flatten().map(|v| v.top.0 as isize).collect()
+        self.views
+            .iter()
+            .filter_map(|v| v.as_hosted().map(|h| h.top.0 as isize))
+            .collect()
     }
 
     fn prune_excluded(&mut self) {
@@ -1552,7 +1563,7 @@ impl App {
             .views
             .iter()
             .enumerate()
-            .filter_map(|(i, v)| v.is_none().then_some(i))
+            .filter_map(|(i, v)| v.is_pending().then_some(i))
             .collect();
         self.reserve_deadline = None;
         if empty.is_empty() {
@@ -1584,7 +1595,7 @@ impl App {
             // it when nothing else is waiting for a window of its own, and
             // only while it is still invisible — that is the shape of the
             // window we just asked Explorer to open.
-            let waiting = self.views.iter().any(|v| v.is_none());
+            let waiting = self.views.iter().any(|v| v.is_pending());
             if waiting || host::is_visible(top) {
                 None
             } else {
@@ -1623,7 +1634,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| match slot {
-                Some(v) if !host::is_window_alive(v.top) => Some(i),
+                View::Hosted(v) if !host::is_window_alive(v.top) => Some(i),
                 _ => None,
             })
             .collect();
@@ -1662,7 +1673,7 @@ impl App {
     fn refresh_labels(&mut self) -> bool {
         let mut changed = false;
         for (i, slot) in self.views.iter().enumerate() {
-            if let Some(v) = slot {
+            if let Some(v) = slot.as_hosted() {
                 let title = host::window_title(v.top);
                 if !title.is_empty() && self.tabs.set_label(i, title) {
                     changed = true;
@@ -1677,7 +1688,7 @@ impl App {
     /// on screen and titled — IShellWindows is out-of-proc and costs 50ms.
     fn resolve_pending_paths(&mut self) {
         for i in 0..self.views.len() {
-            let (top, titled, visible) = match self.views[i].as_ref() {
+            let (top, titled, visible) = match self.views[i].as_hosted() {
                 Some(v) => (v.top, !host::window_title(v.top).is_empty(), host::is_visible(v.top)),
                 None => continue,
             };
@@ -1740,7 +1751,7 @@ impl App {
     /// the only thing left — that is what "resident takeover" means.
     fn may_adopt(&self) -> bool {
         // A reserved tab is a folder *we* spawned; nobody else may take it.
-        if self.views.iter().any(|v| v.is_none()) {
+        if self.views.iter().any(|v| v.is_pending()) {
             return true;
         }
         let me = self.main_hwnd;
@@ -1806,7 +1817,7 @@ impl App {
         // window" — the flash the user reports. Outside that window we keep
         // the old visible-only rule: an unrelated hidden CabinetWClass is
         // none of our business.
-        let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_none());
+        let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_pending());
         // Every window runs this timer. Only the one the user last touched may
         // adopt — otherwise the destination of "open this folder" is decided by
         // whichever timer fired first, which reads as a random window.
@@ -1874,7 +1885,7 @@ impl App {
     /// the desktop), leaving nothing for another window's sweep to re-adopt.
     fn close_all_tabs(&mut self) {
         for slot in self.views.iter_mut() {
-            if let Some(v) = slot.take() {
+            if let View::Hosted(v) = std::mem::replace(slot, View::Pending) {
                 self.excluded.push((v.top.0 as isize, Instant::now()));
                 park_released(v.top);
                 unsafe {
@@ -1903,7 +1914,7 @@ impl App {
         // Remember the title so the sweep closes that window instead of
         // adopting it back as a brand-new tab (which made a closed tab
         // reappear).
-        if self.views.get(i).map(|v| v.is_none()).unwrap_or(false) {
+        if self.views.get(i).map(|v| v.is_pending()).unwrap_or(false) {
             if let Some(t) = self.tabs.get(i) {
                 let label = if t.label.is_empty() {
                     short_label(&t.path)
@@ -1916,7 +1927,9 @@ impl App {
             }
         }
         // Close the Explorer window where it is: hidden, still our child.
-        if let Some(v) = self.views[i].take() {
+        // A Painted tab owns no HWND — nothing to close — the remove below is
+        // the whole teardown.
+        if let View::Hosted(v) = std::mem::replace(&mut self.views[i], View::Pending) {
             // Park it: the sweep must not grab the window back while it is
             // still alive during WM_CLOSE teardown.
             self.excluded.push((v.top.0 as isize, Instant::now()));
@@ -1963,12 +1976,12 @@ impl App {
         // client to the tab-bar background (the green flash). Switching left
         // happened to show the lower-index target before hiding the old pane,
         // which is why the bug was direction-dependent.
-        if let Some(v) = self.views.get_mut(i).and_then(|slot| slot.as_mut()) {
+        if let Some(v) = self.views.get_mut(i).and_then(|slot| slot.as_hosted_mut()) {
             v.set_visible(true);
         }
         for (j, slot) in self.views.iter_mut().enumerate() {
             if j != i {
-                if let Some(v) = slot {
+                if let Some(v) = slot.as_hosted_mut() {
                     v.set_visible(false);
                 }
             }
@@ -1978,14 +1991,15 @@ impl App {
         // Keyboard focus has to be handed to the other process explicitly, or
         // the address bar takes clicks but no keystrokes. A window adopted
         // before Explorer showed it cannot take focus yet: the sweep retries
-        // as soon as it appears (`focus_pending`).
-        self.focus_pending = match self.views.get(i) {
-            Some(Some(v)) if host::is_visible(v.top) => {
+        // as soon as it appears (`focus_pending`). A Painted tab has no foreign
+        // window: focus stays on our own frame and no queue is attached.
+        self.focus_pending = match self.views.get(i).map(|v| v.as_hosted()).flatten() {
+            Some(v) if host::is_visible(v.top) => {
                 focus_view(self.main_hwnd, self.attached_tid, v);
                 false
             }
-            Some(Some(_)) => true,
-            _ => false,
+            Some(_) => true,
+            None => false,
         };
         self.sync_input_queue();
         self.sync_tabbar();
@@ -2005,7 +2019,7 @@ impl App {
         let want = if self.active {
             self.views
                 .get(self.tabs.active_index())
-                .and_then(|v| v.as_ref())
+                .and_then(|v| v.as_hosted())
                 .map(|v| host::thread_of(v.top))
                 .unwrap_or(0)
         } else {
@@ -2079,15 +2093,13 @@ impl App {
     fn place_active_sampled(&mut self, sampled: Option<host::Metrics>) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
-        let metrics = match self.views.get(idx).and_then(|v| v.as_ref()) {
-            Some(v) => Some(sampled.unwrap_or_else(|| v.sample())),
-            None => None,
-        };
+        let hosted = self.views.get(idx).and_then(|v| v.as_hosted());
+        let metrics = hosted.map(|v| sampled.unwrap_or_else(|| v.sample()));
         let key = metrics.map(|m| (idx, rc.left, rc.top, rc.right, rc.bottom, (m.nc, m.band)));
         if key.is_some() && self.laid_out == key {
             return;
         }
-        if let (Some(Some(v)), Some(m)) = (self.views.get(idx), metrics) {
+        if let (Some(v), Some(m)) = (hosted, metrics) {
             // Align the *visible chrome* (ribbon onward) to the view rect.
             v.place_client(rc, m);
         }
@@ -2138,7 +2150,7 @@ impl App {
         let mut show: Option<HWND> = None;
         let mut hide: Vec<HWND> = Vec::new();
         for (i, slot) in self.views.iter().enumerate() {
-            let Some(v) = slot else { continue };
+            let Some(v) = slot.as_hosted() else { continue };
             // Explorer can restore its caption on navigation; that is the band
             // of foreign chrome that shows up between tab bar and ribbon.
             if unsafe { v.ensure_stripped() } {
@@ -2169,14 +2181,11 @@ impl App {
         // used to happen three times per tick (15ms apart during a burst).
         // Measured after ensure_stripped(), because re-stripping the caption is
         // exactly what changes the non-client metrics.
-        let metrics = self
-            .views
-            .get(active)
-            .and_then(|v| v.as_ref())
-            .map(|v| v.sample());
+        let active_hosted = self.views.get(active).and_then(|v| v.as_hosted());
+        let metrics = active_hosted.map(|v| v.sample());
         // Explorer moves and resizes its own frame when it finally shows it;
         // the `laid_out` key cannot notice that because *we* changed nothing.
-        let drifted = match (self.views.get(active).and_then(|v| v.as_ref()), metrics) {
+        let drifted = match (active_hosted, metrics) {
             (Some(v), Some(m)) => !v.is_placed(rc, m),
             _ => false,
         };
@@ -2202,7 +2211,7 @@ impl App {
         // Explorer child pane can never cover it, and raising it every sweep
         // would drag this frame above the other one (Z-order fight).
         for slot in self.views.iter_mut() {
-            if let Some(v) = slot {
+            if let Some(v) = slot.as_hosted_mut() {
                 v.mark_shown();
             }
         }
@@ -2210,7 +2219,7 @@ impl App {
         // A tab absorbed before Explorer showed it could not take focus; hand
         // it over now that it is on screen.
         if self.focus_pending {
-            match self.views.get(active).and_then(|v| v.as_ref()) {
+            match self.views.get(active).and_then(|v| v.as_hosted()) {
                 Some(v) if host::is_visible(v.top) => {
                     focus_view(self.main_hwnd, self.attached_tid, v);
                     self.focus_pending = false;
@@ -2227,12 +2236,12 @@ impl App {
         let active_top = self
             .views
             .get(active)
-            .and_then(|v| v.as_ref())
+            .and_then(|v| v.as_hosted())
             .map(|v| v.top.0 as isize)
             .unwrap_or(0);
         for child in host::child_windows(self.main_hwnd) {
             let raw = child.0 as isize;
-            if self.views.iter().flatten().any(|v| v.top.0 as isize == raw) {
+            if self.views.iter().filter_map(|v| v.as_hosted()).any(|v| v.top.0 as isize == raw) {
                 continue; // tracked; visibility already handled above
             }
             if raw != active_top && host::is_visible(child) {
@@ -2277,8 +2286,8 @@ impl App {
 
     /// Release every absorbed window back to the desktop.
     fn release_all(&mut self) {
-        for v in self.views.iter_mut() {
-            if let Some(v) = v.take() {
+        for slot in self.views.iter_mut() {
+            if let View::Hosted(v) = std::mem::replace(slot, View::Pending) {
                 // Park it process-wide: this window is on its way out, and the
                 // surviving windows' sweeps must not adopt the pane back.
                 park_released(v.top);
@@ -2865,7 +2874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.sync_input_queue();
             app.sync_chrome();
             if app.active {
-                if let Some(Some(v)) = app.views.get(app.tabs.active_index()) {
+                if let Some(v) = app.views.get(app.tabs.active_index()).and_then(|s| s.as_hosted()) {
                     focus_view(app.main_hwnd, app.attached_tid, v);
                 }
             }
