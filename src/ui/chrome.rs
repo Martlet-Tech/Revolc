@@ -31,6 +31,17 @@ pub fn settings_button_x(width: i32) -> i32 {
     width - super::SETTINGS_BTN_W
 }
 
+/// Rectangle of the settings button in chrome-popup client coords. Shared
+/// with the tooltip so it anchors to the control, not the pointer.
+pub fn settings_rect(width: i32) -> RECT {
+    RECT {
+        left: settings_button_x(width),
+        top: caption::HEIGHT,
+        right: width,
+        bottom: caption::HEIGHT + super::BOOKMARK_HEIGHT,
+    }
+}
+
 /// How many bookmark chips fit before the settings button. Extra bookmarks
 /// are not painted or clickable until the window is widened.
 pub fn visible_bookmarks(width: i32, total: usize) -> usize {
@@ -66,7 +77,8 @@ pub fn clamped_drag_left(raw: i32, width: i32) -> i32 {
 }
 
 /// Rectangle of bookmark `i` in chrome-popup client coords, if visible.
-fn bookmark_rect(i: usize, width: i32) -> Option<RECT> {
+/// Public so the tooltip can anchor to the chip rather than the pointer.
+pub fn bookmark_rect(i: usize, width: i32) -> Option<RECT> {
     if i >= visible_bookmarks(width, usize::MAX) {
         return None;
     }

@@ -5,6 +5,7 @@ pub mod gdi;
 pub mod reorder;
 pub mod settings;
 pub mod tabbar;
+pub mod tooltip;
 pub mod view;
 
 pub use revolc_common::icon;
@@ -19,10 +20,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    RedrawWindow, ScreenToClient, SelectObject, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-    RDW_UPDATENOW, SRCCOPY,
+    DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, RedrawWindow, ReleaseDC, ScreenToClient, SelectObject, SetWindowRgn,
+    UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -50,7 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
     WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
-    MINMAXINFO, SM_CXDRAG, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    MINMAXINFO, SM_CXDRAG, SW_SHOWNA, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
@@ -107,6 +109,10 @@ const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// us, and always raised above those panes, so a foreign process can never
 /// erase our title bar again.
 const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
+/// Owned popup for the hover tooltip. A separate top-level window because the
+/// card hangs below the toolbar row, past the strip's CHROME_HEIGHT, and must
+/// float above the absorbed Explorer pane like the strip does.
+const TOOLTIP_CLASS: PCWSTR = w!("RevolcTooltip");
 /// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
 /// with accelerators (which use 1..=keymap.len()).
 const CMD_TAB_NEW_WINDOW: usize = 0x8001;
@@ -354,6 +360,13 @@ pub(crate) struct App {
     bookmark_hover: Option<usize>,
     /// Whether the right-end settings gear is under the pointer.
     settings_hover: bool,
+    /// Owned popup that paints the hover tooltip. Kept above the Explorer
+    /// panes; click-through so it never steals input from the strip.
+    tooltip_hwnd: HWND,
+    /// Current tooltip content, or None when nothing is hovered.
+    tooltip_content: Option<tooltip::Content>,
+    /// Measured card, computed when the hovered target changes.
+    tooltip_layout: Option<tooltip::Layout>,
 }
 
 pub struct MainWindow {
@@ -495,6 +508,56 @@ fn ensure_tabbar_class() {
     let err = windows::core::Error::from_win32();
     if (err.code().0 as u32 & 0xffff) != 1410 {
         tracing::warn!(error = %err, "register tab bar class failed");
+    }
+}
+
+/// Class for the owned tooltip popup. Same tolerate-already-exists rule.
+fn ensure_tooltip_class() {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(tooltip_wndproc),
+        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        lpszClassName: TOOLTIP_CLASS,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return;
+    }
+    let err = windows::core::Error::from_win32();
+    if (err.code().0 as u32 & 0xffff) != 1410 {
+        tracing::warn!(error = %err, "register tooltip class failed");
+    }
+}
+
+/// The tooltip popup paints only when the owner has content for it. All input
+/// passes through (WS_EX_TRANSPARENT) so it can never steal the hover/click
+/// from the chip or tab underneath. The owner drives show/hide and position.
+unsafe extern "system" fn tooltip_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let parent = GetParent(hwnd).unwrap_or_default();
+            let Some(app) = (if parent.0.is_null() { None } else { app_opt(parent) }) else {
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut ps);
+                let _ = EndPaint(hwnd, &ps);
+                return LRESULT(0);
+            };
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            app.paint_tooltip(hdc);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => LRESULT(0),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -657,6 +720,9 @@ impl App {
             bookmark_drag: None,
             bookmark_hover: None,
             settings_hover: false,
+            tooltip_hwnd: HWND::default(),
+            tooltip_content: None,
+            tooltip_layout: None,
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -960,6 +1026,126 @@ impl App {
         }
     }
 
+    /// Create the owned tooltip popup. Click-through and non-activating: the
+    /// pointer must keep hitting the chip/tab beneath it, and showing a card
+    /// must never steal focus from the frame or the absorbed Explorer pane.
+    fn create_tooltip_window(&mut self) {
+        ensure_tooltip_class();
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                TOOLTIP_CLASS,
+                None,
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                self.main_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .expect("create owned tooltip popup");
+            self.tooltip_hwnd = hwnd;
+        }
+    }
+
+    /// Paint the card using the stored layout. The window origin is (0,0) and
+    /// the popup is already the right size, so no coordinate translation here.
+    fn paint_tooltip(&self, hdc: HDC) {
+        let (Some(content), Some(layout)) = (&self.tooltip_content, self.tooltip_layout) else {
+            return;
+        };
+        unsafe {
+            tooltip::paint(hdc, content, &self.cfg.get(), layout);
+        }
+    }
+
+    /// Show a tooltip for a target: its content plus the target's rectangle in
+    /// frame-client coordinates. `None` hides it. The card is anchored to the
+    /// control (below its bottom edge, left-aligned), never to the pointer —
+    /// so it appears in the same place no matter which direction the cursor
+    /// entered from. The position is computed once on first appearance and
+    /// locked while the same target stays hovered.
+    fn set_tooltip(&mut self, target: Option<(tooltip::Content, RECT)>) {
+        if self.tooltip_hwnd.0.is_null() {
+            return;
+        }
+        let Some((content, control_client)) = target else {
+            self.tooltip_content = None;
+            self.tooltip_layout = None;
+            unsafe {
+                let _ = ShowWindow(self.tooltip_hwnd, SW_HIDE);
+            }
+            return;
+        };
+        // Same target -> keep the locked position, do not follow the pointer.
+        if self.tooltip_content.as_ref() == Some(&content) {
+            return;
+        }
+
+        unsafe {
+            let hdc = GetDC(self.tooltip_hwnd);
+            if hdc.is_invalid() {
+                return;
+            }
+            let layout = tooltip::measure(hdc, &content);
+            let _ = ReleaseDC(self.tooltip_hwnd, hdc);
+
+            // Round the popup itself so no square corner shows behind the
+            // card. SetWindowRgn takes ownership of the region.
+            let rgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(
+                0, 0, layout.size.cx + 1, layout.size.cy + 1, 12, 12,
+            );
+            let _ = SetWindowRgn(self.tooltip_hwnd, rgn, true);
+
+            // Control rect: strip client -> frame client (they share an
+            // origin) -> screen. ClientToScreen on the frame handles DPI and
+            // window placement in one step.
+            let mut tl = POINT { x: control_client.left, y: control_client.top };
+            let mut br = POINT { x: control_client.right, y: control_client.bottom };
+            let _ = ClientToScreen(self.main_hwnd, &mut tl);
+            let _ = ClientToScreen(self.main_hwnd, &mut br);
+            let control_screen = RECT {
+                left: tl.x,
+                top: tl.y,
+                right: br.x,
+                bottom: br.y,
+            };
+
+            self.tooltip_content = Some(content);
+            self.tooltip_layout = Some(layout);
+            self.move_tooltip(layout, control_screen);
+            let _ = InvalidateRect(self.tooltip_hwnd, None, true);
+            let _ = ShowWindow(self.tooltip_hwnd, SW_SHOWNA);
+        }
+    }
+
+    /// Position the popup relative to `control` (screen coords), flipping near
+    /// the monitor edge and resizing to the measured card. SWP_NOACTIVATE
+    /// keeps focus untouched.
+    fn move_tooltip(&self, layout: tooltip::Layout, control: RECT) {
+        unsafe {
+            let monitor = MonitorFromWindow(self.main_hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(monitor, &mut mi);
+            let at = tooltip::place(control, layout.size, mi.rcWork);
+            let _ = SetWindowPos(
+                self.tooltip_hwnd,
+                HWND_TOP,
+                at.x,
+                at.y,
+                layout.size.cx,
+                layout.size.cy,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+
     /// Pull maximize/active state into the strip (glyphs depend on both).
     fn sync_chrome(&mut self) {
         let maximized = self.is_maximized();
@@ -967,6 +1153,44 @@ impl App {
         if self.tabbar.set_chrome(self.tabbar.hover(), maximized, active) {
             self.invalidate_band();
         }
+    }
+
+    /// Build the tooltip target for the current hover state: the one-line
+    /// content plus the hovered control's rectangle in strip-client coords.
+    /// The rectangle anchors the card to the control, not the pointer, so the
+    /// position is identical however the cursor approached it. Paths come
+    /// from the tab model — never `folder_path_of`, which consumes cached BHO
+    /// pushes and would corrupt navigation on hover.
+    fn hover_tooltip_target(
+        &self,
+        caption_btn: Option<caption::Button>,
+        over_tab: Option<usize>,
+        over_bookmark: Option<usize>,
+        over_settings: bool,
+        maximized: bool,
+        width: i32,
+    ) -> Option<(tooltip::Content, RECT)> {
+        if let Some(i) = over_bookmark {
+            let bm = self.bookmarks.items().get(i)?;
+            let rect = chrome::bookmark_rect(i, width)?;
+            return Some((tooltip::Content(bm.path.clone()), rect));
+        }
+        if let Some(i) = over_tab {
+            let tab = self.tabs.get(i)?;
+            let rect = self.tabbar.tooltip_rect(i)?;
+            return Some((tooltip::Content(tab.path.clone()), rect));
+        }
+        if over_settings {
+            return Some((tooltip::Content("设置".into()), chrome::settings_rect(width)));
+        }
+        let b = caption_btn?;
+        let label = match b {
+            caption::Button::Minimize => "最小化",
+            caption::Button::Maximize if maximized => "向下还原",
+            caption::Button::Maximize => "最大化",
+            caption::Button::Close => "关闭",
+        };
+        Some((tooltip::Content(label.into()), caption::rect(b, width)))
     }
 
     /// Track which caption button the cursor is over. Driven from
@@ -977,6 +1201,7 @@ impl App {
         // While a row is being dragged the highlight belongs to the item in
         // hand: repainting hover fills underneath it makes the band flicker.
         if self.tabbar.drag().is_some() || self.bookmark_drag.is_some() {
+            self.set_tooltip(None);
             return;
         }
         let want = caption::hit(x, y, width);
@@ -1020,6 +1245,16 @@ impl App {
         if dirty {
             self.invalidate_band();
         }
+
+        // Tooltip follows the same hit resolution as the hover fills: caption
+        // buttons and the gear get a single line; tabs and bookmark chips get
+        // title + full path. Built as owned values so set_tooltip can compare
+        // without borrowing self twice.
+        let target = self.hover_tooltip_target(
+            want, over_tab, over_bookmark, over_settings, maximized, width,
+        );
+        self.set_tooltip(target);
+
         if (want.is_some()
             || over_tab.is_some()
             || over_plus
@@ -1070,6 +1305,7 @@ impl App {
         if dirty {
             self.invalidate_band();
         }
+        self.set_tooltip(None);
     }
 
     /// Index of the tab with `id`, if it still exists.
@@ -1376,6 +1612,7 @@ impl App {
         }
         // Chip count changed: a stale hover index could light up a neighbour.
         self.bookmark_hover = None;
+        self.set_tooltip(None);
         self.refresh_band();
     }
 
@@ -1452,6 +1689,7 @@ impl App {
         }
         self.bookmark_drag = None;
         self.bookmark_hover = None;
+        self.set_tooltip(None);
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -1467,6 +1705,7 @@ impl App {
         if self.bookmarks.remove_at(index) {
             tracing::info!(path = ?bm.path, "bookmark removed via chip menu");
             self.bookmark_hover = None;
+            self.set_tooltip(None);
             self.refresh_band();
         }
     }
@@ -2599,6 +2838,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
             app.create_tabbar_window();
+            app.create_tooltip_window();
             app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which

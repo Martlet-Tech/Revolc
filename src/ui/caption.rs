@@ -52,6 +52,13 @@ pub fn left_edge(bar_width: i32) -> i32 {
     bar_width - WIDTH
 }
 
+/// Rectangle of a button in bar-client coordinates. Shared with the tooltip
+/// so the card anchors to the control, not to wherever the pointer entered.
+pub fn rect(b: Button, bar_width: i32) -> RECT {
+    let x = left_edge(bar_width) + b.slot() * BUTTON_W;
+    RECT { left: x, top: 0, right: x + BUTTON_W, bottom: HEIGHT }
+}
+
 /// Which button (if any) is under a point given in bar-client coordinates.
 pub fn hit(x: i32, y: i32, bar_width: i32) -> Option<Button> {
     if !(0..HEIGHT).contains(&y) {
