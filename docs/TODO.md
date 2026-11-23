@@ -40,7 +40,16 @@
      歧义取活动 tab，label 滞后由 sweep 重放缓存兜底；
      ④SetSite 期间禁止调用 site 方法（订阅全部延迟到 timer 回调）。
      `[bookmarks].enabled` → tray 启动时写/删 `bho.nav` 标记驱动订阅。
-   - ⬜ 三期：加入收藏菜单项 + 书签模型 + 持久化（`bookmarks.json`）。
+   - ✅ 三期（2026-11-23 分支 `feat/bookmarks-phase3`）：**扁平书签 + 工具栏芯片**。
+     - 数据：`src/bookmarks.rs`，`Bookmark { label, path }` 扁平列表，schema 带
+       `version=1`，存 `%APPDATA%\revolc\bookmarks.json`；原子写（`.tmp` →
+       `sync_all` → `MoveFileExW(REPLACE_EXISTING)`），损坏/未来版本启动不动
+       崩溃、回退空列表。路径按大小写/斜杠/尾分隔符归一化去重。5 个单测。
+     - 交互：标签右键「收藏此标签页 / 取消收藏」（只对 Hosted 文件夹 tab 出现，
+       用实时 BHO 路径，设置页不提供）；工具栏行左起画书签芯片（92px 固定宽、
+       自适应数量、省略号截断），点芯片新开 tab；右端设置齿轮不变。
+     - 范围外：文件夹层级、右键管理菜单、pin（四期）。当前实现未设数量上限，
+       窗口宽度决定可见芯片数，超出的等窗口变宽才显示。
    - ⬜ 四期：固定标签页(pin)。
    **「重新打开关闭的标签页」明确不做**（浏览器式 reopen 需要 close stack：在 `close_tab`
    里存 path+label，还得跟 discard/reserve 竞态协调；当前 `Tab` 被直接丢弃，无此基础设施）。

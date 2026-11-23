@@ -52,6 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
+use crate::bookmarks::BookmarkStore;
 use crate::config::ConfigHandle;
 use crate::shell::host::{self, Absorbed};
 use crate::tabs::events::{self, Action, Binding};
@@ -111,6 +112,7 @@ const CMD_TAB_CLOSE: usize = 0x8002;
 const CMD_TAB_CLOSE_OTHERS: usize = 0x8003;
 const CMD_TAB_CLOSE_RIGHT: usize = 0x8004;
 const CMD_TAB_NEW_AFTER: usize = 0x8005;
+const CMD_TAB_BOOKMARK: usize = 0x8006;
 
 /// The window the user is working in right now (0 = none yet).
 ///
@@ -337,6 +339,9 @@ pub(crate) struct App {
     /// State of the painted settings tab (selected category). Only meaningful
     /// while a Painted(Settings) view is active.
     settings_panel: settings::SettingsPanel,
+    /// Flat list of saved folders, painted on the toolbar row and toggled from
+    /// the tab context menu. Loaded at startup, saved atomically on change.
+    bookmarks: BookmarkStore,
 }
 
 pub struct MainWindow {
@@ -635,6 +640,7 @@ impl App {
             hover_tracking: false,
             tab_press: None,
             settings_panel: settings::SettingsPanel::new(),
+            bookmarks: BookmarkStore::open(crate::bookmarks::bookmarks_path()),
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -751,12 +757,12 @@ impl App {
                     let _ = DeleteDC(mem);
                 }
                 self.tabbar.paint(hdc, w);
-                chrome::paint(hdc, w, TABBAR_HEIGHT, &self.cfg.get());
+                chrome::paint(hdc, w, TABBAR_HEIGHT, &self.cfg.get(), self.bookmarks.items());
                 return;
             }
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
             self.tabbar.paint(mem, w);
-            chrome::paint(mem, w, TABBAR_HEIGHT, &self.cfg.get());
+            chrome::paint(mem, w, TABBAR_HEIGHT, &self.cfg.get(), self.bookmarks.items());
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));
@@ -1262,6 +1268,44 @@ impl App {
                 tracing::error!(error = %e, ?path, "failed to spawn new window, tab kept");
             }
         }
+    }
+
+    /// Context menu "收藏此标签页": toggle the tab's live folder in the flat
+    /// bookmark list. Uses the same real-time path resolution as "open in new
+    /// window" (BHO push + label), never the possibly-stale `Tab.path`.
+    fn toggle_bookmark(&mut self, i: usize) {
+        // Only a real folder (Hosted) can be bookmarked — a Painted settings
+        // tab has no path worth saving.
+        if !self.views.get(i).map(|v| v.as_hosted().is_some()).unwrap_or(false) {
+            return;
+        }
+        let path = self.folder_path_of(i);
+        let already = self.bookmarks.contains(&path);
+        if already {
+            self.bookmarks.remove(&path);
+            tracing::info!(?path, tab = i, "bookmark removed");
+        } else {
+            let label = self
+                .tabs
+                .get(i)
+                .map(|t| t.label.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| short_label(&path));
+            self.bookmarks.add(label, path.clone());
+            tracing::info!(?path, tab = i, "bookmark added");
+        }
+        self.refresh_band();
+    }
+
+    /// Toolbar click on a bookmark: open it in a new tab in this window, at
+    /// the same position a "+" click would use. Never replaces the current
+    /// tab — bookmarks are navigational shortcuts, not tab moves.
+    fn open_bookmark(&mut self, index: usize) {
+        let Some(bm) = self.bookmarks.items().get(index).cloned() else {
+            return;
+        };
+        tracing::info!(path = ?bm.path, "bookmark opened");
+        self.new_tab(bm.path);
     }
 
     /// Close every tab except `keep`. Iterate in reverse so removing a tab
@@ -2264,7 +2308,13 @@ fn focus_view(main: HWND, attached_tid: u32, v: &Absorbed) {
 /// window, so the caller must NOT hold an `&mut App` across it (re-entrant
 /// `app_from` would alias). Collect the target first, drop the borrow, show the
 /// menu, then re-acquire the app to dispatch.
-unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usize {
+unsafe fn show_tab_context_menu(
+    hwnd: HWND,
+    screen: POINT,
+    has_tab: bool,
+    // None = not a folder tab (painted page): hide the bookmark item.
+    bookmarked: Option<bool>,
+) -> usize {
     let Ok(menu) = CreatePopupMenu() else { return 0 };
 
     if has_tab {
@@ -2272,6 +2322,15 @@ unsafe fn show_tab_context_menu(hwnd: HWND, screen: POINT, has_tab: bool) -> usi
         // (moves the tab: closes it here + opens the same folder in a new window)
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_NEW_AFTER, w!("在右侧新建标签页(&A)"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        if let Some(bookmarked) = bookmarked {
+            let bookmark_label = if bookmarked {
+                w!("取消收藏此标签页(&B)")
+            } else {
+                w!("收藏此标签页(&B)")
+            };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_BOOKMARK, bookmark_label);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE, w!("关闭标签页(&C)"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_OTHERS, w!("关闭其他标签页(&O)"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_TAB_CLOSE_RIGHT, w!("关闭右侧标签页(&R)"));
@@ -2537,15 +2596,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
-            // Toolbar row: only the right-end settings gear is live for now.
-            // Other toolbar clicks do nothing (bookmark items are phase 3).
-            // Checked before tabbar.hit() so the row never falls into Hit::Band
-            // and starts a window drag.
+            // Toolbar row: the right-end settings gear and the bookmark chips
+            // are the live targets. Checked before tabbar.hit() so the row
+            // never falls into Hit::Band and starts a window drag.
             if chrome::hit_settings(x, y, width) {
                 app.open_settings_tab();
                 return LRESULT(0);
             }
             if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+                let total = app.bookmarks.items().len();
+                if let Some(i) = chrome::hit_bookmark(x, y, width, total) {
+                    app.open_bookmark(i);
+                }
                 return LRESULT(0);
             }
             // Route by vertical band first. The caption/tab strip always wins
@@ -2671,8 +2733,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // target correct even if a sweep reorders views while the menu is up.
         WM_RBUTTONUP => {
             let (x, y) = point_from_lparam(lp);
-            // Phase 1: gather target + screen point, then DROP the app borrow.
-            let (hit_index, screen) = {
+            // Phase 1: gather target + screen point + bookmark state, then
+            // DROP the app borrow before the modal menu loop.
+            let (hit_index, screen, bookmarked) = {
                 let app = app_from(hwnd);
                 let width = app.client().right;
                 let idx = match app.tabbar.hit(x, y, width) {
@@ -2684,12 +2747,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         .and_then(|id| app.index_of(id)),
                     _ => None,
                 };
+                // Painted tabs (settings) have no folder — don't offer to
+                // bookmark them. Only Hosted tabs are real folders.
+                let marked = idx.and_then(|i| {
+                    let is_folder = app
+                        .views
+                        .get(i)
+                        .map(|v| v.as_hosted().is_some())
+                        .unwrap_or(false);
+                    if is_folder {
+                        let p = app.folder_path_of(i);
+                        Some(app.bookmarks.contains(&p))
+                    } else {
+                        None
+                    }
+                });
                 let mut pt = POINT { x, y };
                 let _ = ClientToScreen(hwnd, &mut pt);
-                (idx, pt)
+                (idx, pt, marked)
             };
             // Phase 2: modal loop — no &mut App alive here.
-            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some());
+            let cmd = show_tab_context_menu(hwnd, screen, hit_index.is_some(), bookmarked);
             // Phase 3: re-acquire and dispatch.
             if cmd != 0 {
                 let app = app_from(hwnd);
@@ -2707,6 +2785,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             .unwrap_or_else(|| app.active_folder_path());
                         let anchor = idx.unwrap_or_else(|| app.tabs.len().saturating_sub(1));
                         app.new_tab_after(anchor, path);
+                    }
+                    CMD_TAB_BOOKMARK => {
+                        if let Some(i) = idx {
+                            app.toggle_bookmark(i);
+                        }
                     }
                     CMD_TAB_CLOSE => {
                         if let Some(i) = idx {
