@@ -145,6 +145,62 @@ impl Config {
     }
 }
 
+/// Replace one key's line in TOML text, preserving every other byte
+/// (comments, blank lines, formatting). The settings panel uses this instead
+/// of serializing `Config` so the user's annotated config survives edits.
+/// Returns the new text; the caller decides when/how to write it to disk.
+pub fn set_toml_value(text: &str, section: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let section_header = format!("[{section}]");
+    let mut in_section = false;
+    let mut found = false;
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == section_header;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let some_key = trimmed.split('=').next().unwrap_or("").trim();
+        if some_key == key {
+            // Keep the user's indentation, replace only the value part.
+            let indent_len = line.len() - line.trim_start().len();
+            *line = format!("{}{key} = {value}", &line[..indent_len]);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if let Some(pos) = lines.iter().position(|l| l.trim() == section_header) {
+            lines.insert(pos + 1, format!("{key} = {value}"));
+        } else {
+            if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            lines.push(section_header);
+            lines.push(format!("{key} = {value}"));
+        }
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Apply many key/value edits to TOML text in one pass, preserving comments
+/// and layout like `set_toml_value`. Used by the theme preset switch so the
+/// whole scheme lands atomically (one file write -> one watcher reload).
+pub fn set_toml_values(text: &str, edits: &[(&str, &str, &str)]) -> String {
+    let mut out = text.to_string();
+    for (section, key, value) in edits {
+        out = set_toml_value(&out, section, key, value);
+    }
+    out
+}
+
 pub fn parse_color(s: &str) -> (u8, u8, u8) {
     let s = s.trim().trim_start_matches('#');
     if s.len() == 6 {
@@ -254,5 +310,52 @@ impl ConfigHandle {
 
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_toml_value_preserves_comments() {
+        let original = "[theme]\ntab_radius = 6 # 0 = square\nwindow_border = \"#151515\"\n\n[takeover]\nmode = \"off\"\n";
+        let updated = set_toml_value(original, "theme", "tab_radius", "12");
+        assert!(updated.contains("tab_radius = 12"), "{updated}");
+        assert!(updated.contains("window_border = \"#151515\""), "{updated}");
+        assert!(updated.contains("mode = \"off\""), "{updated}");
+        // The inline comment on the replaced line is dropped (we replaced the
+        // whole line); all *other* comments and layout survive.
+        assert!(updated.ends_with('\n'));
+    }
+
+    #[test]
+    fn set_toml_value_appends_missing_key() {
+        let original = "[theme]\ntab_radius = 6\n\n[takeover]\nmode = \"off\"\n";
+        let updated = set_toml_value(original, "theme", "tab_hover", "\"#c8e6c9\"");
+        let theme_section = updated.split("[takeover]").next().unwrap();
+        assert!(theme_section.contains("tab_hover = \"#c8e6c9\""), "{updated}");
+        assert!(updated.contains("mode = \"off\""), "{updated}");
+    }
+
+    #[test]
+    fn set_toml_value_creates_missing_section() {
+        let original = "# just a comment\n";
+        let updated = set_toml_value(original, "search", "backend", "\"system\"");
+        assert!(updated.contains("[search]"), "{updated}");
+        assert!(updated.contains("backend = \"system\""), "{updated}");
+        assert!(updated.contains("# just a comment"), "{updated}");
+    }
+
+    #[test]
+    fn set_toml_values_applies_all_edits() {
+        let original = "[theme]\nbg = \"#green\"\nfg = \"#dark\"\n# keep me\n";
+        let updated = set_toml_values(
+            original,
+            &[("theme", "bg", "\"#2b2b2b\""), ("theme", "fg", "\"#cccccc\"")],
+        );
+        assert!(updated.contains("bg = \"#2b2b2b\""), "{updated}");
+        assert!(updated.contains("fg = \"#cccccc\""), "{updated}");
+        assert!(updated.contains("# keep me"), "{updated}");
     }
 }

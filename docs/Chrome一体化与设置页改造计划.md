@@ -193,8 +193,30 @@ PaintedPage（开放枚举）
 
 | 阶段 | 状态 | 完成时间 | commit |
 |---|---|---|---|
-| 计划文档 + 分支 | ✅ 完成 | 2026-11-23 | - |
-| A · View 抽象 | ⬜ 待开始 | | |
-| B · 一体绘制 + 设置按钮 | ⬜ 待开始 | | |
-| C · 设置页内容 | ⬜ 待开始 | | |
-| D · 收尾验证 | ⬜ 待开始 | | |
+| 计划文档 + 分支 | ✅ 完成 | 2026-11-23 | `409471a` |
+| A · View 抽象 | ✅ 完成 | 2026-11-23 | `ee3e1af` · 20 tests pass |
+| B · 一体绘制 + 设置按钮 | ✅ 完成 | 2026-11-23 | `56d7dc0` · 20 tests pass |
+| C · 设置页内容 | ✅ 完成 | 2026-11-23 | `7963ae2` · 23 tests pass |
+| D · 收尾验证 | ✅ 完成 | 2026-11-23 | 配色对比修复 + README/TODO 更新 · release build OK · 23 tests pass |
+
+## 七、实施后记（2026-11-23）
+
+- 阶段 A：`Option<Absorbed>` → `View { Pending, Hosted, Painted }`，约 18 处遍历逐处按语义改写；`expire_reserved` 只数 Pending、`tab_by_label_tail` 只匹配 Hosted 是关键陷阱，均已处理。
+- 阶段 B：合并两个 owned popup 为一个 62px chrome popup，`view_rect.top` 固定；收藏栏"可隐藏"从此消失，右端齿轮走 `chrome::hit_settings`。
+- 阶段 C：`SettingsPanel` 三类设置，点击值切换；`set_toml_value` 按行写回保留注释；写入后现有 watcher 自动热刷新。设置页文字颜色用亮度自适应（`ink_on`），避免深色字画在深绿底上。
+- 已知限制（本次范围外）：设置页暂无键盘导航；收藏目录仍是占位文字（TODO Phase 3）；主题预设只有绿/深灰蓝两档；设置页关闭走 `Ctrl+W`（keymap 无 Esc 绑定）。
+- `cargo fmt --check` 报告的是仓库原有文件的格式差异，本次未做全局格式化以免污染无关文件。
+
+### 实测发现的严重 bug（已修复）
+
+**症状**：设置页能打开，但关不掉；设置页活动时窗口右上角 X / 标签关闭全部失灵，只能用任务管理器杀进程。
+
+**根因**：`WM_LBUTTONDOWN` 里按"active tab 是不是 Painted"决定路由，一旦设置页 active，**所有坐标的点击**（包括 y<34 的 caption 按钮行、34..62 的工具栏行）都被 `settings_panel.hit()` 处理后无条件 `return`，`tabbar.hit()` 永远到不了。日志印证：`settings tab opened` 之后没有任何 `caption button clicked`。
+
+**修复**：路由改为先按垂直分段（`chrome::route_click(y, painted_active)`）——y < CHROME_HEIGHT(62) 一律归 chrome（caption 按钮 + 标签 + 工具栏），只有 view_rect 内（y≥62）才在 Painted tab 时交给设置面板。加了 3 个回归单测覆盖"设置页活动时 caption 行仍归 chrome"。
+
+**教训**：输入路由必须按**空间区域**分段，不能按"当前页面类型"一刀切吞掉所有消息。
+
+**同类瑕疵（已修复）**：双击设置页空白会让窗口在最大化/还原间切换。`WM_LBUTTONDBLCLK` 里 `tabbar.hit()` 对 y ≥ TABBAR_HEIGHT 一律返回 `Band`，导致内容区双击也触发 `toggle_maximize()`。修复：加 `chrome::is_chrome_double_click(y)`（y < CHROME_HEIGHT）门禁，只有 chrome 带的双击才 toggle。同样加了回归单测。
+
+**配色预设"三种形态"（已修复）**：主题切换原本只写 7 个颜色字段，漏掉 `caption_hover` / `window_border` / `caption_close_hover` / `bookmark_bar_background`，导致切换后出现"绿标题栏 + 灰标签"等混合态（用户观察到三种形态）。修复：`settings.rs` 定义 `GREEN_THEME` / `DARK_THEME` 两套**完整**配色（11 个键，两边一一对应），`config::set_toml_values` 一次读-改-写全部应用（一次 watcher reload，无中间态）；`current_preset()` 校验整个色系而非只看 `tabbar_background`，混合态显示"自定义"。用户当前的混合配置点一下"配色预设"即自动归位到完整绿色系。

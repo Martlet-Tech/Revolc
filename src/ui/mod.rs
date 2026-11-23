@@ -1,6 +1,9 @@
 pub mod caption;
+pub mod chrome;
 pub mod dwm;
+pub mod settings;
 pub mod tabbar;
+pub mod view;
 
 pub use revolc_common::icon;
 
@@ -14,11 +17,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
-    InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ, HFONT, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-    RDW_UPDATENOW, SRCCOPY, TRANSPARENT, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
+    RedrawWindow, ScreenToClient, SelectObject, UpdateWindow, HBRUSH, HBITMAP, HDC, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -56,6 +58,8 @@ use crate::tabs::events::{self, Action, Binding};
 use crate::tabs::TabList;
 use revolc_common::ledger::Ledger;
 
+use self::view::{PaintedPage, View};
+
 pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher thread
 /// Quit for real: restore every absorbed window and exit. WM_CLOSE only hides
 /// to the tray in redirect mode, so shutdown paths (tray is direct, console
@@ -75,6 +79,14 @@ pub(crate) fn absorb_msg() -> u32 {
 }
 
 const TABBAR_HEIGHT: i32 = caption::HEIGHT;
+/// Bookmark/toolbar row below the tabs. Part of the same chrome popup since
+/// the unification change — not a separately hideable window any more.
+const BOOKMARK_HEIGHT: i32 = 28;
+/// Total height of the unified chrome popup (tabs + toolbar). The Explorer
+/// view starts here.
+const CHROME_HEIGHT: i32 = TABBAR_HEIGHT + BOOKMARK_HEIGHT;
+/// Right-edge toolbar button that opens the settings tab.
+const SETTINGS_BTN_W: i32 = 28;
 /// Frame between the window edge and the Explorer view. The view is inset by
 /// this much so a bare strip of *our* window is left along the left, right and
 /// bottom edges — that is the only place WM_NCHITTEST reaches us (a pointer on
@@ -92,10 +104,6 @@ const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// us, and always raised above those panes, so a foreign process can never
 /// erase our title bar again.
 const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
-/// Owned popup for the bookmark bar, sitting between the tab strip and the
-/// absorbed Explorer pane (feat/tab-context-menu phase 2).
-const BOOKMARK_CLASS: PCWSTR = w!("RevolcOwnedBookmarkBar");
-const BOOKMARK_HEIGHT: i32 = 28;
 /// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
 /// with accelerators (which use 1..=keymap.len()).
 const CMD_TAB_NEW_WINDOW: usize = 0x8001;
@@ -262,7 +270,9 @@ pub(crate) struct App {
     /// delivered to the first one's tab list.
     accel: HACCEL,
     tabs: TabList,
-    views: Vec<Option<Absorbed>>,
+    /// One content slot per tab, by index. `Pending` = waiting for a foreign
+    /// window; `Hosted` = an Explorer pane; `Painted` = drawn by us.
+    views: Vec<View>,
     /// HWNDs we deliberately left on the desktop (closed tabs), with the
     /// instant they were released. Sweep ignores them until EXCLUDE_TTL.
     excluded: Vec<(isize, Instant)>,
@@ -311,11 +321,10 @@ pub(crate) struct App {
     last_client: (i32, i32),
     /// The title bar: painted here, hit-tested here (see ui/tabbar.rs).
     tabbar: tabbar::TabBar,
-    /// Real child window that owns the strip's pixels and hits. Kept above
-    /// every Explorer pane so their overhang cannot cover it.
+    /// Real child window that owns the chrome pixels and hits (tabs + toolbar
+    /// in one popup). Kept above every Explorer pane so their overhang cannot
+    /// cover it.
     tabbar_hwnd: HWND,
-    /// Owned bookmark-bar popup below the tab strip (may be null when disabled).
-    bookmarkbar_hwnd: HWND,
     main_hwnd: HWND,
     /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
     /// run, and it is the only way to drop a hover that the cursor walked out
@@ -325,6 +334,9 @@ pub(crate) struct App {
     /// system drag threshold. `None` once a click is dispatched or a drag
     /// starts.
     tab_press: Option<TabPress>,
+    /// State of the painted settings tab (selected category). Only meaningful
+    /// while a Painted(Settings) view is active.
+    settings_panel: settings::SettingsPanel,
 }
 
 pub struct MainWindow {
@@ -469,30 +481,6 @@ fn ensure_tabbar_class() {
     }
 }
 
-/// Class for the bookmark bar popup. Same tolerates-already-exists rule.
-fn ensure_bookmark_class() {
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(bookmark_wndproc),
-        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-        hbrBackground: HBRUSH(std::ptr::null_mut()),
-        lpszClassName: BOOKMARK_CLASS,
-        // No CS_HREDRAW/VREDRAW: SetWindowPos in every sync would otherwise
-        // invalidate the whole strip on each move/resize. Content is static
-        // in phase 2; phase 3 will double-buffer it when items go in.
-        style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
-        ..Default::default()
-    };
-    if unsafe { RegisterClassExW(&wc) } != 0 {
-        return;
-    }
-    let err = windows::core::Error::from_win32();
-    if (err.code().0 as u32 & 0xffff) != 1410 {
-        tracing::warn!(error = %err, "register bookmark bar class failed");
-    }
-}
-
 /// The owned strip's window procedure. Painting stays here; every input and
 /// hit-test message is forwarded to the frame, which already knows how to
 /// turn a client coordinate into a tab / button / drag action. Because the
@@ -553,60 +541,6 @@ unsafe extern "system" fn tabbar_wndproc(
                 if msg == WM_LBUTTONDOWN || msg == WM_NCLBUTTONDOWN {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(parent);
                 }
-                SendMessageW(parent, msg, wp, lp)
-            }
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
-}
-
-/// Bookmark bar popup. Phase 2 is UI-only: paint a placeholder strip; clicks
-/// are forwarded to the frame but do nothing until phase 3 wires in items.
-unsafe extern "system" fn bookmark_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wp: WPARAM,
-    lp: LPARAM,
-) -> LRESULT {
-    let parent = GetParent(hwnd).unwrap_or_default();
-    match msg {
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rc);
-            let cfg = app_opt(parent).map(|a| a.cfg.clone());
-            let (r, g, b) = cfg
-                .as_ref()
-                .map(|c| c.get().color(|t| &t.bookmark_bar_background))
-                .unwrap_or((0x20, 0x20, 0x20));
-            let brush = CreateSolidBrush(COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32));
-            let _ = FillRect(hdc, &rc, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-
-            // Placeholder caption. Phase 3 replaces this with real bookmarks.
-            let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
-            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
-            let _ = SetBkMode(hdc, TRANSPARENT);
-            let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
-            let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
-            let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
-            let _ = SetTextColor(hdc, COLORREF((tb as u32) << 16 | (tg as u32) << 8 | tr as u32));
-            let mut text = RECT { left: 10, top: 0, right: rc.right - 10, bottom: rc.bottom };
-            let mut label: Vec<u16> = "收藏夹".encode_utf16().chain(Some(0)).collect();
-            let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            let _ = SelectObject(hdc, old_font);
-
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        WM_ERASEBKGND => LRESULT(1),
-        WM_NCDESTROY => LRESULT(0),
-        // Clicks/hover belong to the frame until phase 3 gives items meaning.
-        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE => {
-            if parent.0.is_null() {
-                LRESULT(0)
-            } else {
                 SendMessageW(parent, msg, wp, lp)
             }
         }
@@ -697,10 +631,10 @@ impl App {
             last_client: (0, 0),
             tabbar,
             tabbar_hwnd: HWND::default(),
-            bookmarkbar_hwnd: HWND::default(),
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
+            settings_panel: settings::SettingsPanel::new(),
         });
         let first = args.initial_path.unwrap_or_else(home_dir);
         app.new_tab(first);
@@ -738,7 +672,7 @@ impl App {
     fn view_rect(&self) -> RECT {
         let rc = self.client();
         let b = self.border();
-        let top = TABBAR_HEIGHT + self.bookmark_height();
+        let top = CHROME_HEIGHT;
         RECT {
             left: b,
             top,
@@ -803,7 +737,7 @@ impl App {
     fn paint_band(&self, hdc: HDC) {
         let rc = self.client();
         let w = rc.right.max(1);
-        let h = TABBAR_HEIGHT.min(rc.bottom.max(1));
+        let h = CHROME_HEIGHT.min(rc.bottom.max(1));
         unsafe {
             let mem = CreateCompatibleDC(hdc);
             let bmp = if mem.is_invalid() {
@@ -817,10 +751,12 @@ impl App {
                     let _ = DeleteDC(mem);
                 }
                 self.tabbar.paint(hdc, w);
+                chrome::paint(hdc, w, TABBAR_HEIGHT, &self.cfg.get());
                 return;
             }
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
             self.tabbar.paint(mem, w);
+            chrome::paint(mem, w, TABBAR_HEIGHT, &self.cfg.get());
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));
@@ -895,7 +831,7 @@ impl App {
     /// the update twice per mouse move.
     fn invalidate_band(&self) {
         let rc = self.client();
-        let band = RECT { left: 0, top: 0, right: rc.right, bottom: TABBAR_HEIGHT };
+        let band = RECT { left: 0, top: 0, right: rc.right, bottom: CHROME_HEIGHT };
         unsafe {
             // With WS_CLIPCHILDREN the parent no longer owns these pixels:
             // invalidate the window that actually paints them.
@@ -935,7 +871,7 @@ impl App {
                 origin.x,
                 origin.y,
                 rc.right,
-                TABBAR_HEIGHT,
+                CHROME_HEIGHT,
                 self.main_hwnd,
                 windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
                 windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default(),
@@ -970,75 +906,7 @@ impl App {
                 origin.x,
                 origin.y,
                 rc.right,
-                TABBAR_HEIGHT,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-        }
-        // Keep the second overlay in step with show/hide and moves.
-        self.sync_bookmarkbar_window();
-    }
-
-    /// Bookmark bar height: 0 when disabled, so the Explorer view starts right
-    /// under the tab strip. Read from config each call for hot reload.
-    fn bookmark_height(&self) -> i32 {
-        if self.cfg.get().bookmarks.enabled {
-            BOOKMARK_HEIGHT
-        } else {
-            0
-        }
-    }
-
-    /// Create the bookmark-bar popup just below the tab strip. Created once
-    /// (like the strip); `[bookmarks].enabled` only toggles its visibility via
-    /// `sync_bookmarkbar_window`, so it can be hot-reloaded.
-    fn create_bookmarkbar_window(&mut self) {
-        ensure_bookmark_class();
-        let rc = self.client();
-        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
-        unsafe {
-            let _ = ClientToScreen(self.main_hwnd, &mut origin);
-            let hwnd = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE
-                    | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
-                BOOKMARK_CLASS,
-                None,
-                WS_POPUP | WS_CLIPSIBLINGS,
-                origin.x,
-                origin.y,
-                rc.right,
-                BOOKMARK_HEIGHT,
-                self.main_hwnd,
-                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
-                GetModuleHandleW(None).unwrap_or_default(),
-                None,
-            )
-            .expect("create owned bookmark bar popup");
-            self.bookmarkbar_hwnd = hwnd;
-            self.sync_bookmarkbar_window();
-        }
-    }
-
-    /// Glue the bookmark popup under the strip, hide it with the frame or when
-    /// disabled. SWP_NOZORDER for the same reason as the tab strip.
-    fn sync_bookmarkbar_window(&self) {
-        let hwnd = self.bookmarkbar_hwnd;
-        if hwnd.0.is_null() {
-            return;
-        }
-        let rc = self.client();
-        let enabled = self.cfg.get().bookmarks.enabled;
-        let mut origin = POINT { x: 0, y: TABBAR_HEIGHT };
-        unsafe {
-            let _ = ClientToScreen(self.main_hwnd, &mut origin);
-            let visible = IsWindowVisible(self.main_hwnd).as_bool() && enabled;
-            let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                origin.x,
-                origin.y,
-                rc.right,
-                BOOKMARK_HEIGHT,
+                CHROME_HEIGHT,
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
@@ -1149,7 +1017,7 @@ impl App {
         }
         // pid fallback (kept as a second opinion; label may lag one sweep).
         let idx = self.views.iter().position(|v| {
-            v.as_ref().map(|v| host::process_id_of(v.top) as isize == pid).unwrap_or(false)
+            v.as_hosted().map(|v| host::process_id_of(v.top) as isize == pid).unwrap_or(false)
         });
         let Some(i) = idx else {
             self.cache_nav(pid, path);
@@ -1182,7 +1050,10 @@ impl App {
             .tabs
             .iter_all()
             .enumerate()
-            .filter(|(i, t)| t.label == want && self.views.get(*i).map(|v| v.is_some()).unwrap_or(false))
+            .filter(|(i, t)| {
+                t.label == want
+                    && self.views.get(*i).and_then(|v| v.as_hosted()).is_some()
+            })
             .map(|(i, _)| i)
             .collect();
         match hits.len() {
@@ -1351,7 +1222,7 @@ impl App {
     fn new_tab(&mut self, path: String) {
         let at = self.tabs.len();
         self.tabs.push(path.clone());
-        self.views.insert(at, None);
+        self.views.insert(at, View::Pending);
         self.launch_tab_view(at, path);
     }
 
@@ -1359,7 +1230,7 @@ impl App {
     fn new_tab_after(&mut self, after: usize, path: String) {
         let at = (after + 1).min(self.tabs.len());
         self.tabs.insert_after(after, path.clone());
-        self.views.insert(at, None);
+        self.views.insert(at, View::Pending);
         self.launch_tab_view(at, path);
     }
 
@@ -1429,11 +1300,11 @@ impl App {
         // thread ~1s (20×50ms retries) — every absorb flashed a full Explorer
         // window for 1.6s (2026-11-17). Clover semantics: re-parent the window
         // immediately; metadata (tab label/path) is filled in after.
-        let idx = match self.views.iter().position(|v| v.is_none()) {
+        let idx = match self.views.iter().position(|v| v.is_pending()) {
             Some(i) => i,
             None => {
                 self.tabs.push(String::new());
-                self.views.push(None);
+                self.views.push(View::Pending);
                 self.views.len() - 1
             }
         };
@@ -1449,7 +1320,7 @@ impl App {
                 return;
             }
         };
-        self.views[idx] = Some(view);
+        self.views[idx] = View::Hosted(view);
         // Absorbing into a hidden/minimized Revolc looks like "nothing
         // happened" - surface the window so the user sees the result. Must not
         // un-maximize: this runs on every `+` click.
@@ -1531,7 +1402,10 @@ impl App {
     }
 
     fn known_tops(&self) -> Vec<isize> {
-        self.views.iter().flatten().map(|v| v.top.0 as isize).collect()
+        self.views
+            .iter()
+            .filter_map(|v| v.as_hosted().map(|h| h.top.0 as isize))
+            .collect()
     }
 
     fn prune_excluded(&mut self) {
@@ -1552,7 +1426,7 @@ impl App {
             .views
             .iter()
             .enumerate()
-            .filter_map(|(i, v)| v.is_none().then_some(i))
+            .filter_map(|(i, v)| v.is_pending().then_some(i))
             .collect();
         self.reserve_deadline = None;
         if empty.is_empty() {
@@ -1584,7 +1458,7 @@ impl App {
             // it when nothing else is waiting for a window of its own, and
             // only while it is still invisible — that is the shape of the
             // window we just asked Explorer to open.
-            let waiting = self.views.iter().any(|v| v.is_none());
+            let waiting = self.views.iter().any(|v| v.is_pending());
             if waiting || host::is_visible(top) {
                 None
             } else {
@@ -1623,7 +1497,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| match slot {
-                Some(v) if !host::is_window_alive(v.top) => Some(i),
+                View::Hosted(v) if !host::is_window_alive(v.top) => Some(i),
                 _ => None,
             })
             .collect();
@@ -1662,7 +1536,7 @@ impl App {
     fn refresh_labels(&mut self) -> bool {
         let mut changed = false;
         for (i, slot) in self.views.iter().enumerate() {
-            if let Some(v) = slot {
+            if let Some(v) = slot.as_hosted() {
                 let title = host::window_title(v.top);
                 if !title.is_empty() && self.tabs.set_label(i, title) {
                     changed = true;
@@ -1677,7 +1551,7 @@ impl App {
     /// on screen and titled — IShellWindows is out-of-proc and costs 50ms.
     fn resolve_pending_paths(&mut self) {
         for i in 0..self.views.len() {
-            let (top, titled, visible) = match self.views[i].as_ref() {
+            let (top, titled, visible) = match self.views[i].as_hosted() {
                 Some(v) => (v.top, !host::window_title(v.top).is_empty(), host::is_visible(v.top)),
                 None => continue,
             };
@@ -1740,7 +1614,7 @@ impl App {
     /// the only thing left — that is what "resident takeover" means.
     fn may_adopt(&self) -> bool {
         // A reserved tab is a folder *we* spawned; nobody else may take it.
-        if self.views.iter().any(|v| v.is_none()) {
+        if self.views.iter().any(|v| v.is_pending()) {
             return true;
         }
         let me = self.main_hwnd;
@@ -1806,7 +1680,7 @@ impl App {
         // window" — the flash the user reports. Outside that window we keep
         // the old visible-only rule: an unrelated hidden CabinetWClass is
         // none of our business.
-        let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_none());
+        let expecting = self.burst_until.is_some() || self.views.iter().any(|v| v.is_pending());
         // Every window runs this timer. Only the one the user last touched may
         // adopt — otherwise the destination of "open this folder" is decided by
         // whichever timer fired first, which reads as a random window.
@@ -1874,7 +1748,7 @@ impl App {
     /// the desktop), leaving nothing for another window's sweep to re-adopt.
     fn close_all_tabs(&mut self) {
         for slot in self.views.iter_mut() {
-            if let Some(v) = slot.take() {
+            if let View::Hosted(v) = std::mem::replace(slot, View::Pending) {
                 self.excluded.push((v.top.0 as isize, Instant::now()));
                 park_released(v.top);
                 unsafe {
@@ -1903,7 +1777,7 @@ impl App {
         // Remember the title so the sweep closes that window instead of
         // adopting it back as a brand-new tab (which made a closed tab
         // reappear).
-        if self.views.get(i).map(|v| v.is_none()).unwrap_or(false) {
+        if self.views.get(i).map(|v| v.is_pending()).unwrap_or(false) {
             if let Some(t) = self.tabs.get(i) {
                 let label = if t.label.is_empty() {
                     short_label(&t.path)
@@ -1916,7 +1790,9 @@ impl App {
             }
         }
         // Close the Explorer window where it is: hidden, still our child.
-        if let Some(v) = self.views[i].take() {
+        // A Painted tab owns no HWND — nothing to close — the remove below is
+        // the whole teardown.
+        if let View::Hosted(v) = std::mem::replace(&mut self.views[i], View::Pending) {
             // Park it: the sweep must not grab the window back while it is
             // still alive during WM_CLOSE teardown.
             self.excluded.push((v.top.0 as isize, Instant::now()));
@@ -1963,12 +1839,12 @@ impl App {
         // client to the tab-bar background (the green flash). Switching left
         // happened to show the lower-index target before hiding the old pane,
         // which is why the bug was direction-dependent.
-        if let Some(v) = self.views.get_mut(i).and_then(|slot| slot.as_mut()) {
+        if let Some(v) = self.views.get_mut(i).and_then(|slot| slot.as_hosted_mut()) {
             v.set_visible(true);
         }
         for (j, slot) in self.views.iter_mut().enumerate() {
             if j != i {
-                if let Some(v) = slot {
+                if let Some(v) = slot.as_hosted_mut() {
                     v.set_visible(false);
                 }
             }
@@ -1978,17 +1854,25 @@ impl App {
         // Keyboard focus has to be handed to the other process explicitly, or
         // the address bar takes clicks but no keystrokes. A window adopted
         // before Explorer showed it cannot take focus yet: the sweep retries
-        // as soon as it appears (`focus_pending`).
-        self.focus_pending = match self.views.get(i) {
-            Some(Some(v)) if host::is_visible(v.top) => {
+        // as soon as it appears (`focus_pending`). A Painted tab has no foreign
+        // window: focus stays on our own frame and no queue is attached.
+        self.focus_pending = match self.views.get(i).map(|v| v.as_hosted()).flatten() {
+            Some(v) if host::is_visible(v.top) => {
                 focus_view(self.main_hwnd, self.attached_tid, v);
                 false
             }
-            Some(Some(_)) => true,
-            _ => false,
+            Some(_) => true,
+            None => false,
         };
         self.sync_input_queue();
         self.sync_tabbar();
+        // A Painted tab needs our own frame to own the keyboard focus; there is
+        // no Explorer child to hand it to.
+        if self.views.get(i).map(|v| v.is_painted()).unwrap_or(false) {
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.main_hwnd);
+            }
+        }
     }
 
     /// Keep our input queue attached to the active tab's Explorer thread while
@@ -2005,7 +1889,7 @@ impl App {
         let want = if self.active {
             self.views
                 .get(self.tabs.active_index())
-                .and_then(|v| v.as_ref())
+                .and_then(|v| v.as_hosted())
                 .map(|v| host::thread_of(v.top))
                 .unwrap_or(0)
         } else {
@@ -2020,6 +1904,87 @@ impl App {
         self.attached_tid = want;
         if want != 0 {
             host::attach_input(want, true);
+        }
+    }
+
+    /// Open the settings tab, or focus it if one is already open (singleton).
+    fn open_settings_tab(&mut self) {
+        if let Some(i) = self.views.iter().position(|v| v.is_painted()) {
+            self.activate(i);
+            return;
+        }
+        let at = self.tabs.len();
+        self.tabs.push("设置".to_string());
+        self.views.push(View::Painted(PaintedPage::Settings));
+        self.sync_tabbar();
+        self.activate(at);
+        tracing::info!(tab = at, "settings tab opened");
+    }
+
+    /// Apply a settings-panel click. Config writes go through `set_toml_value`
+    /// (line-preserving), and the existing watcher repaints both the settings
+    /// tab and the main window via WM_APP_CONFIG_CHANGED.
+    fn handle_settings_hit(&mut self, hit: settings::SettingsHit) {
+        use settings::SettingsHit::*;
+        match hit {
+            Category(i) => {
+                // The panel owns its selected category; mutate through a
+                // short-lived &mut borrow, then repaint.
+                if i < crate::ui::settings::CATEGORY_COUNT {
+                    self.settings_panel.select(i);
+                    self.invalidate_view();
+                }
+            }
+            TakeoverMode => {
+                let next = if self.cfg.get().takeover.mode == "redirect" { "off" } else { "redirect" };
+                self.write_config("takeover", "mode", &format!("\"{next}\""));
+            }
+            TabRadius => {
+                let cur = self.cfg.get().theme.tab_radius;
+                let next = match cur { 0 => 4, 4 => 6, 6 => 10, _ => 0 };
+                self.write_config("theme", "tab_radius", &next.to_string());
+            }
+            ThemePreset => {
+                // Cycle between the two COMPLETE colour schemes in one file
+                // write. Writing a partial set used to leave a green/grey
+                // hybrid (the "3 shapes" bug); one write also means one
+                // watcher reload, so there is no half-applied visible state.
+                let next = match settings::current_preset(&self.cfg.get()) {
+                    Some("绿色") => settings::DARK_THEME,
+                    _ => settings::GREEN_THEME,
+                };
+                self.write_config_values(next);
+            }
+        }
+    }
+
+    fn write_config(&self, section: &str, key: &str, value: &str) {
+        self.write_config_values(&[(section, key, value)]);
+    }
+
+    /// Apply a batch of config edits with a single read-modify-write, so the
+    /// watcher sees one change and the user never sees a half-applied theme.
+    fn write_config_values(&self, edits: &[(&str, &str, &str)]) {
+        let path = self.cfg.path().clone();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "settings: failed to read config");
+                return;
+            }
+        };
+        let updated = crate::config::set_toml_values(&text, edits);
+        if let Err(e) = std::fs::write(&path, updated) {
+            tracing::error!(error = %e, "settings: failed to write config");
+        }
+    }
+
+    /// Invalidate the main window's view area (the settings page lives there).
+    fn invalidate_view(&self) {
+        let rc = self.view_rect();
+        unsafe {
+            let _ = InvalidateRect(self.main_hwnd, Some(&rc), true);
+            let _ = UpdateWindow(self.main_hwnd);
         }
     }
 
@@ -2079,15 +2044,13 @@ impl App {
     fn place_active_sampled(&mut self, sampled: Option<host::Metrics>) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
-        let metrics = match self.views.get(idx).and_then(|v| v.as_ref()) {
-            Some(v) => Some(sampled.unwrap_or_else(|| v.sample())),
-            None => None,
-        };
+        let hosted = self.views.get(idx).and_then(|v| v.as_hosted());
+        let metrics = hosted.map(|v| sampled.unwrap_or_else(|| v.sample()));
         let key = metrics.map(|m| (idx, rc.left, rc.top, rc.right, rc.bottom, (m.nc, m.band)));
         if key.is_some() && self.laid_out == key {
             return;
         }
-        if let (Some(Some(v)), Some(m)) = (self.views.get(idx), metrics) {
+        if let (Some(v), Some(m)) = (hosted, metrics) {
             // Align the *visible chrome* (ribbon onward) to the view rect.
             v.place_client(rc, m);
         }
@@ -2138,7 +2101,7 @@ impl App {
         let mut show: Option<HWND> = None;
         let mut hide: Vec<HWND> = Vec::new();
         for (i, slot) in self.views.iter().enumerate() {
-            let Some(v) = slot else { continue };
+            let Some(v) = slot.as_hosted() else { continue };
             // Explorer can restore its caption on navigation; that is the band
             // of foreign chrome that shows up between tab bar and ribbon.
             if unsafe { v.ensure_stripped() } {
@@ -2169,14 +2132,11 @@ impl App {
         // used to happen three times per tick (15ms apart during a burst).
         // Measured after ensure_stripped(), because re-stripping the caption is
         // exactly what changes the non-client metrics.
-        let metrics = self
-            .views
-            .get(active)
-            .and_then(|v| v.as_ref())
-            .map(|v| v.sample());
+        let active_hosted = self.views.get(active).and_then(|v| v.as_hosted());
+        let metrics = active_hosted.map(|v| v.sample());
         // Explorer moves and resizes its own frame when it finally shows it;
         // the `laid_out` key cannot notice that because *we* changed nothing.
-        let drifted = match (self.views.get(active).and_then(|v| v.as_ref()), metrics) {
+        let drifted = match (active_hosted, metrics) {
             (Some(v), Some(m)) => !v.is_placed(rc, m),
             _ => false,
         };
@@ -2202,7 +2162,7 @@ impl App {
         // Explorer child pane can never cover it, and raising it every sweep
         // would drag this frame above the other one (Z-order fight).
         for slot in self.views.iter_mut() {
-            if let Some(v) = slot {
+            if let Some(v) = slot.as_hosted_mut() {
                 v.mark_shown();
             }
         }
@@ -2210,7 +2170,7 @@ impl App {
         // A tab absorbed before Explorer showed it could not take focus; hand
         // it over now that it is on screen.
         if self.focus_pending {
-            match self.views.get(active).and_then(|v| v.as_ref()) {
+            match self.views.get(active).and_then(|v| v.as_hosted()) {
                 Some(v) if host::is_visible(v.top) => {
                     focus_view(self.main_hwnd, self.attached_tid, v);
                     self.focus_pending = false;
@@ -2227,12 +2187,12 @@ impl App {
         let active_top = self
             .views
             .get(active)
-            .and_then(|v| v.as_ref())
+            .and_then(|v| v.as_hosted())
             .map(|v| v.top.0 as isize)
             .unwrap_or(0);
         for child in host::child_windows(self.main_hwnd) {
             let raw = child.0 as isize;
-            if self.views.iter().flatten().any(|v| v.top.0 as isize == raw) {
+            if self.views.iter().filter_map(|v| v.as_hosted()).any(|v| v.top.0 as isize == raw) {
                 continue; // tracked; visibility already handled above
             }
             if raw != active_top && host::is_visible(child) {
@@ -2277,8 +2237,8 @@ impl App {
 
     /// Release every absorbed window back to the desktop.
     fn release_all(&mut self) {
-        for v in self.views.iter_mut() {
-            if let Some(v) = v.take() {
+        for slot in self.views.iter_mut() {
+            if let View::Hosted(v) = std::mem::replace(slot, View::Pending) {
                 // Park it process-wide: this window is on its way out, and the
                 // surviving windows' sweeps must not adopt the pane back.
                 park_released(v.top);
@@ -2388,7 +2348,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
             app.create_tabbar_window();
-            app.create_bookmarkbar_window();
             app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which
@@ -2578,6 +2537,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
+            // Toolbar row: only the right-end settings gear is live for now.
+            // Other toolbar clicks do nothing (bookmark items are phase 3).
+            // Checked before tabbar.hit() so the row never falls into Hit::Band
+            // and starts a window drag.
+            if chrome::hit_settings(x, y, width) {
+                app.open_settings_tab();
+                return LRESULT(0);
+            }
+            if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
+                return LRESULT(0);
+            }
+            // Route by vertical band first. The caption/tab strip always wins
+            // over a Painted page — otherwise its X / min / max buttons and
+            // tab strip become unclickable while settings is open.
+            let painted_active = app
+                .views
+                .get(app.tabs.active_index())
+                .map(|v| v.is_painted())
+                .unwrap_or(false);
+            if chrome::route_click(y, painted_active) == chrome::ClickRoute::PaintedPage {
+                let rc = app.view_rect();
+                if let Some(hit) = app.settings_panel.hit(x, y, rc) {
+                    app.handle_settings_hit(hit);
+                }
+                return LRESULT(0);
+            }
             match app.tabbar.hit(x, y, width) {
                 tabbar::Hit::Tab(i) => app.begin_tab_press(i, x),
                 tabbar::Hit::Close(i) => {
@@ -2610,13 +2595,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        // Double click on the empty strip = maximize / restore, matching what
-        // a real caption does (the window class needs CS_DBLCLKS for this).
+        // Double click on the empty *chrome* strip = maximize / restore,
+        // matching what a real caption does (the class needs CS_DBLCLKS).
+        // Only the band ABOVE the view rect counts: a double-click on a
+        // Painted page (settings) or in a folder view must not maximize the
+        // window. tabbar.hit() reports Band for every y >= TABBAR_HEIGHT, so
+        // without the y guard the whole content area toggled maximize.
         WM_LBUTTONDBLCLK => {
             let app = app_from(hwnd);
             let (x, y) = point_from_lparam(lp);
             let width = app.client().right;
-            if app.tabbar.hit(x, y, width) == tabbar::Hit::Band {
+            if chrome::is_chrome_double_click(y)
+                && app.tabbar.hit(x, y, width) == tabbar::Hit::Band
+            {
                 app.toggle_maximize();
             }
             LRESULT(0)
@@ -2744,6 +2735,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
+            // A Painted tab owns its view rect; Hosted tabs let the Explorer
+            // child cover it (WS_CLIPCHILDREN keeps the two apart).
+            let is_painted = app
+                .views
+                .get(app.tabs.active_index())
+                .map(|v| v.is_painted())
+                .unwrap_or(false);
+            if is_painted {
+                let rc = app.view_rect();
+                app.settings_panel.paint(hdc, rc, &app.cfg.get());
+            }
             app.paint_band(hdc);
             app.paint_frame(hdc);
             let _ = EndPaint(hwnd, &ps);
@@ -2827,7 +2829,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             // Phase 3: re-acquire and dispatch.
-            let mut app = app_from(hwnd);
+            let app = app_from(hwnd);
             app.close_all_tabs();
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -2865,7 +2867,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.sync_input_queue();
             app.sync_chrome();
             if app.active {
-                if let Some(Some(v)) = app.views.get(app.tabs.active_index()) {
+                if let Some(v) = app.views.get(app.tabs.active_index()).and_then(|s| s.as_hosted()) {
                     focus_view(app.main_hwnd, app.attached_tid, v);
                 }
             }
@@ -2874,12 +2876,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m == WM_APP_CONFIG_CHANGED => {
             let app = app_from(hwnd);
             app.sync_tabbar();
-            // [bookmarks].enabled may have flipped: re-sync the popup and
-            // re-lay out so the Explorer view starts below/above it.
-            app.sync_bookmarkbar_window();
-            if !app.bookmarkbar_hwnd.0.is_null() {
-                let _ = InvalidateRect(app.bookmarkbar_hwnd, None, true);
-            }
+            // The chrome is one popup now (tabs + toolbar). A config change
+            // can repaint the toolbar colours; invalidate the whole band.
+            app.invalidate_band();
             app.laid_out = None;
             app.layout();
             LRESULT(0)
