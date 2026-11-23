@@ -1945,31 +1945,26 @@ impl App {
                 self.write_config("theme", "tab_radius", &next.to_string());
             }
             ThemePreset => {
-                // Cycle between the user's green ramp and the shipped dark
-                // default; each is a set of line-preserving writes.
-                let is_green = self.cfg.get().theme.tabbar_background.to_lowercase() == "#1b3d28";
-                if is_green {
-                    self.write_config("theme", "tabbar_background", "\"#2b2b2b\"");
-                    self.write_config("theme", "tab_active", "\"#4a6984\"");
-                    self.write_config("theme", "tab_inactive", "\"#3c3c3c\"");
-                    self.write_config("theme", "tab_hover", "\"#41474d\"");
-                    self.write_config("theme", "tab_text", "\"#cccccc\"");
-                    self.write_config("theme", "tab_text_active", "\"#ffffff\"");
-                    self.write_config("theme", "tabbar_text", "\"#cccccc\"");
-                } else {
-                    self.write_config("theme", "tabbar_background", "\"#1b3d28\"");
-                    self.write_config("theme", "tab_active", "\"#e8f5e9\"");
-                    self.write_config("theme", "tab_inactive", "\"#a5d6a7\"");
-                    self.write_config("theme", "tab_hover", "\"#c8e6c9\"");
-                    self.write_config("theme", "tab_text", "\"#1b3d28\"");
-                    self.write_config("theme", "tab_text_active", "\"#0f2a1a\"");
-                    self.write_config("theme", "tabbar_text", "\"#d8ecd9\"");
-                }
+                // Cycle between the two COMPLETE colour schemes in one file
+                // write. Writing a partial set used to leave a green/grey
+                // hybrid (the "3 shapes" bug); one write also means one
+                // watcher reload, so there is no half-applied visible state.
+                let next = match settings::current_preset(&self.cfg.get()) {
+                    Some("绿色") => settings::DARK_THEME,
+                    _ => settings::GREEN_THEME,
+                };
+                self.write_config_values(next);
             }
         }
     }
 
     fn write_config(&self, section: &str, key: &str, value: &str) {
+        self.write_config_values(&[(section, key, value)]);
+    }
+
+    /// Apply a batch of config edits with a single read-modify-write, so the
+    /// watcher sees one change and the user never sees a half-applied theme.
+    fn write_config_values(&self, edits: &[(&str, &str, &str)]) {
         let path = self.cfg.path().clone();
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -1978,7 +1973,7 @@ impl App {
                 return;
             }
         };
-        let updated = crate::config::set_toml_value(&text, section, key, value);
+        let updated = crate::config::set_toml_values(&text, edits);
         if let Err(e) = std::fs::write(&path, updated) {
             tracing::error!(error = %e, "settings: failed to write config");
         }

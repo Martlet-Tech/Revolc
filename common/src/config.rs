@@ -190,6 +190,17 @@ pub fn set_toml_value(text: &str, section: &str, key: &str, value: &str) -> Stri
     out
 }
 
+/// Apply many key/value edits to TOML text in one pass, preserving comments
+/// and layout like `set_toml_value`. Used by the theme preset switch so the
+/// whole scheme lands atomically (one file write -> one watcher reload).
+pub fn set_toml_values(text: &str, edits: &[(&str, &str, &str)]) -> String {
+    let mut out = text.to_string();
+    for (section, key, value) in edits {
+        out = set_toml_value(&out, section, key, value);
+    }
+    out
+}
+
 pub fn parse_color(s: &str) -> (u8, u8, u8) {
     let s = s.trim().trim_start_matches('#');
     if s.len() == 6 {
@@ -334,5 +345,17 @@ mod tests {
         assert!(updated.contains("[search]"), "{updated}");
         assert!(updated.contains("backend = \"system\""), "{updated}");
         assert!(updated.contains("# just a comment"), "{updated}");
+    }
+
+    #[test]
+    fn set_toml_values_applies_all_edits() {
+        let original = "[theme]\nbg = \"#green\"\nfg = \"#dark\"\n# keep me\n";
+        let updated = set_toml_values(
+            original,
+            &[("theme", "bg", "\"#2b2b2b\""), ("theme", "fg", "\"#cccccc\"")],
+        );
+        assert!(updated.contains("bg = \"#2b2b2b\""), "{updated}");
+        assert!(updated.contains("fg = \"#cccccc\""), "{updated}");
+        assert!(updated.contains("# keep me"), "{updated}");
     }
 }

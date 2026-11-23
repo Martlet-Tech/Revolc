@@ -20,6 +20,76 @@ const ROW_GAP: i32 = 8;
 const CATEGORIES: [&str; 3] = ["常规", "主题", "关于"];
 pub const CATEGORY_COUNT: usize = CATEGORIES.len();
 
+/// Two complete colour schemes. Every theme key that affects what the user
+/// sees must appear in BOTH lists — a partial switch produced a green/grey
+/// hybrid (the "3 shapes" bug). Values are TOML literals (quoted strings).
+pub const GREEN_THEME: &[(&str, &str, &str)] = &[
+    ("theme", "tabbar_background", "\"#1b3d28\""),
+    ("theme", "tab_inactive", "\"#a5d6a7\""),
+    ("theme", "tab_hover", "\"#c8e6c9\""),
+    ("theme", "tab_active", "\"#e8f5e9\""),
+    ("theme", "tab_text", "\"#1b3d28\""),
+    ("theme", "tab_text_active", "\"#0f2a1a\""),
+    ("theme", "tabbar_text", "\"#d8ecd9\""),
+    ("theme", "caption_hover", "\"#2b5c3f\""),
+    ("theme", "caption_close_hover", "\"#c42b1c\""),
+    ("theme", "window_border", "\"#0f2317\""),
+    ("theme", "bookmark_bar_background", "\"#202020\""),
+];
+
+pub const DARK_THEME: &[(&str, &str, &str)] = &[
+    ("theme", "tabbar_background", "\"#2b2b2b\""),
+    ("theme", "tab_inactive", "\"#3c3c3c\""),
+    ("theme", "tab_hover", "\"#41474d\""),
+    ("theme", "tab_active", "\"#4a6984\""),
+    ("theme", "tab_text", "\"#cccccc\""),
+    ("theme", "tab_text_active", "\"#ffffff\""),
+    ("theme", "tabbar_text", "\"#cccccc\""),
+    ("theme", "caption_hover", "\"#3d3d3d\""),
+    ("theme", "caption_close_hover", "\"#c42b1c\""),
+    ("theme", "window_border", "\"#151515\""),
+    ("theme", "bookmark_bar_background", "\"#202020\""),
+];
+
+/// Which preset (if any) the current config matches, by checking the whole
+/// scheme — not just tabbar_background — so a half-switched config reports
+/// "自定义" instead of claiming to be a preset.
+pub fn current_preset(cfg: &Config) -> Option<&'static str> {
+    let matches = |preset: &[(&str, &str, &str)]| {
+        preset.iter().all(|(_, key, expected)| {
+            let actual = theme_value(cfg, key);
+            // TOML literal -> plain value for comparison.
+            let want = expected.trim_matches('"');
+            actual.eq_ignore_ascii_case(want)
+        })
+    };
+    if matches(GREEN_THEME) {
+        Some("绿色")
+    } else if matches(DARK_THEME) {
+        Some("深灰蓝")
+    } else {
+        None
+    }
+}
+
+fn theme_value(cfg: &Config, key: &str) -> String {
+    let t = &cfg.theme;
+    match key {
+        "tabbar_background" => t.tabbar_background.clone(),
+        "tab_inactive" => t.tab_inactive.clone(),
+        "tab_hover" => t.tab_hover.clone(),
+        "tab_active" => t.tab_active.clone(),
+        "tab_text" => t.tab_text.clone(),
+        "tab_text_active" => t.tab_text_active.clone(),
+        "tabbar_text" => t.tabbar_text.clone(),
+        "caption_hover" => t.caption_hover.clone(),
+        "caption_close_hover" => t.caption_close_hover.clone(),
+        "window_border" => t.window_border.clone(),
+        "bookmark_bar_background" => t.bookmark_bar_background.clone(),
+        _ => String::new(),
+    }
+}
+
 /// What a mouse click on the settings page selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsHit {
@@ -192,8 +262,10 @@ impl SettingsPanel {
     }
 
     fn theme_preset_name(&self, cfg: &Config) -> String {
-        let bg = cfg.theme.tabbar_background.to_lowercase();
-        if bg == "#1b3d28" { "绿色（当前）" } else { "自定义" }.to_string()
+        match current_preset(cfg) {
+            Some(name) => format!("{name}（当前）"),
+            None => "自定义".to_string(),
+        }
     }
 
     /// Hit-test a point in view-rect client coords.

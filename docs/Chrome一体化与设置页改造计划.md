@@ -218,3 +218,5 @@ PaintedPage（开放枚举）
 **教训**：输入路由必须按**空间区域**分段，不能按"当前页面类型"一刀切吞掉所有消息。
 
 **同类瑕疵（已修复）**：双击设置页空白会让窗口在最大化/还原间切换。`WM_LBUTTONDBLCLK` 里 `tabbar.hit()` 对 y ≥ TABBAR_HEIGHT 一律返回 `Band`，导致内容区双击也触发 `toggle_maximize()`。修复：加 `chrome::is_chrome_double_click(y)`（y < CHROME_HEIGHT）门禁，只有 chrome 带的双击才 toggle。同样加了回归单测。
+
+**配色预设"三种形态"（已修复）**：主题切换原本只写 7 个颜色字段，漏掉 `caption_hover` / `window_border` / `caption_close_hover` / `bookmark_bar_background`，导致切换后出现"绿标题栏 + 灰标签"等混合态（用户观察到三种形态）。修复：`settings.rs` 定义 `GREEN_THEME` / `DARK_THEME` 两套**完整**配色（11 个键，两边一一对应），`config::set_toml_values` 一次读-改-写全部应用（一次 watcher reload，无中间态）；`current_preset()` 校验整个色系而非只看 `tabbar_background`，混合态显示"自定义"。用户当前的混合配置点一下"配色预设"即自动归位到完整绿色系。
