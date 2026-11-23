@@ -2553,13 +2553,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
                 return LRESULT(0);
             }
-            // Painted tab owns the whole view rect below the chrome.
-            let is_painted = app
+            // Route by vertical band first. The caption/tab strip always wins
+            // over a Painted page — otherwise its X / min / max buttons and
+            // tab strip become unclickable while settings is open.
+            let painted_active = app
                 .views
                 .get(app.tabs.active_index())
                 .map(|v| v.is_painted())
                 .unwrap_or(false);
-            if is_painted {
+            if chrome::route_click(y, painted_active) == chrome::ClickRoute::PaintedPage {
                 let rc = app.view_rect();
                 if let Some(hit) = app.settings_panel.hit(x, y, rc) {
                     app.handle_settings_hit(hit);
@@ -2826,7 +2828,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             // Phase 3: re-acquire and dispatch.
-            let mut app = app_from(hwnd);
+            let app = app_from(hwnd);
             app.close_all_tabs();
             unsafe {
                 let _ = DestroyWindow(hwnd);

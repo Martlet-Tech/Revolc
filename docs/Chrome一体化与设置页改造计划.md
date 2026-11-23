@@ -206,3 +206,13 @@ PaintedPage（开放枚举）
 - 阶段 C：`SettingsPanel` 三类设置，点击值切换；`set_toml_value` 按行写回保留注释；写入后现有 watcher 自动热刷新。设置页文字颜色用亮度自适应（`ink_on`），避免深色字画在深绿底上。
 - 已知限制（本次范围外）：设置页暂无键盘导航；收藏目录仍是占位文字（TODO Phase 3）；主题预设只有绿/深灰蓝两档；设置页关闭走 `Ctrl+W`（keymap 无 Esc 绑定）。
 - `cargo fmt --check` 报告的是仓库原有文件的格式差异，本次未做全局格式化以免污染无关文件。
+
+### 实测发现的严重 bug（已修复）
+
+**症状**：设置页能打开，但关不掉；设置页活动时窗口右上角 X / 标签关闭全部失灵，只能用任务管理器杀进程。
+
+**根因**：`WM_LBUTTONDOWN` 里按"active tab 是不是 Painted"决定路由，一旦设置页 active，**所有坐标的点击**（包括 y<34 的 caption 按钮行、34..62 的工具栏行）都被 `settings_panel.hit()` 处理后无条件 `return`，`tabbar.hit()` 永远到不了。日志印证：`settings tab opened` 之后没有任何 `caption button clicked`。
+
+**修复**：路由改为先按垂直分段（`chrome::route_click(y, painted_active)`）——y < CHROME_HEIGHT(62) 一律归 chrome（caption 按钮 + 标签 + 工具栏），只有 view_rect 内（y≥62）才在 Painted tab 时交给设置面板。加了 3 个回归单测覆盖"设置页活动时 caption 行仍归 chrome"。
+
+**教训**：输入路由必须按**空间区域**分段，不能按"当前页面类型"一刀切吞掉所有消息。

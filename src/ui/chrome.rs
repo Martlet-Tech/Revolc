@@ -31,6 +31,30 @@ pub fn hit_settings(x: i32, y: i32, width: i32) -> bool {
     x >= settings_button_x(width)
 }
 
+/// Which layer handles a left click in the main window's client coordinates.
+///
+/// The split is purely vertical: everything above CHROME_HEIGHT is window
+/// chrome (tabs, caption buttons) and always goes to the tab bar hit test —
+/// even when a Painted (settings) tab is active. Only the area below the
+/// chrome belongs to the painted page. Getting this wrong swallows the X /
+/// min / max buttons and makes an active settings tab impossible to escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickRoute {
+    Chrome,
+    PaintedPage,
+    FolderView,
+}
+
+pub fn route_click(y: i32, painted_active: bool) -> ClickRoute {
+    if y < super::CHROME_HEIGHT {
+        ClickRoute::Chrome
+    } else if painted_active {
+        ClickRoute::PaintedPage
+    } else {
+        ClickRoute::FolderView
+    }
+}
+
 /// Paint the toolbar row. `top` is where the row starts (= TABBAR_HEIGHT).
 pub unsafe fn paint(hdc: HDC, width: i32, top: i32, cfg: &Config) {
     let height = super::BOOKMARK_HEIGHT;
@@ -95,4 +119,38 @@ unsafe fn paint_gear(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORREF) 
 unsafe fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
     let _ = MoveToEx(hdc, x1, y1, None);
     let _ = LineTo(hdc, x2, y2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::caption;
+    use super::super::{BOOKMARK_HEIGHT, CHROME_HEIGHT};
+
+    #[test]
+    fn caption_band_always_routes_to_chrome_even_when_settings_active() {
+        // Regression: an active settings tab used to swallow every click,
+        // including the window X / min / max buttons (y < TABBAR_HEIGHT) and
+        // the tab strip. Those must always reach the tab bar hit test.
+        for y in [0, caption::HEIGHT / 2, caption::HEIGHT - 1] {
+            assert_eq!(route_click(y, true), ClickRoute::Chrome, "y={y}");
+        }
+    }
+
+    #[test]
+    fn toolbar_band_routes_to_chrome() {
+        // The bookmark row is chrome, not the painted page.
+        assert_eq!(route_click(caption::HEIGHT, true), ClickRoute::Chrome);
+        assert_eq!(
+            route_click(caption::HEIGHT + BOOKMARK_HEIGHT - 1, true),
+            ClickRoute::Chrome
+        );
+    }
+
+    #[test]
+    fn view_rect_routes_by_active_tab_kind() {
+        let y = CHROME_HEIGHT + 10;
+        assert_eq!(route_click(y, true), ClickRoute::PaintedPage);
+        assert_eq!(route_click(y, false), ClickRoute::FolderView);
+    }
 }
