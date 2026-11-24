@@ -72,6 +72,8 @@ pub const WM_APP_CONFIG_CHANGED: u32 = 0x8000; // posted by config-watcher threa
 pub const WM_APP_QUIT: u32 = 0x8010;
 /// Tray -> hidden window: show it again. Must match common::messages.
 pub const WM_APP_RESTORE: u32 = 0x8011;
+/// Tray -> window: close all tabs (their Explorer panes) and the frame.
+pub const WM_APP_CLOSE_TABS: u32 = 0x8012;
 /// WM_COPYDATA tag from the BHO for navigation events ("RNAV"). Payload is
 /// UTF-8 "HWND<TAB>url"; must match NAV_COPYDATA_TAG in bho/src/nav.rs.
 const NAV_COPYDATA_TAG: usize = 0x524E4156;
@@ -2283,6 +2285,13 @@ impl App {
         if !self.tabs.activate(i) {
             return;
         }
+        // Tray menu shows the three most recently used tabs of this window.
+        // Use the same label source as the strip; fall back to the short path
+        // while a reserved tab is still waiting for its Explorer pane.
+        let label = self.tabs.get(i)
+            .and_then(|t| if t.label.is_empty() { None } else { Some(t.label.clone()) })
+            .unwrap_or_else(|| self.tabs.get(i).map(|t| short_label(&t.path)).unwrap_or_default());
+        revolc_common::tab_mru::note_activation(self.main_hwnd, &label);
         // POSITION BEFORE SHOWING. A freshly absorbed window still carries its
         // desktop size and origin, so showing it first paints it at (0,0) over
         // the tab bar for one frame — the "content flashes at the wrong place"
@@ -2842,6 +2851,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             app_from(hwnd).release_all();
+            revolc_common::tab_mru::remove(hwnd);
             // One process = one window now (Phase 2): its destruction ends
             // this process. The tray, if any, lives in a separate exe.
             if let Some(l) = ledger() {
@@ -3409,6 +3419,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             app.surface();
             let _ = SetForegroundWindow(hwnd);
+            LRESULT(0)
+        }
+        m if m == WM_APP_CLOSE_TABS => {
+            // Tray "close this window" / "close all": close every tab, which
+            // posts WM_CLOSE to each absorbed Explorer pane (not restore),
+            // then tear down the frame. WM_DESTROY still runs release_all for
+            // any pane whose close has not landed yet — a restored pane is
+            // better than a dangling re-parented window.
+            let app = app_from(hwnd);
+            app.close_all_tabs();
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         m if m == WM_APP_QUIT => {

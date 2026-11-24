@@ -11,6 +11,8 @@
 //!   * BHO fallback when zero windows are open (spawn one to absorb),
 //!   * config reload with single-file watch + debounce.
 
+mod menu;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -20,11 +22,11 @@ use std::time::{Duration, Instant};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use revolc_common::config::{config_path, ConfigHandle};
 use revolc_common::ledger::Ledger;
-use revolc_common::messages::{absorb_msg, WM_APP_QUIT, WM_APP_RESTORE, WM_APP_TRAY};
+use revolc_common::messages::{absorb_msg, WM_APP_CLOSE_TABS, WM_APP_QUIT, WM_APP_RESTORE, WM_APP_TRAY};
 use revolc_common::takeover::ensure_bho_registered;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM, GetLastError,
+    BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM, GetLastError,
 };
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -34,22 +36,17 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
-    GetMessageW, GetWindowTextW, IsWindow, IsWindowVisible, LoadCursorW, MF_SEPARATOR, MF_STRING,
-    MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    TrackPopupMenuEx, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
+    GetMessageW, GetWindowTextW, IsWindow, IsWindowVisible, LoadCursorW,
+    MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    TranslateMessage, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
-    WNDCLASSEXW, TPM_RETURNCMD, IDC_ARROW,
+    WNDCLASSEXW, IDC_ARROW,
 };
 
 const TRAY_CLASS: PCWSTR = w!("RevolcResident");
 const TRAY_ID: u32 = 1;
-const CMD_NEW_WINDOW: usize = 3;
-const CMD_CLOSE_ALL: usize = 5;
-const CMD_EXIT: usize = 2;
-const LIST_CMD_BASE: usize = 100;
-const MAX_LIST: usize = 32;
 
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
@@ -58,6 +55,12 @@ static EXE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Set when the config watcher asks the tray to hide, so WM_APP_QUIT knows to
 /// keep BHO registration (takeover stays on) instead of tearing everything down.
 static HIDDEN_BY_CONFIG: AtomicBool = AtomicBool::new(false);
+
+/// The tray message window, for menu commands posted back to this process.
+pub(crate) fn tray_hwnd() -> HWND {
+    let raw = TRAY_HWND.load(Ordering::SeqCst);
+    HWND(raw as _)
+}
 
 fn main() {
     revolc_common::crash::install();
@@ -325,14 +328,21 @@ unsafe extern "system" fn enum_windows(hwnd: HWND, lp: LPARAM) -> BOOL {
             Some(enum_tab_pane),
             LPARAM(&mut panes as *mut Vec<String> as isize),
         );
-        let label = if panes.is_empty() {
-            // No hosted pane yet (e.g. a settings-only window): fall back to
-            // the frame title so the entry is never blank.
-            let mut title = [0u16; 256];
-            let t = GetWindowTextW(hwnd, &mut title);
-            String::from_utf16_lossy(&title[..t.max(0) as usize])
+        // Prefer the MRU labels the window process records on every tab
+        // activation ("recently used 3 tabs"), falling back to the pane
+        // order when no MRU file exists yet.
+        let mut mru = revolc_common::tab_mru::read(hwnd);
+        let label = if mru.is_empty() {
+            if panes.is_empty() {
+                let mut title = [0u16; 256];
+                let t = GetWindowTextW(hwnd, &mut title);
+                String::from_utf16_lossy(&title[..t.max(0) as usize])
+            } else {
+                panes.join(" / ")
+            }
         } else {
-            panes.join("/")
+            mru.truncate(3);
+            mru.join(" / ")
         };
         out.push((hwnd, label));
     }
@@ -366,49 +376,26 @@ fn spawn_window() {
     }
 }
 
-/// Left-clicking the tray restores a window hidden by the "hide to tray"
-/// close action; only when there is no hidden window do we open a new one.
-/// Without this, hiding a window and clicking the icon produced a second
-/// window at the home folder while the original stayed invisible — looking
-/// exactly like the hidden window had lost all its tabs.
-unsafe fn restore_or_spawn() {
-    let hidden: Vec<HWND> = our_windows()
-        .into_iter()
-        .map(|(h, _)| h)
-        .filter(|h| !IsWindowVisible(*h).as_bool())
-        .collect();
-    if let Some(target) = hidden.first() {
-        tracing::info!(?target, "tray click restoring hidden window");
-        let _ = PostMessageW(*target, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
-    } else {
-        spawn_window();
+/// Left-click switches to the most recently active Revolc window (hidden or
+/// minimized included), matching the browser-style tray. No window = nothing
+/// to switch to; right-click still offers "new window".
+unsafe fn switch_to_last_active() {
+    let target = LEDGER.get()
+        .and_then(|l| l.lock().ok().and_then(|g| g.last_active()));
+    if let Some(h) = target {
+        if IsWindow(h).as_bool() {
+            let _ = PostMessageW(h, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
+            return;
+        }
     }
-}
-
-unsafe fn popup_menu(hwnd: HWND) -> usize {
-    let menu = match CreatePopupMenu() {
-        Ok(m) => m,
-        Err(_) => return 0,
-    };
-    // Open windows are first-class entries: one click restores one window,
-    // no submenu to hunt through. Label = "窗口N: tab1/tab2/...".
+    // Ledger empty (tray just started): fall back to the first hidden window,
+    // then to any window.
     let windows = our_windows();
-    for (i, (_, label)) in windows.iter().take(MAX_LIST).enumerate() {
-        let text: Vec<u16> = format!("窗口{}: {}", i + 1, label)
-            .encode_utf16().chain(Some(0)).collect();
-        let _ = AppendMenuW(menu, MF_STRING, LIST_CMD_BASE + i, PCWSTR(text.as_ptr()));
+    if let Some((h, _)) = windows.iter().find(|(h, _)| !IsWindowVisible(*h).as_bool()) {
+        let _ = PostMessageW(*h, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
+    } else if let Some((h, _)) = windows.first() {
+        let _ = PostMessageW(*h, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
     }
-    if !windows.is_empty() {
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    }
-    let _ = AppendMenuW(menu, MF_STRING, CMD_CLOSE_ALL, w!("关闭全部窗口"));
-    let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_WINDOW, w!("新建窗口"));
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("退出(托盘+全部窗口)"));
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let _ = SetForegroundWindow(hwnd);
-    TrackPopupMenuEx(menu, TPM_RETURNCMD.0, pt.x, pt.y, hwnd, None).0 as usize
 }
 
 /// Tear down the tray. The two flags are independent:
@@ -503,38 +490,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         m if m == WM_APP_TRAY => {
             match lp.0 as u32 {
-                WM_LBUTTONUP | WM_LBUTTONDBLCLK => restore_or_spawn(),
-                WM_RBUTTONUP => match popup_menu(hwnd) {
-                    CMD_NEW_WINDOW => spawn_window(),
-                    cmd if cmd >= LIST_CMD_BASE => {
-                        // One click restores one window. Re-enumerate so the
-                        // index matches the menu that was just shown; a
-                        // window may have closed while the menu was open.
-                        let windows = our_windows();
-                        if let Some((target, _)) = windows.get(cmd - LIST_CMD_BASE) {
-                            if IsWindow(*target).as_bool() {
-                                // The window knows whether it is hidden
-                                // (close="hide") or minimized, and keeps its
-                                // maximized state on restore.
-                                let _ = PostMessageW(
-                                    *target,
-                                    WM_APP_RESTORE,
-                                    WPARAM(0),
-                                    LPARAM(0),
-                                );
-                            }
-                        }
-                    }
-                    CMD_CLOSE_ALL => {
-                        for (h, _) in our_windows() {
-                            let _ = PostMessageW(h, WM_APP_QUIT, WPARAM(0), LPARAM(0));
-                        }
-                    }
-                    CMD_EXIT => quit(hwnd, true, true),
-                    _ => {}
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => switch_to_last_active(),
+                WM_RBUTTONUP => unsafe {
+                    menu::show(hwnd, our_windows());
                 },
                 _ => {}
             }
+            LRESULT(0)
+        }
+        m if m == menu::CMD_NEW_WINDOW => { spawn_window(); LRESULT(0) }
+        m if m == menu::CMD_EXIT => { quit(hwnd, true, true); LRESULT(0) }
+        m if m == menu::CMD_CLOSE_ALL => {
+            // "Close everything": close every tab (and its Explorer pane),
+            // then tear down the tray without restoring anything to desktop.
+            for (h, _) in our_windows() {
+                let _ = PostMessageW(h, WM_APP_CLOSE_TABS, WPARAM(0), LPARAM(0));
+            }
+            quit(hwnd, true, false);
             LRESULT(0)
         }
         m if m == WM_APP_QUIT => {
