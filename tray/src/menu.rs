@@ -139,22 +139,29 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let snapshot = rows().lock().unwrap().clone();
-    let mut y = 0i32;
+
+    // One background fill for the WHOLE window first. The window class has no
+    // background brush, so any pixel we miss stays white/garbage — that was
+    // the white bars between rows in the first build.
+    let total: i32 = snapshot.iter().map(|r| r.height).sum();
+    let bg = CreateSolidBrush(COLORREF(0x002B2B2B));
+    let whole = RECT { left: 0, top: 0, right: MENU_W, bottom: total };
+    let _ = FillRect(hdc, &whole, bg);
+    let _ = DeleteObject(HGDIOBJ(bg.0));
+
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(0x00E0E0E0));
     let font = GetStockObject(DEFAULT_GUI_FONT);
+    let _ = SelectObject(hdc, HGDIOBJ(font.0));
+
+    let mut y = 0i32;
     for row in &snapshot {
         if row.separator {
-            let brush = CreateSolidBrush(COLORREF(0x00606060));
+            let line = CreateSolidBrush(COLORREF(0x00606060));
             let rc = RECT { left: PAD, top: y + SEP_H / 2, right: MENU_W - PAD, bottom: y + SEP_H / 2 + 1 };
-            let _ = FillRect(hdc, &rc, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
+            let _ = FillRect(hdc, &rc, line);
+            let _ = DeleteObject(HGDIOBJ(line.0));
         } else {
-            let brush = CreateSolidBrush(COLORREF(0x002B2B2B));
-            let rc = RECT { left: 0, top: y, right: MENU_W, bottom: y + ROW_H };
-            let _ = FillRect(hdc, &rc, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-            let _ = SetBkMode(hdc, TRANSPARENT);
-            let _ = SetTextColor(hdc, COLORREF(0x00E0E0E0));
-            let _ = SelectObject(hdc, HGDIOBJ(font.0));
             let mut rc = RECT { left: PAD, top: y, right: MENU_W - PAD - X_W, bottom: y + ROW_H };
             let mut text: Vec<u16> = row.text.encode_utf16().chain(Some(0)).collect();
             let _ = DrawTextW(hdc, &mut text, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
