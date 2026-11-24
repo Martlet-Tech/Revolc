@@ -129,8 +129,12 @@ impl SettingsPanel {
             }
         }
         for id in settings_in_category(self.category) {
-            self.row(hdc, pane_left, &mut y, pane_right, id.label(), &id.display(cfg), cfg);
-            let hint = id.hint();
+            let available = id.is_available(cfg);
+            let hint = if available { id.hint() } else { id.unavailable_hint() };
+            self.row(
+                hdc, pane_left, &mut y, pane_right,
+                id.label(), &id.display(cfg), cfg, available,
+            );
             if !hint.is_empty() {
                 y -= 12; // tuck the hint under the row without a full gap
                 self.note(hdc, pane_left + 12, &mut y, pane_right, hint, page_ink);
@@ -170,13 +174,29 @@ impl SettingsPanel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn row(&self, hdc: HDC, x: i32, y: &mut i32, right: i32, label: &str, value: &str, cfg: &Config) {
+    unsafe fn row(
+        &self, hdc: HDC, x: i32, y: &mut i32, right: i32,
+        label: &str, value: &str, cfg: &Config, available: bool,
+    ) {
         let rc = RECT { left: x, top: *y, right, bottom: *y + ROW_H };
         let row_bg = Self::color(cfg, |t| &t.tab_inactive);
         let brush = CreateSolidBrush(row_bg);
         let _ = FillRect(hdc, &rc, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
-        let _ = SetTextColor(hdc, contrast_text(row_bg));
+        // Grey text on the same background reads as "disabled" without
+        // introducing a new colour key or a different row shape.
+        let ink = if available {
+            contrast_text(row_bg)
+        } else {
+            // Blend the readable ink halfway into the background: visibly
+            // dimmed but still legible, without a new config colour key.
+            let bg = COLORREF(row_bg.0);
+            let fg = contrast_text(bg);
+            let byte = |c: u32| -> u32 { ((c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff)) / 3 };
+            let mix = |a: u32, b: u32| -> u32 { (byte(a) + byte(b)) / 2 };
+            COLORREF(mix(bg.0, fg.0) * 0x010101)
+        };
+        let _ = SetTextColor(hdc, ink);
         let mut lrc = RECT { left: x + 12, top: *y, right: x + 180, bottom: *y + ROW_H };
         let mut lwide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
         let _ = DrawTextW(hdc, &mut lwide, &mut lrc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -186,8 +206,9 @@ impl SettingsPanel {
         *y += ROW_H + ROW_GAP;
     }
 
-    /// Hit-test a point in view-rect client coords.
-    pub fn hit(&self, x: i32, y: i32, rc: RECT) -> Option<SettingsHit> {
+    /// Hit-test a point in view-rect client coords. Unavailable settings keep
+    /// their row (and their place in the layout) but do not answer hits.
+    pub fn hit(&self, x: i32, y: i32, rc: RECT, cfg: &Config) -> Option<SettingsHit> {
         let cat_y0 = rc.top + 40;
         for i in 0..CATEGORIES.len() {
             let top = cat_y0 + (i as i32) * (ROW_H + ROW_GAP);
@@ -205,10 +226,11 @@ impl SettingsPanel {
             0 | 1 => {
                 for id in settings_in_category(self.category) {
                     if in_row(y, y_cursor) {
-                        return Some(SettingsHit::Setting(id));
+                        return id.is_available(cfg).then_some(SettingsHit::Setting(id));
                     }
                     y_cursor += ROW_H + ROW_GAP;
-                    if !id.hint().is_empty() {
+                    let hint = if id.is_available(cfg) { id.hint() } else { id.unavailable_hint() };
+                    if !hint.is_empty() {
                         y_cursor -= 12;
                         y_cursor += 28; // note() height
                     }

@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::Watcher;
+use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
 
 use crate::config::{self, ConfigHandle};
 use crate::shell;
@@ -88,9 +89,7 @@ fn sync_session_state(cfg: &ConfigHandle) {
     let snapshot = cfg.get();
 
     if snapshot.tray.enabled {
-        if let Err(e) = spawn_tray() {
-            tracing::warn!(error = %e, "could not start tray (window features still work)");
-        }
+        ensure_tray();
     }
 
     let exe = std::env::current_exe().unwrap_or_default();
@@ -102,17 +101,32 @@ fn sync_session_state(cfg: &ConfigHandle) {
     }
 }
 
-/// Spawn `revolc-tray.exe` next to this executable. The tray exits on its own
-/// if another instance holds the mutex, so no cross-process check is needed.
-fn spawn_tray() -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
+/// Make sure the tray is running, but only if it is not already. Checking the
+/// tray window (rather than relying on each process's watcher state) makes
+/// this correct even when several window processes start or reload at once —
+/// the old unconditional spawn could resurrect a tray the user just hid.
+fn ensure_tray() {
+    // RevolcResident is the tray's hidden message-only-ish window; it exists
+    // for the whole lifetime of a live tray process.
+    let already = unsafe { FindWindowW(w!("RevolcResident"), None) };
+    if already.map(|h| !h.0.is_null()).unwrap_or(false) {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot locate exe to spawn tray");
+            return;
+        }
+    };
     let tray = exe
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("revolc-tray.exe");
-    std::process::Command::new(&tray).spawn()?;
-    tracing::info!(?tray, "spawned tray");
-    Ok(())
+    match std::process::Command::new(&tray).spawn() {
+        Ok(_) => tracing::info!(?tray, "spawned tray"),
+        Err(e) => tracing::warn!(error = %e, ?tray, "could not start tray"),
+    }
 }
 
 /// Watch only `revolc.toml` (never the whole directory) and debounce bursts.
@@ -134,11 +148,9 @@ fn spawn_config_watcher(cfg: Arc<ConfigHandle>, hwnd_raw: usize) -> Option<notif
                 cfg.reload();
                 let enabled = cfg.get().tray.enabled;
                 if enabled && !tray_was_enabled {
-                    // Tray turned back on: spawn it. Turning off is handled by
-                    // the tray's own watcher, so we don't touch it here.
-                    if let Err(e) = spawn_tray() {
-                        tracing::warn!(error = %e, "could not restart tray");
-                    }
+                    // Tray turned back on: start it if no live tray owns the
+                    // window yet. Turning off is the tray's own watcher's job.
+                    ensure_tray();
                 }
                 tray_was_enabled = enabled;
 

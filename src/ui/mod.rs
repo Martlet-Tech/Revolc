@@ -3035,7 +3035,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 .unwrap_or(false);
             if chrome::route_click(y, painted_active) == chrome::ClickRoute::PaintedPage {
                 let rc = app.view_rect();
-                if let Some(hit) = app.settings_panel.hit(x, y, rc) {
+                if let Some(hit) = app.settings_panel.hit(x, y, rc, &app.cfg.get()) {
                     app.handle_settings_hit(hit);
                 }
                 return LRESULT(0);
@@ -3371,6 +3371,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             };
             if hide {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                // The tab strip is an owned top-level popup, not a child: it
+                // stays on screen unless we hide it explicitly. surface()
+                // calls the same sync on restore.
+                app_from(hwnd).sync_tabbar_window();
                 tracing::info!("window hidden to tray");
                 return LRESULT(0);
             }

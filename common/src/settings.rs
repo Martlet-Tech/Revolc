@@ -53,6 +53,25 @@ impl SettingId {
         }
     }
 
+    /// Whether this setting can be changed in the current config. A setting
+    /// whose meaning depends on another one is disabled, not silently forced:
+    /// "hide to tray" is meaningless with no tray, so the row is greyed out
+    /// instead of accepting a click that gets rewritten to "exit".
+    pub fn is_available(self, cfg: &Config) -> bool {
+        match self {
+            SettingId::CloseAction => cfg.tray.enabled,
+            _ => true,
+        }
+    }
+
+    /// Hint shown while the setting is unavailable.
+    pub fn unavailable_hint(self) -> &'static str {
+        match self {
+            SettingId::CloseAction => "需先开启托盘",
+            _ => "",
+        }
+    }
+
     /// One-line hint shown under the row, if any.
     pub fn hint(self) -> &'static str {
         match self {
@@ -98,7 +117,13 @@ impl SettingId {
             SettingId::TrayEnabled => if cfg.tray.enabled { "开" } else { "关" }.into(),
             SettingId::Autostart => if cfg.tray.autostart { "开" } else { "关" }.into(),
             SettingId::CloseAction => {
-                if cfg.tray.close_action == "hide" { "隐藏到托盘" } else { "退出" }.into()
+                if !cfg.tray.enabled {
+                    "退出（需先开启托盘）".into()
+                } else if cfg.tray.close_action == "hide" {
+                    "隐藏到托盘".into()
+                } else {
+                    "退出".into()
+                }
             }
             SettingId::ThemePreset => crate::theme_presets::current_preset_name(cfg).to_string(),
         }
@@ -131,9 +156,11 @@ impl SettingId {
                 vec![("tray", "autostart", next.to_string())]
             }
             SettingId::CloseAction => {
+                // No silent rewrite to "exit" here: apply() refuses this
+                // setting entirely while the tray is off, and the UI greys
+                // the row. With the tray on, hide/exit is a plain toggle.
                 let next = if cfg.tray.close_action == "hide" { "exit" } else { "hide" };
-                let eff = if cfg.tray.enabled { next } else { "exit" };
-                vec![("tray", "close_action", format!("\"{eff}\""))]
+                vec![("tray", "close_action", format!("\"{next}\""))]
             }
             SettingId::ThemePreset => {
                 let next = crate::theme_presets::next_preset(cfg);
@@ -163,6 +190,9 @@ impl SettingId {
 /// Computes the next value from `cfg`, validates it, then writes every edit in
 /// one pass so the watcher sees a single change (one reload, no half state).
 pub fn apply(cfg: &Config, text: &str, id: SettingId) -> Result<String, &'static str> {
+    if !id.is_available(cfg) {
+        return Err("setting unavailable");
+    }
     let edits = id.next_edits(cfg);
     if let Some((_, _, value)) = edits.first() {
         id.validate(value)?;
@@ -214,10 +244,11 @@ mod tests {
     }
 
     #[test]
-    fn hide_is_forced_to_exit_without_tray() {
+    fn close_action_is_unavailable_without_tray() {
         let mut cfg = Config::default();
+        assert!(SettingId::CloseAction.is_available(&cfg));
         cfg.tray.enabled = false;
-        let edits = SettingId::CloseAction.next_edits(&cfg);
-        assert_eq!(edits[0].2, "\"exit\"");
+        assert!(!SettingId::CloseAction.is_available(&cfg));
+        assert!(apply(&cfg, "[tray]\nenabled = false\n", SettingId::CloseAction).is_err());
     }
 }
