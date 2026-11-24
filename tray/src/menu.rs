@@ -12,16 +12,16 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
-    SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT,
-    DT_SINGLELINE, DT_VCENTER, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    InvalidateRect, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics,
-    LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WNDCLASSEXW, WM_ACTIVATEAPP, WM_CANCELMODE, WM_DESTROY, WM_LBUTTONDOWN,
-    WM_PAINT, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN,
-    SW_SHOW, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW, WS_POPUP,
+    LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, WNDCLASSEXW, WM_ACTIVATEAPP, WM_CANCELMODE, WM_DESTROY,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST,
+    IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use revolc_common::messages::{WM_APP_CLOSE_TABS, WM_APP_RESTORE};
@@ -29,7 +29,7 @@ use revolc_common::messages::{WM_APP_CLOSE_TABS, WM_APP_RESTORE};
 const MENU_CLASS: PCWSTR = w!("RevolcTrayMenu");
 const ROW_H: i32 = 34;
 const SEP_H: i32 = 9;
-const MENU_W: i32 = 560;
+const MENU_W: i32 = 520;
 const PAD: i32 = 12;
 const X_W: i32 = 28;
 
@@ -58,18 +58,40 @@ struct Row {
 static ROWS: OnceLock<Mutex<Vec<Row>>> = OnceLock::new();
 fn rows() -> &'static Mutex<Vec<Row>> { ROWS.get_or_init(|| Mutex::new(Vec::new())) }
 
+/// Which part of a window row the pointer is over. Left and × highlight
+/// independently so the close target is obvious before clicking.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum HoverPart { #[default] None, Left, X }
+static HOVER: OnceLock<Mutex<(usize, HoverPart)>> = OnceLock::new();
+fn hover() -> &'static Mutex<(usize, HoverPart)> {
+    HOVER.get_or_init(|| Mutex::new((usize::MAX, HoverPart::None)))
+}
+
+/// Generic shell captions that carry no information in a tab list.
+fn short_tab(label: &str) -> Option<&str> {
+    let s = label.trim();
+    if s.is_empty() || s == "文件资源管理器" || s == "此电脑" || s == "File Explorer" || s == "This PC" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Show the menu at the cursor. `windows` is (hwnd, "tabA/tabB/tabC") in
 /// display order; `tray` receives the command messages.
 pub unsafe fn show(tray: HWND, windows: Vec<(HWND, String)>) {
     let mut list: Vec<Row> = Vec::new();
     for (i, (hwnd, label)) in windows.iter().enumerate() {
+        let tabs: Vec<&str> = label.split(" / ").filter_map(short_tab).collect();
+        let text = format!("{}#: {}", i + 1, tabs.join(" / "));
         list.push(Row {
-            text: format!("窗口{}: {}", i + 1, label),
+            text,
             action: Action::Window(hwnd.0 as isize),
             separator: false,
             height: ROW_H,
         });
     }
+    *hover().lock().unwrap() = (usize::MAX, HoverPart::None);
     list.push(Row { text: String::new(), action: Action::NewWindow, separator: true, height: SEP_H });
     list.push(Row { text: "新建窗口".into(), action: Action::NewWindow, separator: false, height: ROW_H });
     list.push(Row { text: String::new(), action: Action::Exit, separator: true, height: SEP_H });
@@ -127,6 +149,7 @@ unsafe fn register_class_inner() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => { paint(hwnd); LRESULT(0) }
+        WM_MOUSEMOVE => { on_hover(hwnd, lp); LRESULT(0) }
         WM_LBUTTONDOWN => { on_click(hwnd, lp); LRESULT(0) }
         WM_ACTIVATEAPP if wp.0 == 0 => { let _ = DestroyWindow(hwnd); LRESULT(0) }
         WM_CANCELMODE => { let _ = DestroyWindow(hwnd); LRESULT(0) }
@@ -154,14 +177,34 @@ unsafe fn paint(hwnd: HWND) {
     let font = GetStockObject(DEFAULT_GUI_FONT);
     let _ = SelectObject(hdc, HGDIOBJ(font.0));
 
+    let (hover_row, hover_part) = *hover().lock().unwrap();
     let mut y = 0i32;
-    for row in &snapshot {
+    for (idx, row) in snapshot.iter().enumerate() {
         if row.separator {
             let line = CreateSolidBrush(COLORREF(0x00606060));
             let rc = RECT { left: PAD, top: y + SEP_H / 2, right: MENU_W - PAD, bottom: y + SEP_H / 2 + 1 };
             let _ = FillRect(hdc, &rc, line);
             let _ = DeleteObject(HGDIOBJ(line.0));
         } else {
+            let hot = idx == hover_row;
+            if hot {
+                // Highlight only the hovered half: the row (left) and the
+                // close button (right) get separate colours.
+                let (left_color, x_color) = match hover_part {
+                    HoverPart::X => (COLORREF(0x002B2B2B), COLORREF(0x000030C0)),
+                    _ => (COLORREF(0x003A3A3A), COLORREF(0x002B2B2B)),
+                };
+                let lbrush = CreateSolidBrush(left_color);
+                let rc = RECT { left: 0, top: y, right: MENU_W - PAD - X_W, bottom: y + ROW_H };
+                let _ = FillRect(hdc, &rc, lbrush);
+                let _ = DeleteObject(HGDIOBJ(lbrush.0));
+                if matches!(row.action, Action::Window(_)) {
+                    let xbrush = CreateSolidBrush(x_color);
+                    let xrc0 = RECT { left: MENU_W - PAD - X_W, top: y, right: MENU_W, bottom: y + ROW_H };
+                    let _ = FillRect(hdc, &xrc0, xbrush);
+                    let _ = DeleteObject(HGDIOBJ(xbrush.0));
+                }
+            }
             let mut rc = RECT { left: PAD, top: y, right: MENU_W - PAD - X_W, bottom: y + ROW_H };
             let mut text: Vec<u16> = row.text.encode_utf16().chain(Some(0)).collect();
             let _ = DrawTextW(hdc, &mut text, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -174,6 +217,33 @@ unsafe fn paint(hwnd: HWND) {
         y += row.height;
     }
     let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn on_hover(hwnd: HWND, lp: LPARAM) {
+    let x = (lp.0 as u32 & 0xffff) as i32;
+    let y = ((lp.0 as u32 >> 16) & 0xffff) as i32;
+    let snapshot = rows().lock().unwrap().clone();
+    let mut next = (usize::MAX, HoverPart::None);
+    let mut top = 0i32;
+    for (idx, row) in snapshot.iter().enumerate() {
+        let bottom = top + row.height;
+        if y >= top && y < bottom && !row.separator {
+            let part = if matches!(row.action, Action::Window(_)) && x >= MENU_W - PAD - X_W {
+                HoverPart::X
+            } else {
+                HoverPart::Left
+            };
+            next = (idx, part);
+            break;
+        }
+        top = bottom;
+    }
+    let mut h = hover().lock().unwrap();
+    if *h != next {
+        *h = next;
+        drop(h);
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 unsafe fn on_click(hwnd: HWND, lp: LPARAM) {
