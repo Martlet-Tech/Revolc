@@ -36,7 +36,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
-    GetMessageW, GetWindowTextW, IsWindow, LoadCursorW, MF_SEPARATOR, MF_STRING,
+    GetMessageW, GetWindowTextW, IsWindow, IsWindowVisible, LoadCursorW, MF_SEPARATOR, MF_STRING,
     MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
     TrackPopupMenuEx, TranslateMessage, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
@@ -336,6 +336,25 @@ fn spawn_window() {
     }
 }
 
+/// Left-clicking the tray restores a window hidden by the "hide to tray"
+/// close action; only when there is no hidden window do we open a new one.
+/// Without this, hiding a window and clicking the icon produced a second
+/// window at the home folder while the original stayed invisible — looking
+/// exactly like the hidden window had lost all its tabs.
+unsafe fn restore_or_spawn() {
+    let hidden: Vec<HWND> = our_windows()
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| !IsWindowVisible(*h).as_bool())
+        .collect();
+    if let Some(target) = hidden.first() {
+        tracing::info!(?target, "tray click restoring hidden window");
+        let _ = PostMessageW(*target, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
+    } else {
+        spawn_window();
+    }
+}
+
 unsafe fn popup_menu(hwnd: HWND) -> usize {
     let menu = match CreatePopupMenu() {
         Ok(m) => m,
@@ -471,7 +490,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         m if m == WM_APP_TRAY => {
             match lp.0 as u32 {
-                WM_LBUTTONUP | WM_LBUTTONDBLCLK => spawn_window(),
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => restore_or_spawn(),
                 WM_RBUTTONUP => match popup_menu(hwnd) {
                     CMD_NEW_WINDOW => spawn_window(),
                     CMD_WINDOW_LIST => {
