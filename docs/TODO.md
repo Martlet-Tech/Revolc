@@ -18,6 +18,14 @@
 > section/key/校验/cycle/预设编辑，设置页从 `SettingId::ALL` 生成行，不再硬编码
 > `(section,key,value)`。主题预设迁至 `common/src/theme_presets.rs`。
 > 真相源仍是 TOML：在任务管理器禁用自启项后，下次配置变更会把 Run 项写回。
+>
+> **2026-11-24 · 修 "托盘关不掉" 时的踩坑**：此前 `cargo build --release` 只重编了
+> `revolc.exe`（因为只改了主程序源码），`revolc-tray.exe` 仍是旧二进制，导致新写的
+> watcher 退出逻辑根本没跑——主程序侧一切正常，托盘侧毫无反应。排查手法：对比
+> `target/release/revolc-tray.exe` 与 `tray/src/main.rs` 的 mtime。**验收任何涉及
+> 两个 exe 的改动，必须确认两个二进制都重新构建**（`cargo build --release -p revolc -p revolc-tray`）。
+> 另：托盘关不掉的根因代码是多个窗口进程无条件 spawn tray 的竞态，已改 `ensure_tray()`
+> 先查 `RevolcResident` 窗口（commit `8cc61a0`）。
 
 ## P0 — 已知缺陷
 
