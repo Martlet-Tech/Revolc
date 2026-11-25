@@ -33,7 +33,6 @@ fn settings_in_category(category: usize) -> Vec<SettingId> {
     match category {
         0 => vec![
             SettingId::TakeoverMode,
-            SettingId::TrayEnabled,
             SettingId::Autostart,
             SettingId::CloseAction,
         ],

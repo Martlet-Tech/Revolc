@@ -16,12 +16,13 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
     FillRect, FillRgn, GetStockObject, IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode,
-    SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+    SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
     DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
 use crate::config::Config;
+use crate::ui::folder_icon::FolderIcons;
 use crate::ui::reorder::Drag;
 use crate::ui::{caption, icon};
 use super::gdi::rgb;
@@ -44,10 +45,26 @@ const TAB_GAP: i32 = 4;
 /// undrag-by-title). Sized 16px icon + 6px breathing room on both sides.
 const GUTTER: i32 = 28;
 const ICON_SIZE: i32 = 16;
+/// Folder icon's leading pad inside a tab, and its gap to the label.
+const TAB_ICON_PAD: i32 = 4;
+const TAB_ICON_GAP: i32 = 3;
+/// Once tabs are squeezed to half their maximum width, the X on inactive
+/// tabs goes away and every remaining pixel belongs to the label.
+const CLOSE_SQUEEZE_AT: i32 = TAB_MAX_W / 2;
 const CLOSE_BOX: i32 = 16; // per-tab close (X) button size
 const PLUS_SIZE: i32 = 26; // trailing "+" button size
-/// Vertical centre of the band, for the "+" pill.
+/// Vertical centre of the bare band; used by the leading app icon.
 const CENTER: i32 = caption::HEIGHT / 2;
+/// The "+" pill is centred on the *tabs*, not on the raw band. Tabs start at
+/// `TAB_TOP`, so their centre is 2px below `CENTER` — using `CENTER` made the
+/// "+" read as if it had floated up (measured 2026-11-25).
+const PLUS_CENTER: i32 = (TAB_TOP + TAB_BOTTOM) / 2;
+/// Gap between the "+" and the caption-button block. Once every tab slot is
+/// full this is the only bare strip left to grab the window by on the right,
+/// so it is deliberately as wide as the "+" itself. Was a bare 8 (too tight
+/// to drag from), raised to 16, then to a full PLUS_SIZE (measured
+/// 2026-11-25).
+const PLUS_TRAILING: i32 = PLUS_SIZE;
 
 /// What a point in the band landed on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +89,10 @@ pub struct TabBar {
     /// list can shrink between a click and its dispatch.
     ids: Vec<u64>,
     labels: Vec<String>,
+    /// Folder path each tab is showing; empty means "use the app icon".
+    paths: Vec<String>,
+    /// Shell icons keyed by path, so reordering tabs never refetches one.
+    icons: FolderIcons,
     active: usize,
     bg: COLORREF,
     active_bg: COLORREF,
@@ -103,6 +124,8 @@ impl TabBar {
         let mut bar = Self {
             ids: Vec::new(),
             labels: Vec::new(),
+            paths: Vec::new(),
+            icons: FolderIcons::new(),
             active: 0,
             bg: COLORREF(0),
             active_bg: COLORREF(0),
@@ -161,12 +184,19 @@ impl TabBar {
         &mut self,
         ids: &[u64],
         labels: &[String],
+        paths: &[String],
         active: usize,
         cfg: &Config,
         width: i32,
     ) {
         self.ids = ids.to_vec();
         self.labels = labels.to_vec();
+        // Reconcile only on an actual path change: most updates come from a
+        // hover or a title tick, and must never touch the shell.
+        if self.paths.as_slice() != paths {
+            self.paths = paths.to_vec();
+            self.icons.sync(paths);
+        }
         self.active = active;
         // The tab that was under the pointer may be gone (closed, or the list
         // reordered); never carry a stale highlight into the next frame.
@@ -278,13 +308,13 @@ impl TabBar {
     /// Recompute tab widths for a new client width. Returns true on change.
     ///
     /// Tabs get exactly what the fixed furniture leaves over: gutter, "+",
-    /// its breathing room and the three caption buttons are subtracted first,
-    /// so the right end of the strip is always whole — measured 2026-11-18, a
-    /// dozen tabs at the old 90px floor pushed the "+" and the close box clean
-    /// off the end.
+    /// its trailing drag gutter and the three caption buttons are subtracted
+    /// first, so the right end of the strip is always whole — measured
+    /// 2026-11-18, a dozen tabs at the old 90px floor pushed the "+" and the
+    /// close box clean off the end.
     pub fn fit(&mut self, width: i32) -> bool {
         let n = self.labels.len().max(1) as i32;
-        let avail = width - GUTTER - PLUS_SIZE - 8 - caption::WIDTH - n * TAB_GAP;
+        let avail = width - GUTTER - PLUS_SIZE - PLUS_TRAILING - caption::WIDTH - n * TAB_GAP;
         let want = (avail / n).clamp(TAB_MIN_W, TAB_MAX_W);
         if want == self.tab_w {
             return false;
@@ -297,6 +327,15 @@ impl TabBar {
     /// tab — a 24px tab still has to answer "select" on its leading half.
     fn close_w(&self) -> i32 {
         CLOSE_BOX.min(self.tab_w / 2).max(8)
+    }
+
+    /// Close boxes are the first thing to go when the strip gets tight: below
+    /// half the maximum tab width only the active tab (or one held in a drag)
+    /// keeps its X. The rest spend that space on their label.
+    fn close_visible(&self, i: usize) -> bool {
+        self.tab_w > CLOSE_SQUEEZE_AT
+            || i == self.active
+            || self.drag.map(|d| d.from == i).unwrap_or(false)
     }
 
     fn tab_x(&self, i: usize) -> i32 {
@@ -334,7 +373,7 @@ impl TabBar {
         let n = self.labels.len() as i32;
         // Trailing "+" button.
         let plus_x = self.plus_x();
-        let plus_top = CENTER - PLUS_SIZE / 2;
+        let plus_top = PLUS_CENTER - PLUS_SIZE / 2;
         if x >= plus_x && x <= plus_x + PLUS_SIZE && (plus_top..plus_top + PLUS_SIZE).contains(&y) {
             return Hit::Plus;
         }
@@ -351,13 +390,14 @@ impl TabBar {
         if x > tab_left + self.tab_w {
             return Hit::Band; // in the gap between tabs
         }
-        // Close box occupies the tab's right edge.
-        let close_left = tab_left + self.tab_w - self.close_w() - 4;
-        if x >= close_left {
-            Hit::Close(i as usize)
-        } else {
-            Hit::Tab(i as usize)
+        // Close box occupies the tab's right edge, while there is room for it.
+        if self.close_visible(i as usize) {
+            let close_left = tab_left + self.tab_w - self.close_w() - 4;
+            if x >= close_left {
+                return Hit::Close(i as usize);
+            }
         }
+        Hit::Tab(i as usize)
     }
 
     /// Paint the whole band. `width` is the client width. The caller has
@@ -421,9 +461,9 @@ impl TabBar {
             let plus_x = self.plus_x();
             let plus_rc = RECT {
                 left: plus_x,
-                top: CENTER - PLUS_SIZE / 2,
+                top: PLUS_CENTER - PLUS_SIZE / 2,
                 right: plus_x + PLUS_SIZE,
-                bottom: CENTER + PLUS_SIZE / 2,
+                bottom: PLUS_CENTER + PLUS_SIZE / 2,
             };
             let plus_bg = if self.hover_plus { self.hover_bg } else { self.inactive_bg };
             fill_round(hdc, &plus_rc, plus_bg, self.radius);
@@ -474,39 +514,77 @@ impl TabBar {
             };
             fill_tab(hdc, &tab_rc, bg, self.radius);
 
-            // Close (X) on the tab's right edge.
+            // Close (X) on the tab's right edge — only while it has room.
             let cy = (tab_rc.top + tab_rc.bottom) / 2;
-            let close_rc = RECT {
-                left: tab_rc.right - self.close_w() - 4,
-                top: cy - CLOSE_BOX / 2,
-                right: tab_rc.right - 4,
-                bottom: cy + CLOSE_BOX / 2,
+            let close_rc = if self.close_visible(i) {
+                Some(RECT {
+                    left: tab_rc.right - self.close_w() - 4,
+                    top: cy - CLOSE_BOX / 2,
+                    right: tab_rc.right - 4,
+                    bottom: cy + CLOSE_BOX / 2,
+                })
+            } else {
+                None
             };
             let fg = if dragged || i == self.active { self.text_active } else { self.text };
             let _ = SetTextColor(hdc, fg);
-            let _ = DrawTextW(
-                hdc,
-                &mut to_wide("\u{00D7}"), // ×
-                &mut { RECT { ..close_rc } },
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
+            if let Some(rc) = close_rc.as_ref() {
+                let _ = DrawTextW(
+                    hdc,
+                    &mut to_wide("\u{00D7}"), // ×
+                    &mut { RECT { ..*rc } },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
 
-            // Label, clipped to leave room for the X. The leading pad
-            // shrinks with the tab: 8px on a full-width tab, 4px on a
-            // 24px one, where every pixel goes to characters.
-            let mut wide = to_wide(label);
-            let pad = (self.tab_w / 6).clamp(4, 8);
-            let mut text_rc = RECT {
-                left: tab_rc.left + pad,
-                right: (close_rc.left - 2).max(tab_rc.left + pad),
-                ..tab_rc
+            // Folder icon: the shell HICON cached for this tab's path, or our
+            // own app icon when the tab has no folder (settings). Always drawn;
+            // it only shrinks when the tab is too narrow for it AND the X.
+            let icon_size = close_rc
+                .as_ref()
+                .map(|rc| (rc.left - tab_rc.left - TAB_ICON_PAD - 2).clamp(4, ICON_SIZE))
+                .unwrap_or(ICON_SIZE);
+            let icon_x = tab_rc.left + TAB_ICON_PAD;
+            let icon_y = (tab_rc.top + tab_rc.bottom - icon_size) / 2;
+            let path = self.paths.get(i).map(String::as_str).unwrap_or("");
+            let has_icon = if let Some(h) = self.icons.get(path) {
+                DrawIconEx(hdc, icon_x, icon_y, h, icon_size, icon_size, 0, None, DI_NORMAL).is_ok()
+            } else {
+                let app = icon::small();
+                if !app.0.is_null() {
+                    DrawIconEx(hdc, icon_x, icon_y, app, icon_size, icon_size, 0, None, DI_NORMAL)
+                        .is_ok()
+                } else {
+                    false
+                }
             };
-            let _ = DrawTextW(
-                hdc,
-                &mut wide,
-                &mut text_rc,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
+
+            // Label: icon + text are one left-aligned group. No ellipsis —
+            // on a tight tab the text is simply cut where space runs out, so
+            // it shows as much as fits (DrawText clips to the rect by default).
+            let text_left = if has_icon {
+                icon_x + icon_size + TAB_ICON_GAP
+            } else {
+                tab_rc.left + TAB_ICON_PAD
+            };
+            let text_right = close_rc
+                .as_ref()
+                .map(|rc| rc.left - 2)
+                .unwrap_or(tab_rc.right - TAB_ICON_PAD);
+            if text_right > text_left {
+                let mut wide = to_wide(label);
+                let mut text_rc = RECT {
+                    left: text_left,
+                    right: text_right,
+                    ..tab_rc
+                };
+                let _ = DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut text_rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
         }
     }
 }
@@ -674,5 +752,26 @@ mod tests {
     fn a_single_tab_never_lands_anywhere() {
         assert_eq!(landing(GUTTER, W, 1, 0), None);
         assert_eq!(landing(GUTTER, W, 3, 3), None);
+    }
+
+    #[test]
+    fn close_boxes_hide_in_narrow_tabs_except_active() {
+        let cfg = Config::default();
+        let mut bar = TabBar::new(&cfg);
+        bar.update(
+            &[1, 2],
+            &["a".into(), "b".into()],
+            &[String::new(), String::new()],
+            0,
+            &cfg,
+            1000,
+        );
+        bar.tab_w = TAB_MAX_W;
+        assert!(bar.close_visible(1), "wide tabs keep every X");
+        bar.tab_w = CLOSE_SQUEEZE_AT;
+        assert!(bar.close_visible(0), "active keeps its X");
+        assert!(!bar.close_visible(1), "inactive loses X when squeezed");
+        bar.begin_drag(1, GUTTER);
+        assert!(bar.close_visible(1), "a dragged tab keeps its X");
     }
 }

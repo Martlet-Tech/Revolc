@@ -84,7 +84,21 @@
 - 入口：工具栏右端六边形按钮 → 打开一个 **Painted 标签页**（单例：已存在则激活）
 - 形态：`View::Painted(PaintedPage::Settings)`——无 HWND、由主窗口 GDI 自绘，
   与 `Hosted`（被接管的 Explorer 窗口）并列；抽象见 `ui/view.rs`
-- 分类：常规（接管模式 off/redirect、标签圆角）/ 主题（绿 ↔ 深灰蓝预设、圆角）/ 关于
+- 分类（2026-11-25 最终收敛）：常规（① **接管：是/否**——是 = 首次 UAC 装 BHO
+  并启用 BHO 通知 + 后台扫描两条路径，且广播一次吸收已有文件夹窗口；
+  否 = 卸载清理，UAC 删注册表 / Run / `%APPDATA%\revolc`，用户可直接删目录；
+  ② **开机自启：是/否**——仅接管=是时可选，关接管时自动关；③ 关闭按钮）/
+  主题（绿 ↔ 深灰蓝预设、标签圆角）/ 关于
+- **没有“临时暂停”状态**：用户只有“想用”和“不想用”，关掉就是卸载清理。
+  内部仍用 disabled 标记做进程退出时的临时失效，但不再作为用户选项
+- 接管=否时 `revolc.exe` 是**控制台**：启动只开设置页，不 spawn Explorer、不建 Home
+  tab；`+` 和书签点击转到设置页；窗口 X 强制退出（`hide` 在这种状态下无意义）
+- 从设置页把接管切到“是”：关掉 Painted 设置 tab，新建并激活一个工作 tab；托盘
+  同时广播一次吸收，暂停期间已开的文件夹窗口也会成为 tab
+- BHO 零窗口兜底拉起的进程用 `--adopt` 启动：**0 个初始 tab**，让待吸收文件夹
+  直接成为第一个 tab，避免 Clover 式“一个文件夹 = 新窗口 + 多余 Home tab”
+- 托盘**永久显示**，不再有「显示托盘图标」开关；旧配置里的 `tray.enabled=false`
+  被忽略（`close_action=hide` 也不再因此失效）
 - 写回：`config::set_toml_values` 按行替换，保留用户注释与排版；一次写入触发一次
   watcher reload，主窗口与设置页同步刷新（**无重启**）
 - 不暴露死配置：`startup_mode` / `startup_paths` / `hover_switch`（代码从不读取）
@@ -161,12 +175,17 @@
 > 且开关完全可控、**绝不允许弄坏系统 Explorer 或要求重启**。
 > 实现路线已从初版规格的 WinEventHook 监听改为 **BHO 通知**（见 §1）。
 
-### 7.1 设置三态（配置项 `takeover.mode`）
+### 7.1 接管开关（唯一用户开关）
 
-- `off`（默认）：BHO 写禁用标记（`%APPDATA%\revolc\disabled`，SetSite 时检查），
-  Explorer 原样工作
-- `redirect`（已实现）：BHO 发现新 Explorer 文件夹窗口 → `WM_APP_ABSORB` 通知
-  Revolc → 主程序吸收该窗口为 tab；另有自适应扫描兜底（BHO 未加载/通知丢失时）
+配置项 `takeover.mode`，设置页显示「接管：是/否」：
+
+- `off`（默认）：**等于卸载**。点击后提权跑 `revolc-tray.exe --uninstall`：
+  退出所有 Revolc 进程，删 HKLM/HKCU 的 BHO/CLSID 键、HKCU Run 项和
+  `%APPDATA%\revolc\`；用户随后可直接删软件目录。没有临时暂停状态
+- `redirect`：首次开启时提权跑 `regsvr32 /s revolc_bho.dll` 装 BHO，清禁用标记，
+  广播一次吸收把已有文件夹窗口收进来；此后 BHO 通知 + 后台扫描两条路径同时工作
+- 托盘启动时检查 HKLM `InprocServer32` 是否指向当前 DLL；绿色版移动目录后
+  会提权重注册一次（未安装的系统不会被自动装上）
 - `associate`（⬜ 未做）：用户级注册表关联（`HKCU\Software\Classes\Folder\shell\open\command`）。
   高级选项，默认关闭，实现必须遵守 Takeover_Research.md §3 的六条安全红线
   （只动 HKCU、备份原值、启动自修复、卸载清键、SHChangeNotify 刷新、格式规范）
@@ -175,8 +194,10 @@
 
 - BHO 只"喊一声"（发一条消息）：不注入、不 hook、不子类化 Explorer 代码
 - BHO 注册在 HKLM（Explorer 只读 HKLM 的 BHO 列表，Clover 逆向佐证）；
-  HKLM 缺失时降级 HKCU 并经 UAC 用 regsvr32 重试一次；禁用走标记文件而非删
-  HKLM 键（避免每次开关都弹 UAC），彻底清除见 `docs/registry/`
+  由设置页「接管」在首次开启时提权安装，关闭时提权卸载；移动绿色版目录时
+  托盘会按需提权重注册
+- 关闭接管时清理 HKLM + HKCU 的 BHO/CLSID 键、HKCU Run 项和
+  `%APPDATA%\revolc\`；`docs/registry/` 里的 .reg 仍是手工应急手段
 - 只吸收真正的文件夹视图窗口；"此电脑/回收站/控制面板"等不拦
 - 接管开关切换不要求重启 explorer 或电脑；BHO 失效时扫描兜底继续工作
 - 本程序崩溃/退出时，系统 Explorer 的任何行为不受影响（红线：接管模块的可失败性

@@ -39,20 +39,18 @@ unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> windows::Win32::Fou
     BOOL(0)
 }
 
-pub fn run(initial_path: Option<String>) -> i32 {
+pub fn run(initial_path: Option<String>, adopt_only: bool, settings_only: bool) -> i32 {
     if let Err(e) = shell::init_com() {
         tracing::error!(error = %e, "CoInitializeEx failed");
         return 1;
     }
 
     let cfg = Arc::new(ConfigHandle::new(config::config_path()));
-    // Without the optional tray, this window process still needs the BHO to
-    // notify it. Clear a stale "disabled" marker left by a previous exit.
-    if cfg.get().takeover.mode == "redirect" {
-        revolc_common::takeover::set_disabled(false);
-    }
+    // Mirror the temporary takeover switch from config into the marker. This
+    // is marker-only (no UAC, no registry); the tray owns registry install.
+    revolc_common::takeover::set_takeover_enabled(cfg.get().takeover.mode == "redirect");
 
-    let window = match MainWindow::new(cfg.clone(), initial_path) {
+    let window = match MainWindow::new(cfg.clone(), initial_path, adopt_only, settings_only) {
         Ok(w) => w,
         Err(e) => {
             tracing::error!(error = %e, "window creation failed");
@@ -61,8 +59,8 @@ pub fn run(initial_path: Option<String>) -> i32 {
     };
 
     // Session helpers the window process owns on behalf of the user: the
-    // optional tray (only when [tray].enabled) and the HKCU Run entry.
-    // Both are idempotent and re-applied whenever the config changes.
+    // permanent tray and the HKCU Run entry. Both are idempotent and
+    // re-applied whenever the config changes.
     sync_session_state(&cfg);
     let watcher = spawn_config_watcher(cfg.clone(), window.hwnd_raw());
 
@@ -82,15 +80,13 @@ pub fn run(initial_path: Option<String>) -> i32 {
     code
 }
 
-/// Bring the optional tray up when enabled, and reconcile the HKCU Run entry
-/// with `[tray].autostart`. Safe to call on every startup and config reload:
+/// Bring the permanent tray up, and reconcile the HKCU Run entry with
+/// `[tray].autostart`. Safe to call on every startup and config reload:
 /// the tray has its own single-instance mutex and Run writes are idempotent.
 fn sync_session_state(cfg: &ConfigHandle) {
     let snapshot = cfg.get();
 
-    if snapshot.tray.enabled {
-        ensure_tray();
-    }
+    ensure_tray();
 
     let exe = std::env::current_exe().unwrap_or_default();
     if let Err(e) = revolc_common::autostart::set_enabled(
@@ -135,7 +131,6 @@ fn ensure_tray() {
 fn spawn_config_watcher(cfg: Arc<ConfigHandle>, hwnd_raw: usize) -> Option<notify::RecommendedWatcher> {
     let path = cfg.path().clone();
     let mut last = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or(Instant::now());
-    let mut tray_was_enabled = cfg.get().tray.enabled;
 
     let mut watcher = match notify::recommended_watcher(
         move |res: Result<notify::Event, notify::Error>| match res {
@@ -146,18 +141,16 @@ fn spawn_config_watcher(cfg: Arc<ConfigHandle>, hwnd_raw: usize) -> Option<notif
                 }
                 last = now;
                 cfg.reload();
-                let enabled = cfg.get().tray.enabled;
-                if enabled && !tray_was_enabled {
-                    // Tray turned back on: start it if no live tray owns the
-                    // window yet. Turning off is the tray's own watcher's job.
-                    ensure_tray();
-                }
-                tray_was_enabled = enabled;
-
+                // The tray is permanent: a reload can also resurrect it if
+                // it crashed. Both writes below are idempotent.
+                ensure_tray();
+                let snapshot = cfg.get();
+                revolc_common::takeover::set_takeover_enabled(
+                    snapshot.takeover.mode == "redirect",
+                );
                 // Autostart is reconciled from whichever window sees the
                 // change; Run writes are idempotent so concurrent windows are
                 // harmless.
-                let snapshot = cfg.get();
                 let exe = std::env::current_exe().unwrap_or_default();
                 if let Err(e) = revolc_common::autostart::set_enabled(
                     snapshot.tray.autostart,

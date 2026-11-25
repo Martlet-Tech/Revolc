@@ -15,15 +15,17 @@ mod menu;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use revolc_common::config::{config_path, ConfigHandle};
 use revolc_common::ledger::Ledger;
-use revolc_common::messages::{absorb_msg, WM_APP_CLOSE_TABS, WM_APP_QUIT, WM_APP_RESTORE, WM_APP_TRAY};
-use revolc_common::takeover::ensure_bho_registered;
+use revolc_common::messages::{absorb_msg, WM_APP_QUIT, WM_APP_RESTORE, WM_APP_TRAY};
+use revolc_common::takeover::{
+    repair_bho_path_if_installed, set_takeover_enabled, uninstall_bho_keys,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM, GetLastError,
@@ -38,9 +40,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
-    GetMessageW, GetWindowTextW, IsWindow, IsWindowVisible, LoadCursorW,
-    MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    GetMessageW, GetWindowTextW, HWND_BROADCAST, IsWindow, IsWindowVisible, LoadCursorW,
+    MB_ICONINFORMATION, MB_OK, MessageBoxW, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+    TranslateMessage, WM_NULL, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
     WNDCLASSEXW, IDC_ARROW,
 };
@@ -52,9 +55,9 @@ static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 static EXE_DIR: OnceLock<PathBuf> = OnceLock::new();
-/// Set when the config watcher asks the tray to hide, so WM_APP_QUIT knows to
-/// keep BHO registration (takeover stays on) instead of tearing everything down.
-static HIDDEN_BY_CONFIG: AtomicBool = AtomicBool::new(false);
+/// Read-only config handle for the tray menu: it needs to know whether to
+/// show workbench rows without opening the TOML on every right-click.
+static CONFIG: OnceLock<Arc<ConfigHandle>> = OnceLock::new();
 
 /// The tray message window, for menu commands posted back to this process.
 pub(crate) fn tray_hwnd() -> HWND {
@@ -62,10 +65,64 @@ pub(crate) fn tray_hwnd() -> HWND {
     HWND(raw as _)
 }
 
+/// Elevated helper launched from the settings page's 系统注册 row.
+/// Order matters: quit every Revolc process first (otherwise their watchers
+/// would recreate the config), then remove registry, Run entry and APPDATA.
+fn uninstall_flow() -> i32 {
+    for (hwnd, _) in our_windows() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    if let Ok(old_tray) = unsafe { FindWindowW(w!("RevolcResident"), None) } {
+        if !old_tray.0.is_null() {
+            unsafe {
+                let _ = PostMessageW(old_tray, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+    for _ in 0..30 {
+        let old_tray_gone = match unsafe { FindWindowW(w!("RevolcResident"), None) } {
+            Ok(h) => h.0.is_null(),
+            Err(_) => true,
+        };
+        if our_windows().is_empty() && old_tray_gone {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    uninstall_bho_keys();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let _ = revolc_common::autostart::set_enabled(
+        false,
+        &revolc_common::autostart::launch_command(&exe),
+    );
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let _ = std::fs::remove_dir_all(PathBuf::from(appdata).join("revolc"));
+    }
+
+    unsafe {
+        let _ = MessageBoxW(
+            HWND::default(),
+            w!("已清除 Revolc 的注册表项、开机自启和全部配置。\n已打开的 Explorer 进程仍持有 DLL，重启资源管理器或注销后彻底释放。\n现在可以删除软件目录了。"),
+            w!("Revolc 卸载完成"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+    0
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // No logging here: the uninstaller deletes %APPDATA%\revolc, and an open
+    // log handle would make that removal fail on Windows.
+    if args.iter().any(|a| a == "--uninstall") {
+        std::process::exit(uninstall_flow());
+    }
+
     revolc_common::crash::install();
     revolc_common::logging::init("revolc-tray");
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--shutdown") {
         std::process::exit(shutdown());
     }
@@ -75,10 +132,7 @@ fn main() {
     let _ = EXE_DIR.set(dir);
 
     let cfg = Arc::new(ConfigHandle::new(config_path()));
-    if !cfg.get().tray.enabled {
-        tracing::info!("tray disabled in config, exiting");
-        return;
-    }
+    let _ = CONFIG.set(cfg.clone());
 
     if !ensure_single_instance() {
         return;
@@ -93,25 +147,21 @@ fn main() {
     };
     let _ = LEDGER.set(Mutex::new(ledger));
 
-    // One owner for BHO registration: the tray. A window process must never
-    // touch the registry (it may be launched while another window is closing).
-    if cfg.get().takeover.mode == "redirect" {
-        ensure_bho_registered("redirect");
-        // Navigation tracking (tab context menu) is gated by a marker file the
-        // BHO checks at window creation: `[bookmarks] enabled` drives it, so
-        // the config stays the single source of truth (hot-reloaded by the
-        // window's watcher only restarts windows; the marker persists).
-        let marker = std::env::var_os("APPDATA")
-            .map(|d| std::path::Path::new(&d).join("revolc").join("bho.nav"));
-        if let Some(m) = marker {
-            if cfg.get().bookmarks.enabled {
-                let _ = std::fs::write(&m, b"");
-            } else {
-                let _ = std::fs::remove_file(&m);
-            }
+    // Registry install is now an explicit settings action, not a side effect
+    // of the takeover switch. On startup we only heal a moved portable folder.
+    repair_bho_path_if_installed();
+    set_takeover_enabled(cfg.get().takeover.mode == "redirect");
+    // Navigation tracking (tab context menu) is gated by a marker file the
+    // BHO checks at window creation: `[bookmarks] enabled` drives it, so the
+    // config stays the single source of truth and survives takeover toggles.
+    let marker = std::env::var_os("APPDATA")
+        .map(|d| std::path::Path::new(&d).join("revolc").join("bho.nav"));
+    if let Some(m) = marker {
+        if cfg.get().bookmarks.enabled {
+            let _ = std::fs::write(&m, b"");
+        } else {
+            let _ = std::fs::remove_file(&m);
         }
-    } else {
-        ensure_bho_registered("off");
     }
 
     let hwnd = match create_tray_window() {
@@ -302,6 +352,29 @@ fn tray_icon_remove(hwnd: HWND) {
     }
 }
 
+/// A window whose UI thread has stopped pumping messages is a zombie: it is
+/// still enumerable (the process is alive, the frame hidden via
+/// `close_action = "hide"`), but every `PostMessageW` we send it — restore,
+/// close, quit — lands in a queue nobody drains. The tray used to list such
+/// windows as clickable rows that did nothing. Probe with a synchronous
+/// `WM_NULL` under `SMTO_ABORTIFHUNG`; a hung thread times out and is dropped
+/// from the list, so the menu only shows windows it can actually control.
+/// 300ms is short enough that opening the menu stays snappy.
+const PROBE_TIMEOUT_MS: u32 = 300;
+
+unsafe fn window_responds(hwnd: HWND) -> bool {
+    let mut result: usize = 0;
+    SendMessageTimeoutW(
+        hwnd,
+        WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG,
+        PROBE_TIMEOUT_MS,
+        Some(&mut result),
+    ).0 != 0
+}
+
 /// (hwnd, "tab1/tab2/...") for every RevolcMain, in enumeration order.
 /// Tab labels come from the absorbed Explorer panes (CabinetWClass /
 /// ExploreWClass children), which is exactly what each window's tab strip
@@ -315,6 +388,24 @@ fn our_windows() -> Vec<(HWND, String)> {
         );
     }
     out
+}
+
+/// Window list for the tray *menu* only. Same enumeration as `our_windows`
+/// plus a liveness probe: a zombie frame (hidden process whose UI thread
+/// stopped pumping messages) cannot answer restore/close, so listing it just
+/// produces a row that silently does nothing when clicked. Lifecycle paths
+/// (quit / close-all / foreground switch) keep using `our_windows` unchanged
+/// — with a hung thread a posted message is lost either way.
+fn menu_windows() -> Vec<(HWND, String)> {
+    our_windows().into_iter()
+        .filter(|(h, _)| {
+            let live = unsafe { window_responds(*h) };
+            if !live {
+                tracing::warn!(hwnd = ?h, "menu: skipping unresponsive window");
+            }
+            live
+        })
+        .collect()
 }
 
 unsafe extern "system" fn enum_windows(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -367,12 +458,27 @@ unsafe extern "system" fn enum_tab_pane(hwnd: HWND, lp: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-fn spawn_window() {
+fn spawn_window(adopt_only: bool) {
     let dir = EXE_DIR.get().cloned().unwrap_or_default();
     let exe = dir.join("revolc.exe");
-    match Command::new(&exe).spawn() {
+    let mut cmd = Command::new(&exe);
+    if adopt_only {
+        // An existing folder window is waiting to be adopted: start with no
+        // Home tab so it becomes the first tab (REA §8 constraint).
+        cmd.arg("--adopt");
+    }
+    match cmd.spawn() {
         Ok(_) => tracing::info!(?exe, "spawned revolc.exe"),
         Err(e) => tracing::error!(error = %e, ?exe, "failed to spawn revolc.exe"),
+    }
+}
+
+fn spawn_settings_window() {
+    let dir = EXE_DIR.get().cloned().unwrap_or_default();
+    let exe = dir.join("revolc.exe");
+    match Command::new(&exe).arg("--settings").spawn() {
+        Ok(_) => tracing::info!(?exe, "spawned settings window"),
+        Err(e) => tracing::error!(error = %e, ?exe, "failed to spawn settings window"),
     }
 }
 
@@ -399,16 +505,15 @@ unsafe fn switch_to_last_active() {
 }
 
 /// Tear down the tray. The two flags are independent:
-/// - `unregister_bho`: menu `--shutdown` disables takeover; a config-driven
-///   hide or logoff must leave the registration intact.
-/// - `quit_windows`: tell window processes to restore their panes. A config
-///   hide must NOT do this (the user's folders stay open), but logoff/shutdown
-///   must (otherwise Explorer keeps dangling refs to re-parented windows).
-unsafe fn quit(hwnd: HWND, unregister_bho: bool, quit_windows: bool) {
+/// - `disable_takeover`: a real exit disables the temporary switch; logoff
+///   leaves the user's setting alone (the marker is persistent anyway).
+/// - `quit_windows`: tell window processes to restore their panes. Logoff /
+///   shutdown must do this, otherwise Explorer keeps dangling refs.
+unsafe fn quit(hwnd: HWND, disable_takeover: bool, quit_windows: bool) {
     tray_icon_remove(hwnd);
     unhook();
-    if unregister_bho {
-        ensure_bho_registered("off");
+    if disable_takeover {
+        set_takeover_enabled(false);
     }
     if quit_windows {
         for (h, _) in our_windows() {
@@ -443,26 +548,25 @@ fn spawn_config_watcher(cfg: Arc<ConfigHandle>) -> Option<RecommendedWatcher> {
                 let snapshot = cfg.get();
                 let new_mode = snapshot.takeover.mode.clone();
                 if new_mode != mode {
-                    tracing::info!(%new_mode, "takeover mode changed, re-registering BHO");
-                    ensure_bho_registered(&new_mode);
-                    mode = new_mode;
-                }
-                // Tray hidden from the settings page: leave the process so the
-                // icon and foreground hook disappear. The main process will
-                // spawn us again if the user turns it back on.
-                if !snapshot.tray.enabled {
-                    tracing::info!("tray disabled in config, exiting");
-                    HIDDEN_BY_CONFIG.store(true, Ordering::SeqCst);
-                    // Win32 windows are thread-affine: ask the tray thread to
-                    // quit via its message loop, never call DestroyWindow here.
-                    // HWND is not Send, so read it from the atomic instead of
-                    // capturing it in this watcher closure.
-                    let raw = TRAY_HWND.load(Ordering::SeqCst);
-                    if raw != 0 {
+                    tracing::info!(%new_mode, "takeover switch changed (marker only)");
+                    set_takeover_enabled(new_mode == "redirect");
+                    if new_mode == "redirect" {
+                        // Enabling takeover must also adopt folder windows
+                        // that were opened while it was paused. The BHO only
+                        // reports *new* windows, so nudge every RevolcMain
+                        // into one immediate fast sweep, exactly like a BHO
+                        // notification. may_adopt() keeps a single owner.
                         unsafe {
-                            let _ = PostMessageW(HWND(raw as _), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+                            let _ = PostMessageW(
+                                HWND_BROADCAST,
+                                absorb_msg(),
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
                         }
+                        tracing::info!("takeover enabled: broadcast absorb for existing windows");
                     }
+                    mode = new_mode;
                 }
             }
             Err(e) => tracing::error!(error = %e, "config watcher error"),
@@ -483,7 +587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Spawn one; its own sweep adopts the folder within one burst tick.
         if our_windows().is_empty() {
             tracing::info!("absorb notify with zero windows, spawning one");
-            spawn_window();
+            spawn_window(true);
         }
         return LRESULT(0);
     }
@@ -492,28 +596,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match lp.0 as u32 {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => switch_to_last_active(),
                 WM_RBUTTONUP => unsafe {
-                    menu::show(hwnd, our_windows());
+                    let takeover_on = CONFIG
+                        .get()
+                        .map(|c| c.get().takeover.mode == "redirect")
+                        .unwrap_or(false);
+                    menu::show(hwnd, menu_windows(), takeover_on);
                 },
                 _ => {}
             }
             LRESULT(0)
         }
-        m if m == menu::CMD_NEW_WINDOW => { spawn_window(); LRESULT(0) }
+        m if m == menu::CMD_NEW_WINDOW => { spawn_window(false); LRESULT(0) }
+        m if m == menu::CMD_OPEN_SETTINGS => { spawn_settings_window(); LRESULT(0) }
         m if m == menu::CMD_EXIT => { quit(hwnd, true, true); LRESULT(0) }
-        m if m == menu::CMD_CLOSE_ALL => {
-            // "Close everything": close every tab (and its Explorer pane),
-            // then tear down the tray without restoring anything to desktop.
-            for (h, _) in our_windows() {
-                let _ = PostMessageW(h, WM_APP_CLOSE_TABS, WPARAM(0), LPARAM(0));
-            }
-            quit(hwnd, true, false);
-            LRESULT(0)
-        }
         m if m == WM_APP_QUIT => {
-            // CLI --shutdown / menu exit tears down takeover (unregister BHO);
-            // a config-driven hide only removes the icon, leaving takeover on.
-            let hidden = HIDDEN_BY_CONFIG.swap(false, Ordering::SeqCst);
-            quit(hwnd, !hidden, !hidden);
+            // CLI --shutdown, menu exit or the elevated uninstaller: disable
+            // the temporary switch and restore absorbed panes to the desktop.
+            quit(hwnd, true, true);
             LRESULT(0)
         }
         WM_ENDSESSION => {

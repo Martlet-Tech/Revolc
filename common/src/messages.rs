@@ -15,6 +15,9 @@ pub const WM_APP_RESTORE: u32 = 0x8011;
 /// Explorer pane) and then close the frame. Unlike WM_APP_QUIT, the panes are
 /// closed rather than restored to the desktop.
 pub const WM_APP_CLOSE_TABS: u32 = 0x8012;
+/// Registry install/uninstall finished in a worker thread -> repaint the
+/// settings page so the 系统注册 row shows the new state.
+pub const WM_APP_REGISTRY_CHANGED: u32 = 0x8013;
 /// BHO → Revolc: "a folder window was created". Registered so every process
 /// sees the same ID, including the low-integrity Explorer/BHO process.
 pub fn absorb_msg() -> u32 {

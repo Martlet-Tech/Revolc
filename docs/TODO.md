@@ -1,7 +1,20 @@
 # Revolc 待办
 
-> 排序 = 建议执行顺序。历史项与踩坑记录见 `../Revolc_交接文档.md`，行为规格见
+> 排序 = 建议执行顺序。历史项与踩坑记录见 `交接文档.md`，行为规格见
 > `Rebuild_Target_Spec.md`（里程碑 M0–M6），本文件只留“还没做、以及为什么做”。
+
+> **2026-11-25 09:50 · 最终用户模型（取代下面 11-24 的三段式）**：用户只有两个开关。
+> 「接管：是/否」是唯一主开关：是 = 首次 UAC 装 BHO，BHO 通知 + 后台扫描一起工作，
+> 并广播一次吸收已有文件夹窗口；否 = 卸载清理（UAC 删注册表 / Run / `%APPDATA%\revolc`），
+> 没有临时暂停状态。「开机自启：是/否」只有接管=是时可选，关接管自动关自启。
+> 托盘在 Revolc 运行时常驻，不是开关；BHO/扫描/注册表都是内部实现，不再对用户暴露。
+> 下面的「系统注册」行和 `SettingId::ToggleRegistry` 描述均为历史记录。
+>
+> 2026-11-25 10:15 · 行为切分（REA 依据 `clover/analysis/Clover_MultiWindow_And_Tray_Evidence.md` §8）：
+> 接管=否时启动只开设置页（控制台），不建 Home tab、不 spawn Explorer；`+`/书签转设置页；
+> X 强制退出不允许 hide。切到“是”时关掉设置 tab 并创建工作 tab；托盘广播吸收已有窗口。
+> 托盘零窗口兜底改用 `--adopt` 启动：0 初始 tab，待吸收文件夹直接成为第一个 tab，
+> 消除 Clover 式“新窗口 + 多余 Home tab”。
 
 > **2026-11-23 更新（已合并入 master，合并提交 `a9874a6`）**：收藏栏与标签栏已合并为一条
 > 62px chrome 条、不可隐藏；右端新增设置按钮，点开一个 `Painted` 设置标签页（单例），
@@ -26,6 +39,17 @@
 > 两个 exe 的改动，必须确认两个二进制都重新构建**（`cargo build --release -p revolc -p revolc-tray`）。
 > 另：托盘关不掉的根因代码是多个窗口进程无条件 spawn tray 的竞态，已改 `ensure_tray()`
 > 先查 `RevolcResident` 窗口（commit `8cc61a0`）。
+>
+> **2026-11-24 下午 · 安装/接管/自启三段式（分支 `feat/install-uninstall-settings`）**：
+> 注册表安装与接管开关彻底拆开。设置页常规页新增第 1 行「系统注册」：点击提权
+> 安装/卸载 BHO；卸载走 `revolc-tray.exe --uninstall`，先退出所有 Revolc 进程，
+> 再删 HKLM/HKCU BHO+CLSID 键、HKCU Run 和 `%APPDATA%\revolc\`，用户可以删目录走人。
+> 第 2 行「接管（临时）」只写 disabled 标记，零 UAC、零注册表写；第 3 行仍是开机自启。
+> 托盘改为永久显示，移除「显示托盘图标」行，旧配置的 `tray.enabled=false` 被忽略。
+> 托盘启动时会检查 HKLM `InprocServer32`，绿色版移动目录后按需提权自修复。
+> `SettingId::TrayEnabled` 删除；`WM_APP_REGISTRY_CHANGED` 用于工作线程完成后重绘设置页。
+> 2026-11-25 补：切到「接管中」时托盘广播一次 `absorb_msg()`，让暂停期间已经打开的
+> Explorer 文件夹窗口立即被 sweep 吸收，而不是等下一次随机扫描。
 
 ## P0 — 已知缺陷
 

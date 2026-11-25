@@ -33,9 +33,9 @@ impl Default for Bookmarks {
 
 /// Tray icon and session-level launcher.
 ///
-/// `enabled` is hot-reloaded: the tray process stays alive and adds/removes the
-/// icon in place (see `tray/src/main.rs`). `autostart` is a HKCU Run entry, so
-/// Task Manager's Startup apps page shows it and the user can remove it there.
+/// The tray is permanent now: `enabled` is kept only so old config files still
+/// deserialize, and is never read. `autostart` is a HKCU Run entry, so Task
+/// Manager's Startup apps page shows it and the user can remove it there.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Tray {
@@ -262,15 +262,14 @@ startup_paths = []       # used when startup_mode == "list"
 hover_switch = true
 
 [takeover]
-mode = "off"             # "off" | "redirect"
-                         # redirect: 新 Explorer 文件夹窗口自动改由 Revolc 打开
+mode = "off"             # "off" = 否（卸载清理）| "redirect" = 是（接管工作）
+                         # 两者都通过设置页「接管」切换，首次需要 UAC
 
 [tray]
-enabled = true           # 显示托盘图标（热更新，无需重启）
 autostart = false        # 开机自启（写入 HKCU Run，任务管理器「启动应用」可见）
-                         # 启动的是 revolc.exe；托盘按需由主程序拉起
+                         # 启动的是 revolc.exe；托盘永久显示，由主程序拉起
 close_action = "exit"    # 窗口 X 的行为："exit" 退出 | "hide" 隐藏到托盘
-                         # 托盘隐藏时 "hide" 无效，强制退出
+                         # 托盘永久显示，因此 "hide" 总能通过托盘恢复
 
 [bookmarks]
 enabled = true           # 标签栏下方的收藏栏（热重载即时生效）

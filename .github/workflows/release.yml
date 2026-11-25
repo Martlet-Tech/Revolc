@@ -1,0 +1,57 @@
+name: Release portable build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Stage portable zip
+        shell: pwsh
+        run: |
+          $stage = "portable"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/revolc.exe, target/release/revolc-tray.exe, target/release/revolc_bho.dll, LICENSE $stage
+          @'
+Revolc 0.1.0 portable (x64)
+
+首次使用
+  1. 把这三个 exe/dll 解压到任意目录（保持在同一目录）。
+  2. 运行 revolc.exe：未接管时只会打开设置页，不会造空的文件管理器窗口。
+  3. 常规页只有两个开关：把「接管」切到「是」，首次会弹 UAC 安装 BHO；设置页随即让位给一个真正的工作 tab。
+  4. 需要开机自动工作，再把「开机自启」切到「是」（接管为“是”时才可选）。
+
+不再使用
+  把「接管」切到「否」，会弹 UAC 清理注册表、Run 项和 %APPDATA%\revolc\，
+  之后直接删除软件目录即可。没有“临时暂停”状态。
+
+注意
+  - 不开自启时，每次重启后手动运行一次 revolc.exe 即恢复上次状态。
+  - 托盘图标在 Revolc 运行时常驻显示，没有独立开关。
+  - 移动软件目录后托盘会自动修复 BHO 路径（会弹一次 UAC）。
+  - 已打开的 Explorer 进程仍持有 DLL，卸载后重启资源管理器或注销才彻底释放。
+'@ | Set-Content -Path "$stage/README.txt" -Encoding UTF8
+          Compress-Archive -Path "$stage/*" -DestinationPath "Revolc-$($env:GITHUB_REF_NAME)-x64.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Revolc-*.zip
+          generate_release_notes: true

@@ -25,7 +25,6 @@ pub enum SettingId {
     TakeoverMode,
     TabRadius,
     ThemePreset,
-    TrayEnabled,
     Autostart,
     CloseAction,
 }
@@ -36,7 +35,6 @@ impl SettingId {
         SettingId::TakeoverMode,
         SettingId::TabRadius,
         SettingId::ThemePreset,
-        SettingId::TrayEnabled,
         SettingId::Autostart,
         SettingId::CloseAction,
     ];
@@ -44,22 +42,20 @@ impl SettingId {
     /// Human label shown in the settings page.
     pub fn label(self) -> &'static str {
         match self {
-            SettingId::TakeoverMode => "接管模式",
+            SettingId::TakeoverMode => "接管",
             SettingId::TabRadius => "标签圆角",
             SettingId::ThemePreset => "配色预设",
-            SettingId::TrayEnabled => "显示托盘图标",
             SettingId::Autostart => "开机自启",
             SettingId::CloseAction => "关闭按钮",
         }
     }
 
-    /// Whether this setting can be changed in the current config. A setting
-    /// whose meaning depends on another one is disabled, not silently forced:
-    /// "hide to tray" is meaningless with no tray, so the row is greyed out
-    /// instead of accepting a click that gets rewritten to "exit".
+    /// Whether this setting can be changed in the current config. Autostart
+    /// is meaningless when takeover is off — the user explicitly decided that
+    /// "off" means uninstall, so there must be no process left to start.
     pub fn is_available(self, cfg: &Config) -> bool {
         match self {
-            SettingId::CloseAction => cfg.tray.enabled,
+            SettingId::Autostart => cfg.takeover.mode == "redirect",
             _ => true,
         }
     }
@@ -67,7 +63,7 @@ impl SettingId {
     /// Hint shown while the setting is unavailable.
     pub fn unavailable_hint(self) -> &'static str {
         match self {
-            SettingId::CloseAction => "需先开启托盘",
+            SettingId::Autostart => "需先开启接管",
             _ => "",
         }
     }
@@ -75,8 +71,8 @@ impl SettingId {
     /// One-line hint shown under the row, if any.
     pub fn hint(self) -> &'static str {
         match self {
-            SettingId::TrayEnabled => "关闭后托盘退出，窗口 X 强制退出",
-            SettingId::Autostart => "启动 revolc.exe；任务管理器「启动应用」可禁用",
+            SettingId::TakeoverMode => "开启需 UAC（首次）；关闭即卸载并清除配置",
+            SettingId::Autostart => "开机自动进入接管；任务管理器「启动应用」可禁用",
             SettingId::CloseAction => "托盘隐藏时强制退出",
             _ => "",
         }
@@ -88,7 +84,6 @@ impl SettingId {
         match self {
             SettingId::TakeoverMode => Some(("takeover", "mode")),
             SettingId::TabRadius => Some(("theme", "tab_radius")),
-            SettingId::TrayEnabled => Some(("tray", "enabled")),
             SettingId::Autostart => Some(("tray", "autostart")),
             SettingId::CloseAction => Some(("tray", "close_action")),
             SettingId::ThemePreset => None,
@@ -100,7 +95,6 @@ impl SettingId {
         match self {
             SettingId::TakeoverMode => format!("\"{}\"", cfg.takeover.mode),
             SettingId::TabRadius => cfg.theme.tab_radius.to_string(),
-            SettingId::TrayEnabled => cfg.tray.enabled.to_string(),
             SettingId::Autostart => cfg.tray.autostart.to_string(),
             SettingId::CloseAction => format!("\"{}\"", cfg.tray.close_action),
             SettingId::ThemePreset => String::new(), // rendered via preset_name
@@ -111,19 +105,12 @@ impl SettingId {
     pub fn display(self, cfg: &Config) -> String {
         match self {
             SettingId::TakeoverMode => {
-                if cfg.takeover.mode == "redirect" { "接管新窗口" } else { "关闭" }.into()
+                if cfg.takeover.mode == "redirect" { "是" } else { "否" }.into()
             }
             SettingId::TabRadius => cfg.theme.tab_radius.to_string(),
-            SettingId::TrayEnabled => if cfg.tray.enabled { "开" } else { "关" }.into(),
-            SettingId::Autostart => if cfg.tray.autostart { "开" } else { "关" }.into(),
+            SettingId::Autostart => if cfg.tray.autostart { "是" } else { "否" }.into(),
             SettingId::CloseAction => {
-                if !cfg.tray.enabled {
-                    "退出（需先开启托盘）".into()
-                } else if cfg.tray.close_action == "hide" {
-                    "隐藏到托盘".into()
-                } else {
-                    "退出".into()
-                }
+                if cfg.tray.close_action == "hide" { "隐藏到托盘" } else { "退出" }.into()
             }
             SettingId::ThemePreset => crate::theme_presets::current_preset_name(cfg).to_string(),
         }
@@ -147,18 +134,12 @@ impl SettingId {
                 };
                 vec![("theme", "tab_radius", next.to_string())]
             }
-            SettingId::TrayEnabled => {
-                let next = !cfg.tray.enabled;
-                vec![("tray", "enabled", next.to_string())]
-            }
             SettingId::Autostart => {
                 let next = !cfg.tray.autostart;
                 vec![("tray", "autostart", next.to_string())]
             }
             SettingId::CloseAction => {
-                // No silent rewrite to "exit" here: apply() refuses this
-                // setting entirely while the tray is off, and the UI greys
-                // the row. With the tray on, hide/exit is a plain toggle.
+                // The tray is permanent now, so hide/exit is a plain toggle.
                 let next = if cfg.tray.close_action == "hide" { "exit" } else { "hide" };
                 vec![("tray", "close_action", format!("\"{next}\""))]
             }
@@ -177,7 +158,7 @@ impl SettingId {
         let valid = match self {
             SettingId::TakeoverMode => matches!(value, "\"off\"" | "\"redirect\""),
             SettingId::TabRadius => value.parse::<i32>().map(|n| (0..=20).contains(&n)).unwrap_or(false),
-            SettingId::TrayEnabled | SettingId::Autostart => matches!(value, "true" | "false"),
+            SettingId::Autostart => matches!(value, "true" | "false"),
             SettingId::CloseAction => matches!(value, "\"exit\"" | "\"hide\""),
             SettingId::ThemePreset => true, // a batch of colour keys, checked by serde on reload
         };
@@ -236,19 +217,28 @@ mod tests {
 
     #[test]
     fn apply_preserves_comments() {
-        let cfg = Config::default();
-        let text = "# keep me\n[tray]\nenabled = true # mine\n";
-        let out = apply(&cfg, text, SettingId::TrayEnabled).unwrap();
+        let mut cfg = Config::default();
+        cfg.takeover.mode = "redirect".into(); // autostart is gated on takeover
+        let text = "# keep me\n[tray]\nautostart = false # mine\n";
+        let out = apply(&cfg, text, SettingId::Autostart).unwrap();
         assert!(out.contains("# keep me"), "{out}");
-        assert!(out.contains("enabled = false"), "{out}");
+        assert!(out.contains("autostart = true"), "{out}");
     }
 
     #[test]
-    fn close_action_is_unavailable_without_tray() {
+    fn close_action_is_always_available_with_permanent_tray() {
         let mut cfg = Config::default();
+        cfg.tray.enabled = false; // stale config from an older build is ignored
         assert!(SettingId::CloseAction.is_available(&cfg));
-        cfg.tray.enabled = false;
-        assert!(!SettingId::CloseAction.is_available(&cfg));
-        assert!(apply(&cfg, "[tray]\nenabled = false\n", SettingId::CloseAction).is_err());
+        assert!(apply(&cfg, "[tray]\nclose_action = \"exit\"\n", SettingId::CloseAction).is_ok());
+    }
+
+    #[test]
+    fn autostart_requires_takeover() {
+        let mut cfg = Config::default();
+        assert!(!SettingId::Autostart.is_available(&cfg));
+        assert_eq!(SettingId::Autostart.unavailable_hint(), "需先开启接管");
+        cfg.takeover.mode = "redirect".into();
+        assert!(SettingId::Autostart.is_available(&cfg));
     }
 }

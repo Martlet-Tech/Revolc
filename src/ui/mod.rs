@@ -1,6 +1,7 @@
 pub mod caption;
 pub mod chrome;
 pub mod dwm;
+pub mod folder_icon;
 pub mod gdi;
 pub mod reorder;
 pub mod settings;
@@ -50,6 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
     WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
+    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, SW_SHOWNA, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
@@ -261,6 +263,11 @@ const MAX_TABS: usize = 40;
 struct WindowArgs {
     cfg: Arc<ConfigHandle>,
     initial_path: Option<String>,
+    /// Spawned by the tray to adopt an already-open folder window. Start with
+    /// zero tabs so that folder becomes the first tab, not an extra one.
+    adopt_only: bool,
+    /// Tray "打开设置": open the control panel even when takeover is on.
+    settings_only: bool,
     /// Not a preference: built per window by the creator; the loop translates
     /// with the table of whichever window owns the focused control, so this
     /// cannot be shared.
@@ -295,6 +302,10 @@ pub(crate) struct App {
     /// Reentrancy guard: absorb moves windows around, which can re-enter
     /// this app's message handlers.
     sweeping: bool,
+    /// True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE. Freezes all
+    /// cross-process geometry/repaint work on the absorbed Explorer pane
+    /// while the user drags the frame -- see Absorbed::place_client.
+    in_sizemove: bool,
     /// Fast-poll window: a folder is expected until this instant.
     burst_until: Option<Instant>,
     /// Explorer thread whose input queue we are currently attached to (0 =
@@ -379,13 +390,20 @@ pub struct MainWindow {
 
 impl MainWindow {
     /// The single window owned by this `revolc.exe` process.
-    pub fn new(cfg: Arc<ConfigHandle>, initial_path: Option<String>) -> windows::core::Result<Self> {
-        Self::create(cfg, initial_path)
+    pub fn new(
+        cfg: Arc<ConfigHandle>,
+        initial_path: Option<String>,
+        adopt_only: bool,
+        settings_only: bool,
+    ) -> windows::core::Result<Self> {
+        Self::create(cfg, initial_path, adopt_only, settings_only)
     }
 
     fn create(
         cfg: Arc<ConfigHandle>,
         initial_path: Option<String>,
+        adopt_only: bool,
+        settings_only: bool,
     ) -> windows::core::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
@@ -407,6 +425,8 @@ impl MainWindow {
             let args = Box::into_raw(Box::new(WindowArgs {
                 cfg,
                 initial_path,
+                adopt_only,
+                settings_only,
                 accel,
             }));
 
@@ -694,6 +714,9 @@ unsafe fn app_from(hwnd: HWND) -> &'static mut App {
 
 impl App {
     fn build(hwnd: HWND, args: Box<WindowArgs>) -> Box<App> {
+        let takeover_on = args.cfg.get().takeover.mode == "redirect";
+        let adopt_only = args.adopt_only;
+        let settings_only = args.settings_only;
         let tabbar = tabbar::TabBar::new(&args.cfg.get());
         let mut app = Box::new(App {
             cfg: args.cfg,
@@ -703,6 +726,7 @@ impl App {
             views: Vec::new(),
             excluded: Vec::new(),
             sweeping: false,
+            in_sizemove: false,
             burst_until: None,
             attached_tid: 0,
             active: true,
@@ -728,8 +752,20 @@ impl App {
             tooltip_content: None,
             tooltip_layout: None,
         });
-        let first = args.initial_path.unwrap_or_else(home_dir);
-        app.new_tab(first);
+        if settings_only || !takeover_on {
+            // Control panel, not an empty file manager. seed_settings_tab()
+            // deliberately does not activate: WM_CREATE has not installed the
+            // App pointer in GWLP_USERDATA yet (crash 2026-11-25).
+            app.seed_settings_tab();
+        } else if adopt_only {
+            // The BHO is handing us an existing folder window. The first
+            // sweep will adopt it into tab 0; spawning a Home tab here would
+            // recreate Clover's "one folder = new window + spare tab" artifact.
+            tracing::info!("started in adopt-only mode, waiting for stray folder window");
+        } else {
+            let first = args.initial_path.unwrap_or_else(home_dir);
+            app.new_tab(first);
+        }
         app
     }
 
@@ -883,9 +919,26 @@ impl App {
                 }
             })
             .collect();
+        // A painted tab (settings) has no shell folder: an empty path makes
+        // the strip fall back to our own app icon for that tab.
+        let paths: Vec<String> = self
+            .tabs
+            .iter_all()
+            .enumerate()
+            .map(|(i, t)| {
+                let folder = self.views.get(i).map(|v| v.as_hosted().is_some()).unwrap_or(false);
+                if folder { t.path.clone() } else { String::new() }
+            })
+            .collect();
         let width = self.client().right;
-        self.tabbar
-            .update(&ids, &labels, self.tabs.active_index(), &self.cfg.get(), width);
+        self.tabbar.update(
+            &ids,
+            &labels,
+            &paths,
+            self.tabs.active_index(),
+            &self.cfg.get(),
+            width,
+        );
         self.invalidate_band();
         // With no caption there is nothing left that shows the current folder
         // outside the strip itself, so the taskbar tooltip / Alt-Tab entry take
@@ -1546,6 +1599,14 @@ impl App {
     /// Open a folder: push a reserved tab, spawn Explorer, absorb on the
     /// notify or on the next fast sweep tick, whichever comes first.
     fn new_tab(&mut self, path: String) {
+        if self.cfg.get().takeover.mode != "redirect" {
+            // Every entry point (shortcut, toolbar +, bookmark) funnels here.
+            // No absorption pipeline while uninstalled: show the control panel
+            // instead of spawning a system Explorer window we cannot adopt.
+            tracing::info!("new tab blocked while takeover is off");
+            self.open_settings_tab();
+            return;
+        }
         let at = self.tabs.len();
         self.tabs.push(path.clone());
         self.views.insert(at, View::Pending);
@@ -1554,6 +1615,11 @@ impl App {
 
     /// Context menu "new tab to the right": insert after `after` and open it.
     fn new_tab_after(&mut self, after: usize, path: String) {
+        if self.cfg.get().takeover.mode != "redirect" {
+            tracing::info!("new tab blocked while takeover is off");
+            self.open_settings_tab();
+            return;
+        }
         let at = (after + 1).min(self.tabs.len());
         self.tabs.insert_after(after, path.clone());
         self.views.insert(at, View::Pending);
@@ -1624,6 +1690,10 @@ impl App {
     /// the same position a "+" click would use. Never replaces the current
     /// tab — bookmarks are navigational shortcuts, not tab moves.
     fn open_bookmark(&mut self, index: usize) {
+        if self.cfg.get().takeover.mode != "redirect" {
+            self.open_settings_tab();
+            return;
+        }
         let Some(bm) = self.bookmarks.items().get(index).cloned() else {
             return;
         };
@@ -1988,7 +2058,24 @@ impl App {
         for (i, slot) in self.views.iter().enumerate() {
             if let Some(v) = slot.as_hosted() {
                 let title = host::window_title(v.top);
-                if !title.is_empty() && self.tabs.set_label(i, title) {
+                if title.is_empty() {
+                    continue;
+                }
+                let (old, path) = self.tabs.get(i)
+                    .map(|t| (t.label.clone(), t.path.clone()))
+                    .unwrap_or_default();
+                if self.tabs.set_label(i, title.clone()) {
+                    // The tray menu reads labels from the per-window MRU, not
+                    // from the tab strip. Keep the MRU in lockstep with the
+                    // live Explorer title so navigation ("此电脑", "下载")
+                    // shows up there too instead of a stale absorbed name.
+                    if old.is_empty() {
+                        // On first fill, activate() wrote short_label(path)
+                        // into the MRU as a placeholder. Replace that entry.
+                        revolc_common::tab_mru::rename(self.main_hwnd, &short_label(&path), &title);
+                    } else {
+                        revolc_common::tab_mru::rename(self.main_hwnd, &old, &title);
+                    }
                     changed = true;
                 }
             }
@@ -2373,6 +2460,17 @@ impl App {
         }
     }
 
+    /// Create the settings tab without activating it. Used during WM_CREATE,
+    /// where activate() -> SetFocus would re-enter WM_NCACTIVATE before the
+    /// App pointer is installed in GWLP_USERDATA.
+    fn seed_settings_tab(&mut self) {
+        let at = self.tabs.len();
+        self.tabs.push("设置".to_string());
+        self.views.push(View::Painted(PaintedPage::Settings));
+        self.sync_tabbar();
+        tracing::info!(tab = at, "settings tab opened");
+    }
+
     /// Open the settings tab, or focus it if one is already open (singleton).
     fn open_settings_tab(&mut self) {
         if let Some(i) = self.views.iter().position(|v| v.is_painted()) {
@@ -2385,6 +2483,31 @@ impl App {
         self.sync_tabbar();
         self.activate(at);
         tracing::info!(tab = at, "settings tab opened");
+    }
+
+    /// Turn an uninstalled control-panel window into a workbench: drop the
+    /// Painted settings tab and open one real folder tab. Scheduled only when
+    /// the user switches 接管 from 否 to 是.
+    fn enter_workbench(&mut self) {
+        let painted: Vec<usize> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_painted())
+            .map(|(i, _)| i)
+            .collect();
+        for i in painted.into_iter().rev() {
+            self.tabs.remove(i);
+            self.views.remove(i);
+        }
+        if self.tabs.is_empty() {
+            self.new_tab(home_dir());
+        } else {
+            let active = self.tabs.active_index().min(self.tabs.len() - 1);
+            self.activate(active);
+            self.sync_tabbar();
+            self.layout();
+        }
     }
 
     /// Apply a settings-panel click. The value, validation and TOML keys all
@@ -2412,6 +2535,67 @@ impl App {
                         return;
                     }
                 };
+
+                if id == revolc_common::settings::SettingId::TakeoverMode {
+                    // The user model has no "pause": 是 means work, 否 means
+                    // uninstall. UAC is modal, so both branches run off-thread
+                    // and post a repaint when done.
+                    let enabling = self.cfg.get().takeover.mode != "redirect";
+                    let hwnd_raw = self.main_hwnd.0 as usize;
+                    if enabling {
+                        match revolc_common::settings::apply(&self.cfg.get(), &text, id) {
+                            Ok(updated) => {
+                                if let Err(e) = std::fs::write(&path, updated) {
+                                    tracing::error!(error = %e, "settings: failed to write config");
+                                    return;
+                                }
+                            }
+                            Err(label) => {
+                                tracing::warn!(setting = label, "settings: invalid value rejected");
+                                return;
+                            }
+                        }
+                        // Make the new state visible immediately: sweep and
+                        // arm_burst read the config handle, not the file.
+                        self.cfg.reload();
+                        self.enter_workbench();
+                        std::thread::spawn(move || {
+                            if !revolc_common::takeover::is_bho_installed() {
+                                if let Err(e) = revolc_common::takeover::install_bho() {
+                                    tracing::error!(error = %e, "BHO installation failed");
+                                }
+                            }
+                            unsafe {
+                                let _ = PostMessageW(
+                                    HWND(hwnd_raw as _),
+                                    revolc_common::messages::WM_APP_REGISTRY_CHANGED,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            }
+                        });
+                    } else {
+                        std::thread::spawn(move || {
+                            let exe = std::env::current_exe().unwrap_or_default();
+                            let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+                            if let Err(e) = revolc_common::takeover::launch_uninstaller(
+                                &dir.join("revolc-tray.exe"),
+                            ) {
+                                tracing::error!(error = %e, "could not launch elevated uninstaller");
+                            }
+                            unsafe {
+                                let _ = PostMessageW(
+                                    HWND(hwnd_raw as _),
+                                    revolc_common::messages::WM_APP_REGISTRY_CHANGED,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            }
+                        });
+                    }
+                    return;
+                }
+
                 match revolc_common::settings::apply(&self.cfg.get(), &text, id) {
                     Ok(updated) => {
                         if let Err(e) = std::fs::write(&path, updated) {
@@ -2437,10 +2621,16 @@ impl App {
         tracing::debug!(?a, "action dispatched");
         match a {
             Action::NewTab => {
-                // Reuse where the user actually is, not where the tab was
-                // opened (a tab navigated to This PC must not reopen "zt").
-                let path = self.active_folder_path();
-                self.new_tab(path);
+                if self.cfg.get().takeover.mode != "redirect" {
+                    // No absorption pipeline while uninstalled: + must not
+                    // leave a system Explorer window on the desktop.
+                    self.open_settings_tab();
+                } else {
+                    // Reuse where the user actually is, not where the tab was
+                    // opened (a tab navigated to This PC must not reopen "zt").
+                    let path = self.active_folder_path();
+                    self.new_tab(path);
+                }
             }
             Action::CloseTab => self.close_tab(self.tabs.active_index()),
             Action::NextTab => {
@@ -2472,7 +2662,14 @@ impl App {
         // The strip must be painted **now**, synchronously: leaving it to the
         // message queue is what produced the black rectangle right of the tabs
         // after a maximize (host already grown and erased, band not yet drawn).
-        self.redraw_all();
+        // NOT during a resize drag, though: RDW_ALLCHILDREN | RDW_UPDATENOW
+        // marks the whole child subtree dirty and waits for it, and the
+        // absorbed pane lives in explorer.exe -- which also owns the tray and
+        // the DWM activation state that other apps' title bars follow. Doing
+        // that on every WM_SIZE frame makes focus-sensitive apps stutter.
+        if !self.in_sizemove {
+            self.redraw_all();
+        }
         self.refresh_band();
     }
 
@@ -2486,6 +2683,15 @@ impl App {
         self.place_active_sampled(None);
     }
 
+    /// Catch the absorbed pane up with the host's final geometry after a
+    /// resize drag, then repaint once. This is the single cross-process
+    /// update that replaces the dozens that were skipped during the drag.
+    fn flush_after_sizing(&mut self) {
+        self.laid_out = None;
+        self.place_active();
+        self.redraw_all();
+    }
+
     fn place_active_sampled(&mut self, sampled: Option<host::Metrics>) {
         let idx = self.tabs.active_index();
         let rc = self.view_rect();
@@ -2497,7 +2703,7 @@ impl App {
         }
         if let (Some(v), Some(m)) = (hosted, metrics) {
             // Align the *visible chrome* (ribbon onward) to the view rect.
-            v.place_client(rc, m);
+            v.place_client(rc, m, self.in_sizemove);
         }
         self.laid_out = key;
     }
@@ -2829,6 +3035,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = app_from(hwnd);
             app.create_tabbar_window();
             app.create_tooltip_window();
+            // Safe now: GWLP_USERDATA is installed, so the SetFocus a Painted
+            // settings tab triggers can re-enter WM_NCACTIVATE without a null
+            // App pointer.
+            if !app.tabs.is_empty() {
+                app.activate(0);
+            }
             app.invalidate_band();
             // The class icons cover Alt-Tab and the title bar; the taskbar button
             // and `SendMessage`-based consumers read the *window* icon, which
@@ -3313,6 +3525,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app_from(hwnd).sync_tabbar_window();
             LRESULT(0)
         }
+        WM_ENTERSIZEMOVE => {
+            app_from(hwnd).in_sizemove = true;
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            let app = app_from(hwnd);
+            app.in_sizemove = false;
+            // One catch-up + repaint for the final geometry instead of one
+            // per resize frame.
+            app.flush_after_sizing();
+            LRESULT(0)
+        }
         WM_SIZE => {
             let app = app_from(hwnd);
             app.sync_tabbar_window();
@@ -3370,14 +3594,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CLOSE => {
             // "hide" close action: the window just disappears from view; its
-            // tabs and absorbed panes stay alive, and the tray can bring it
-            // back with WM_APP_RESTORE. Only meaningful with the tray visible
-            // (otherwise there is no way to restore), and `next_edits`
-            // already forces "exit" when the tray is off — check again here
-            // so a stale config can never strand a hidden window.
+            // tabs and absorbed panes stay alive, and the permanent tray can
+            // bring it back with WM_APP_RESTORE. It only makes sense while
+            // taking over — an uninstalled hidden window would be an invisible
+            // control panel nobody can restore meaningfully.
             let hide = {
                 let app = app_from(hwnd);
-                app.cfg.get().tray.close_action == "hide" && app.cfg.get().tray.enabled
+                let cfg = app.cfg.get();
+                cfg.tray.close_action == "hide" && cfg.takeover.mode == "redirect"
             };
             if hide {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -3479,6 +3703,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.invalidate_band();
             app.laid_out = None;
             app.layout();
+            LRESULT(0)
+        }
+        m if m == revolc_common::messages::WM_APP_REGISTRY_CHANGED => {
+            // Registry install/uninstall ran on a worker thread; refresh the
+            // painted settings row with the new state.
+            app_from(hwnd).invalidate_view();
             LRESULT(0)
         }
         m if m == WM_TIMER && wp.0 == SWEEP_TIMER_ID => {

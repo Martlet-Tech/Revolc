@@ -1,9 +1,9 @@
 //! Self-drawn tray menu (a Win32 popup menu cannot host an inline button).
 //!
-//! Rows: one per open window ("N#: tab/tab/tab", with a × hit area on the
-//! right), a separator, new window, a separator, exit-revolc, close-everything.
-//! Clicking a row restores that window; clicking its × closes all its tabs
-//! and the frame. Commands are posted to the tray window as private messages.
+//! Rows: one per open workbench window ("N#: tab/tab/tab", × on the right),
+//! then only daily actions — new window / open settings / exit. Takeover
+//! toggling is deliberately NOT here: it stays in the settings page.
+//! Clicking a window row restores it; clicking its × closes that window.
 //!
 //! Geometry is derived from the widest row at open time: text width is
 //! measured with GetTextExtentPoint32W, so a menu with one short window is
@@ -42,15 +42,15 @@ const MAX_W: i32 = 560;
 /// Private messages the menu posts to the tray window, which owns spawn/quit.
 pub const CMD_NEW_WINDOW: u32 = 0x8020;
 pub const CMD_EXIT: u32 = 0x8021;
-pub const CMD_CLOSE_ALL: u32 = 0x8022;
+pub const CMD_OPEN_SETTINGS: u32 = 0x8022;
 
 #[derive(Clone, Copy)]
 enum Action {
     Window(isize),
     CloseWindow(isize),
     NewWindow,
+    OpenSettings,
     Exit,
-    CloseAll,
 }
 
 #[derive(Clone)]
@@ -106,24 +106,29 @@ unsafe fn measure(text: &str) -> i32 {
     w
 }
 
-/// Show the menu at the cursor. `windows` is (hwnd, "tabA/tabB/tabC") in
-/// display order; `tray` receives the command messages.
-pub unsafe fn show(tray: HWND, windows: Vec<(HWND, String)>) {
+/// Show the daily-use menu at the cursor. `windows` is (hwnd, "tabA/tabB") in
+/// display order; `takeover_on` decides whether workbench actions appear.
+/// System-level takeover changes live only in the settings page.
+pub unsafe fn show(tray: HWND, windows: Vec<(HWND, String)>, takeover_on: bool) {
     let mut list: Vec<Row> = Vec::new();
-    for (i, (hwnd, label)) in windows.iter().enumerate() {
-        let tabs: Vec<&str> = label.split(" / ").filter_map(short_tab).collect();
-        list.push(Row {
-            text: format!("{}#: {}", i + 1, tabs.join(" / ")),
-            action: Action::Window(hwnd.0 as isize),
-            separator: false,
-            height: ROW_H,
-        });
+    if takeover_on {
+        for (i, (hwnd, label)) in windows.iter().enumerate() {
+            let tabs: Vec<&str> = label.split(" / ").filter_map(short_tab).collect();
+            list.push(Row {
+                text: format!("{}#: {}", i + 1, tabs.join(" / ")),
+                action: Action::Window(hwnd.0 as isize),
+                separator: false,
+                height: ROW_H,
+            });
+        }
+        list.push(Row { text: String::new(), action: Action::NewWindow, separator: true, height: SEP_H });
+        list.push(Row { text: "新建窗口".into(), action: Action::NewWindow, separator: false, height: ROW_H });
     }
-    list.push(Row { text: String::new(), action: Action::NewWindow, separator: true, height: SEP_H });
-    list.push(Row { text: "新建窗口".into(), action: Action::NewWindow, separator: false, height: ROW_H });
-    list.push(Row { text: String::new(), action: Action::Exit, separator: true, height: SEP_H });
-    list.push(Row { text: "退出revolc（关托盘+窗口，还原FE）".into(), action: Action::Exit, separator: false, height: ROW_H });
-    list.push(Row { text: "关闭全部（啥都关）".into(), action: Action::CloseAll, separator: false, height: ROW_H });
+    if !list.is_empty() {
+        list.push(Row { text: String::new(), action: Action::OpenSettings, separator: true, height: SEP_H });
+    }
+    list.push(Row { text: "打开设置".into(), action: Action::OpenSettings, separator: false, height: ROW_H });
+    list.push(Row { text: "退出 Revolc".into(), action: Action::Exit, separator: false, height: ROW_H });
     *rows().lock().unwrap() = list;
     *hover().lock().unwrap() = (usize::MAX, HoverPart::None);
 
@@ -307,7 +312,7 @@ unsafe fn dispatch(action: Action) {
         Action::Window(h) => { let _ = PostMessageW(HWND(h as _), WM_APP_RESTORE, WPARAM(0), LPARAM(0)); }
         Action::CloseWindow(h) => { let _ = PostMessageW(HWND(h as _), WM_APP_CLOSE_TABS, WPARAM(0), LPARAM(0)); }
         Action::NewWindow => { let _ = PostMessageW(tray, CMD_NEW_WINDOW, WPARAM(0), LPARAM(0)); }
+        Action::OpenSettings => { let _ = PostMessageW(tray, CMD_OPEN_SETTINGS, WPARAM(0), LPARAM(0)); }
         Action::Exit => { let _ = PostMessageW(tray, CMD_EXIT, WPARAM(0), LPARAM(0)); }
-        Action::CloseAll => { let _ = PostMessageW(tray, CMD_CLOSE_ALL, WPARAM(0), LPARAM(0)); }
     }
 }

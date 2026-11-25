@@ -93,10 +93,17 @@ fn main() {
     if args.iter().any(|a| a == "--shutdown") {
         std::process::exit(shutdown_running());
     }
-    let initial_path = valid_startup_path(args.first().cloned());
-    tracing::info!(?initial_path, "starting");
+    let adopt_only = args.iter().any(|a| a == "--adopt");
+    let settings_only = args.iter().any(|a| a == "--settings");
+    let path_arg = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let initial_path = if adopt_only || settings_only {
+        None
+    } else {
+        valid_startup_path(path_arg)
+    };
+    tracing::info!(?initial_path, adopt_only, settings_only, "starting");
 
-    let exit_code = app::run(initial_path);
+    let exit_code = app::run(initial_path, adopt_only, settings_only);
     tracing::info!(elapsed = ?started.elapsed(), exit_code, "exited");
     std::process::exit(exit_code);
 }
