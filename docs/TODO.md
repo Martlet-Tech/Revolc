@@ -59,9 +59,9 @@
    想法：吸收与摆位拆成两步（SetParent 用 `SWP_ASYNCWINDOWPOS` 之后不再同步等），
    或者按窗口 post 一个工作项、下一个窗口的 SetParent 与上一个的摆位重叠。
    非阻塞的替代：启动时先给所有待吸收窗口套一层遮罩（见 P2）。
-2. **`startup path` 不做校验**：`revolc.exe Explorer` 会把字面量 `"Explorer"`
-   当路径 spawn（log 实锤 `2026-11-17T00:40:30 path="Explorer"`）。
-   修法：`initial_path` 必须通过 `GetFileAttributesW` / 存在性检查，否则回退 `home_dir()`。
+2. ~~**`startup path` 不做校验**~~ **已修**（`src/main.rs::valid_startup_path` 用 `GetFileAttributesW`
+   校验，非目录 / 不存在时回退 `home_dir()`；原 bug 是 `revolc.exe Explorer` 把字面量 `"Explorer"`
+   当路径 spawn，log 实锤 `2026-11-17T00:40:30 path="Explorer"`）。
 3. **soak 测试**（交接文档 §6-1）：日常使用 1–2 天，重点开关机/注销/强杀后无僵尸窗口，
    以及“连开 10 个文件夹是否每个都进 tab”。
 
