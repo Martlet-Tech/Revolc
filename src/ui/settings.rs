@@ -515,7 +515,10 @@ impl SettingsPanel {
                 continue;
             }
             for (i, cell) in row.choices.iter().enumerate() {
-                if inside(x, y, *cell) && row.control != Control::Toggle {
+                // Only segmented controls select a value directly. The
+                // dropdown's cell is just the affordance to open the list;
+                // hitting it must return `Setting` so the list can expand.
+                if inside(x, y, *cell) && row.control == Control::Segmented {
                     return Some(SettingsHit::Choice(row.id, i));
                 }
             }
@@ -642,6 +645,17 @@ mod tests {
         };
         let mut panel = SettingsPanel::new();
         panel.select(1);
+        let closed = panel.layout(rc, &cfg);
+        let cell = closed.rows[0].choices[0];
+        assert_eq!(
+            panel.hit(
+                (cell.left + cell.right) / 2,
+                (cell.top + cell.bottom) / 2,
+                rc,
+                &cfg
+            ),
+            Some(SettingsHit::Setting(SettingId::ThemePreset))
+        );
         panel.toggle_theme_dropdown();
         let layout = panel.layout(rc, &cfg);
         assert_eq!(layout.dropdown_items.len(), 4);

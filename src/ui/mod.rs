@@ -2966,8 +2966,14 @@ impl App {
                 };
                 match revolc_common::settings::apply_choice(&self.cfg.get(), &text, id, index) {
                     Ok(updated) => {
-                        if let Err(e) = std::fs::write(&path, updated) {
-                            tracing::error!(error = %e, "settings: failed to write config");
+                        // Re-selecting the current value must not churn the
+                        // config watcher (it posts a repaint on every write).
+                        if updated != text {
+                            if let Err(e) = std::fs::write(&path, updated) {
+                                tracing::error!(error = %e, "settings: failed to write config");
+                            }
+                        } else {
+                            self.invalidate_view();
                         }
                     }
                     Err(label) => tracing::warn!(setting = label, "settings: invalid value rejected"),
@@ -3050,8 +3056,12 @@ impl App {
 
                 match revolc_common::settings::apply(&self.cfg.get(), &text, id) {
                     Ok(updated) => {
-                        if let Err(e) = std::fs::write(&path, updated) {
-                            tracing::error!(error = %e, "settings: failed to write config");
+                        if updated != text {
+                            if let Err(e) = std::fs::write(&path, updated) {
+                                tracing::error!(error = %e, "settings: failed to write config");
+                            }
+                        } else {
+                            self.invalidate_view();
                         }
                     }
                     Err(label) => tracing::warn!(setting = label, "settings: invalid value rejected"),
