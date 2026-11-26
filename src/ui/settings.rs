@@ -140,7 +140,16 @@ impl SettingsPanel {
             } else {
                 id.unavailable_hint()
             };
-            let height = CARD_H + if hint.is_empty() { 0 } else { CARD_HINT_H };
+            // An open theme dropdown grows its own card instead of floating
+            // over the next setting — no occupied row is ever covered.
+            let dropdown_rows = if id == SettingId::ThemePreset && self.dropdown_open {
+                SettingId::ThemePreset.choices(cfg).len()
+            } else {
+                0
+            };
+            let height = CARD_H
+                + if hint.is_empty() { 0 } else { CARD_HINT_H }
+                + if dropdown_rows == 0 { 0 } else { 8 + dropdown_rows as i32 * 28 };
             let rect = RECT {
                 left,
                 top: y,
@@ -183,14 +192,14 @@ impl SettingsPanel {
             if let Some(row) = rows.iter().find(|r| r.id == SettingId::ThemePreset) {
                 let choices = SettingId::ThemePreset.choices(cfg);
                 let item_h = 28;
-                let top = row.rect.bottom + 4;
-                let left = row.rect.left;
-                let width = 320.min(row.rect.right - left);
-                let bottom = (top + 8 + choices.len() as i32 * item_h).min(rc.bottom - 8);
+                let top = row.rect.top + CARD_H;
+                let left = row.rect.left + 8;
+                let right = row.rect.right - 8;
+                let bottom = row.rect.bottom - 4;
                 dropdown = Some(RECT {
                     left,
                     top,
-                    right: left + width,
+                    right,
                     bottom,
                 });
                 dropdown_items = choices
@@ -199,8 +208,8 @@ impl SettingsPanel {
                     .map(|(i, _)| RECT {
                         left: left + 4,
                         top: top + 4 + i as i32 * item_h,
-                        right: left + width - 4,
-                        bottom: (top + 4 + (i + 1) as i32 * item_h).min(bottom - 4),
+                        right: right - 4,
+                        bottom: top + 4 + (i + 1) as i32 * item_h,
                     })
                     .collect();
             }
@@ -442,12 +451,13 @@ impl SettingsPanel {
         }
 
         if let Some(overlay) = layout.dropdown {
-            card(
-                hdc,
-                overlay,
-                COLORREF(p.surface_raised().to_colorref()),
-                COLORREF(p.border_subtle().to_colorref()),
-            );
+            // The expanded area is part of the card itself: one separator,
+            // no floating panel and no covered neighbour.
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(p.border_subtle().to_colorref()));
+            let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+            line(hdc, overlay.left, overlay.top, overlay.right, overlay.top);
+            let _ = SelectObject(hdc, old_pen);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
             let choices = SettingId::ThemePreset.choices(cfg);
             let selected = current_index(SettingId::ThemePreset, cfg);
             for (i, item) in layout.dropdown_items.iter().enumerate() {
@@ -659,6 +669,10 @@ mod tests {
         panel.toggle_theme_dropdown();
         let layout = panel.layout(rc, &cfg);
         assert_eq!(layout.dropdown_items.len(), 4);
+        // Expanded list lives inside its own card; the next row is pushed
+        // down instead of being covered.
+        assert!(layout.rows[0].rect.bottom <= layout.rows[1].rect.top);
+        assert!(layout.dropdown_items[3].bottom < layout.rows[0].rect.bottom);
         let item = layout.dropdown_items[1];
         assert_eq!(
             panel.hit(
