@@ -126,7 +126,7 @@ const TOOLTIP_CLASS: PCWSTR = w!("RevolcTooltip");
 /// Owned, layered popup that paints the tab while it floats outside the band.
 const FLOAT_CLASS: PCWSTR = w!("RevolcFloatTab");
 /// WM_COPYDATA tag for cross-window tab drag ("TDRG"). Payload is UTF-8
-/// `op\tpath\tlabel\tlanding`: op = `enter` | `move` | `leave` | `drop`.
+/// `op\tpath\tlabel\tscreen_x`: op = `enter` | `move` | `leave` | `drop`.
 const DRAG_COPYDATA_TAG: usize = 0x54445247;
 /// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
 /// with accelerators (which use 1..=keymap.len()).
@@ -1666,7 +1666,7 @@ impl App {
             // SM_CXDRAG is the only threshold user32 exposes, but a tab can
             // detach vertically. Compare both axes or a straight up/down pull
             // never starts the drag (felt as "can't yank the tab out").
-            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) } as i32;
             if !reorder::crossed_2d(press.x, press.y, x, y, threshold) {
                 return false;
             }
@@ -1900,7 +1900,9 @@ impl App {
             let committed = if let Some(target) = f.target {
                 let ok = unsafe { IsWindow(target).as_bool() };
                 if ok {
-                    self.send_drag(target, "drop", &f.path, &f.label, 0);
+                    // drop uses the ghost's stored slot; label/pointer are
+                    // deliberately empty (target needs neither).
+                    self.send_drag(target, "drop", &f.path, "", 0);
                 }
                 ok
             } else {
@@ -2041,9 +2043,6 @@ impl App {
     fn on_tab_drag_message(&mut self, op: &str, path: &str, label: &str, screen_x: i32) {
         match op {
             "leave" => {
-                if self.tabbar.set_drop_tint(false) {
-                    self.invalidate_band();
-                }
                 if self.tabbar.set_incoming(None) {
                     self.invalidate_band();
                     tracing::info!("tab drag: incoming ghost cleared");
@@ -2063,9 +2062,6 @@ impl App {
                     self.invalidate_band();
                     tracing::info!(slot, ?ghost, "tab drag: incoming ghost");
                 }
-                if self.tabbar.set_drop_tint(true) {
-                    self.invalidate_band();
-                }
             }
             "drop" => {
                 // Use the ghost's last landing, not a fresh hit test: the
@@ -2083,7 +2079,6 @@ impl App {
                 self.views.insert(at, View::Pending);
                 self.launch_tab_view(at, path.clone());
                 self.tabbar.set_incoming(None);
-                self.tabbar.set_drop_tint(false);
                 tracing::info!(?path, slot = at, "merged tab from another window");
             }
             _ => {}
@@ -2147,7 +2142,7 @@ impl App {
     /// the same `reorder` code the tab strip uses.
     fn bookmark_drag_track(&mut self, x: i32) -> bool {
         if let Some(press) = self.bookmark_press {
-            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+            let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) } as i32;
             if !reorder::crossed(press.x, x, threshold) {
                 return false;
             }

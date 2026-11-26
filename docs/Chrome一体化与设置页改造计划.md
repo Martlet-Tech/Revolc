@@ -192,7 +192,8 @@ PaintedPage（开放枚举）
 - Everything 搜索栏、搜索后端下载/安装、IPC 查询
 - 收藏目录的真实数据与交互（TODO Phase 3）
 - 主题色默认值修改（当前代码默认是深灰蓝，用户实际用绿色 toml，本计划不改默认值）
-- `tray.enabled`、`startup_mode`、`hover_switch` 的行为修复
+- ~~`tray.enabled`、`startup_mode`、`hover_switch` 的行为修复~~
+  这三项已确认是死配置并删除（`behavior` 整组 + `tray.enabled` 忽略；见 `common/src/config.rs`）
 - 安装器、BHO、注册表
 
 ---

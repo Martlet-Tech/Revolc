@@ -11,7 +11,6 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub theme: Theme,
-    pub behavior: Behavior,
     pub takeover: Takeover,
     pub tray: Tray,
     pub bookmarks: Bookmarks,
@@ -96,22 +95,10 @@ pub struct Theme {
     pub tab_radius: i32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct Behavior {
-    /// "last" | "new" | "list"  (spec §3.2)
-    pub startup_mode: String,
-    /// Used when startup_mode == "list"
-    pub startup_paths: Vec<String>,
-    /// Hover-to-switch tabs (spec §3.1)
-    pub hover_switch: bool,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             theme: Theme::default(),
-            behavior: Behavior::default(),
             takeover: Takeover::default(),
             tray: Tray::default(),
             bookmarks: Bookmarks::default(),
@@ -141,16 +128,6 @@ impl Default for Theme {
             window_border: "#151515".into(),
             bookmark_bar_background: "#202020".into(),
             tab_radius: 6,
-        }
-    }
-}
-
-impl Default for Behavior {
-    fn default() -> Self {
-        Self {
-            startup_mode: "last".into(),
-            startup_paths: Vec::new(),
-            hover_switch: true,
         }
     }
 }
@@ -261,11 +238,6 @@ caption_hover     = "#3d3d3d"  # min/max button hover fill
 caption_close_hover = "#c42b1c" # close button hover (red)
 window_border     = "#151515" # colour of the frame around the whole window
 tab_radius        = 6      # 0 = square corners
-
-[behavior]
-startup_mode = "last"    # "last" | "new" | "list"
-startup_paths = []       # used when startup_mode == "list"
-hover_switch = true
 
 [takeover]
 mode = "off"             # "off" = 否（卸载清理）| "redirect" = 是（接管工作）

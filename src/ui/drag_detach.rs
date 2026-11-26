@@ -46,25 +46,10 @@ pub fn in_band_reenter(win: WinRect, x: i32, y: i32) -> bool {
 }
 
 /// Which window's band contains the point, with `from` excluded (the caller
-/// tests the source window separately). First match wins; windows never
-/// overlap their bands in practice, and if they do the topmost one in the
-/// enumeration order is as good a choice as any.
-#[allow(dead_code)] // pure reference for tests; production uses the sticky version
-pub fn band_owner<HWnd: Eq + Copy>(
-    windows: impl IntoIterator<Item = (HWnd, WinRect)>,
-    from: HWnd,
-    x: i32,
-    y: i32,
-) -> Option<HWnd> {
-    windows
-        .into_iter()
-        .find(|(h, rc)| *h != from && in_band(*rc, x, y))
-        .map(|(h, _)| h)
-}
-
-/// Sticky version of `band_owner` for an in-progress float. If `current` is
-/// still inside the outer band, keep it — only switch when it has actually
-/// left, so a pointer parked on a boundary does not toggle the ghost on/off.
+/// tests the source window separately). Sticky for an in-progress float: if
+/// `current` is still inside the outer band, keep it — only switch when it has
+/// actually left, so a pointer parked on a boundary does not toggle the ghost
+/// on/off. First match wins when there is no current target.
 pub fn band_owner_sticky<HWnd: Eq + Copy>(
     windows: impl IntoIterator<Item = (HWnd, WinRect)>,
     from: HWnd,
@@ -126,22 +111,16 @@ mod tests {
     }
 
     #[test]
-    fn band_owner_skips_source_window() {
-        let other = WinRect { left: 1000, top: 200, right: 1800, bottom: 800 };
-        let list = [(1u32, W), (2u32, other)];
-        assert_eq!(band_owner(list, 1, 1100, 210), Some(2));
-        assert_eq!(band_owner(list, 1, 200, 210), None);
-    }
-
-    #[test]
-    fn sticky_target_keeps_current_until_it_leaves() {
+    fn sticky_target_skips_source_and_keeps_current() {
         let other = WinRect { left: 1000, top: 200, right: 1800, bottom: 800 };
         let list = [(1u32, W), (2u32, other)];
         // Point in window 2's band: keep 2.
         assert_eq!(band_owner_sticky(list, 1, Some(2), 1100, 210), Some(2));
+        // Current target on the source window is never kept.
+        assert_eq!(band_owner_sticky(list, 1, Some(1), 1100, 210), Some(2));
         // Point outside 2's band: fall back to whatever is in band (none).
         assert_eq!(band_owner_sticky(list, 1, Some(2), 500, 210), None);
-        // No current target: same as band_owner.
+        // No current target: first in-band window wins.
         assert_eq!(band_owner_sticky(list, 1, None, 1100, 210), Some(2));
     }
 
