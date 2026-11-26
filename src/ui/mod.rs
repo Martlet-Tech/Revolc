@@ -2955,6 +2955,7 @@ impl App {
                 }
             }
             Choice(id, index) => {
+                self.settings_panel.close_theme_dropdown();
                 let path = self.cfg.path().clone();
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
@@ -2973,6 +2974,11 @@ impl App {
                 }
             }
             Setting(id) => {
+                if id == revolc_common::settings::SettingId::ThemePreset {
+                    self.settings_panel.toggle_theme_dropdown();
+                    self.invalidate_view();
+                    return;
+                }
                 let path = self.cfg.path().clone();
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
@@ -3705,7 +3711,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 .unwrap_or(false);
             if chrome::route_click(y, painted_active) == chrome::ClickRoute::PaintedPage {
                 let rc = app.view_rect();
-                if let Some(hit) = app.settings_panel.hit(x, y, rc, &app.cfg.get()) {
+                let cfg = app.cfg.get();
+                if let Some(hit) = app.settings_panel.hit(x, y, rc, &cfg) {
                     app.handle_settings_hit(hit);
                 }
                 return LRESULT(0);

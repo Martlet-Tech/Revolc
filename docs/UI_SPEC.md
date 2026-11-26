@@ -53,7 +53,8 @@
 | 标题栏按钮 hover / 关闭 hover | `surface.hover` / `danger.default` |
 | 设置页画布 / 左导航 / 导航选中 | `app.background` / `surface.background` / `surface.raised` + 3px `accent.default` 左竖条 |
 | 设置卡片 / 行 hover / 禁用态 | `surface.raised` + 1px `border.subtle` / `surface.hover` / primary 与底色等比混合 |
-| 开关 on / off、分段选中、色卡 | `accent.default` / `surface.hover` / `accent.soft` + `accent.default` |
+| 开关 on / off、分段选中 | `accent.default` / `surface.hover` + `app.background` 文字 |
+| 配色主题选择器 | **下拉列表**：卡片显示当前主题名，展开项用 `surface.raised` 底、`foreground.primary` 文字；**禁止**用色点/色卡代替名称 |
 | 托盘菜单底 / 分隔线 / 行 hover | `surface.background` / `border.subtle` / `surface.hover` |
 | 托盘关闭列 hover / 退出项 | `danger.default` + `foreground.inverse` / `danger.default` 文字 |
 | 新控件（本表未列） | 先补表：它属于哪一层面（chrome / surface / raised）、什么状态、强调还是危险 |
@@ -86,7 +87,8 @@
 - 内置四套：`普通浅色`、`普通深色`、`三叶草浅色`、`三叶草深色`。
 - 用户主题放 `%APPDATA%\revolc\themes\`；缺失键按 `inherit` → 内置主题 → 按 `type` 推导的顺序补齐。
 - 从 VS Code 等外部主题导入时，只映射到 §2 的语义键；映射表由 `theme` crate 维护，UI 不参与。
-- 旧 TOML 里的扁平色键只作为一次性迁移的 overrides 读入，**禁止**长期并存两套色值真相源。
+- 旧 TOML 里的扁平色键在首次加载时映射到**最接近的内置主题**，不再生成可选择的「迁移的主题」——继承旧色值会产出读不清的文字，已废弃。
+- `derive` **必须**校验 `foreground.primary` / `foreground.secondary` 与所在底面的对比度 ≥ 4.5:1，不达标时回退到黑白文字。
 
 ---
 

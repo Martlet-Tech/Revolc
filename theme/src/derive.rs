@@ -70,7 +70,18 @@ pub fn fill_missing(theme: &mut Theme) {
         Color(0xF5, 0xF5, 0xF5)
     };
     ensure(theme, "foreground.primary", ink);
+    // A user-supplied or inherited text colour must never end up unreadable
+    // on its own surface. Fall back to black/white when contrast is too low.
+    let extreme = |bg: Color| {
+        if bg.luminance() > 0.35 { Color(0x1A, 0x1A, 0x1A) } else { Color(0xFF, 0xFF, 0xFF) }
+    };
+    if theme.color("foreground.primary").contrast(app) < 4.5 {
+        theme.colors.insert("foreground.primary".into(), extreme(app));
+    }
     ensure(theme, "foreground.secondary", ink.blend(app, 0.38));
+    if theme.color("foreground.secondary").contrast(surface) < 4.5 {
+        theme.colors.insert("foreground.secondary".into(), theme.color("foreground.primary"));
+    }
     ensure(theme, "foreground.inverse", app);
 
     let accent = theme.color("accent.default");
@@ -151,6 +162,22 @@ mod tests {
                 .color("foreground.primary")
                 .contrast(theme.color("app.background"))
                 > 4.5
+        );
+    }
+
+    #[test]
+    fn unreadable_secondary_is_replaced() {
+        let theme = partial(
+            ThemeKind::Dark,
+            &[
+                ("app.background", "#10261A"),
+                ("surface.background", "#1E4632"),
+                ("foreground.primary", "#F2F7F3"),
+                ("foreground.secondary", "#1b3d28"),
+            ],
+        );
+        assert!(
+            theme.color("foreground.secondary").contrast(theme.color("surface.background")) >= 4.5
         );
     }
 

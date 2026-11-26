@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use revolc_theme::{save_user_theme, Theme as Palette, ThemeFile, ThemeSet};
+use revolc_theme::{import::infer_kind, Theme as Palette, ThemeKind, ThemeSet};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,8 +70,9 @@ pub struct Takeover {
 }
 
 /// Legacy flat colour fields remain only so an existing `revolc.toml` still
-/// deserializes. On first load they are migrated into a user theme JSON and
-/// never used for painting again. New UI code reads `Config.palette`.
+/// deserializes. On first load `active` is set to the closest built-in theme
+/// and these keys are never used for painting again. New UI code reads
+/// `Config.palette`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Theme {
@@ -322,64 +323,34 @@ pub fn load(path: &PathBuf) -> Config {
     if cfg.theme.active.is_empty() {
         cfg.theme.active = default_theme_id();
     }
+    // Earlier builds wrote a "migrated" user theme with inherited legacy
+    // colours. It is no longer selectable; pin those configs to clover-dark.
+    if cfg.theme.active == "migrated" {
+        let updated = set_toml_value(&text, "theme", "active", "\"clover-dark\"");
+        let _ = std::fs::write(path, updated);
+        cfg.theme.active = "clover-dark".into();
+    }
 
     cfg.palette = resolve_palette(&cfg.theme);
     cfg
 }
 
-/// Turn the legacy `[theme]` colour keys into a user theme JSON and set
-/// `[theme].active` in place. Called at most once per config file.
+/// Old configs have flat colour keys but no `active`. Pick the closest
+/// built-in theme instead of creating a user theme: a copied legacy palette
+/// can produce unreadable text, and it adds a fifth choice nobody wants.
 fn migrate_legacy_theme(path: &PathBuf, text: &str, theme: &Theme) -> Result<String, String> {
-    let legacy = [
-        (
-            "tabbar_background",
-            "chrome.background",
-            &theme.tabbar_background,
-        ),
-        ("tab_active", "accent.soft", &theme.tab_active),
-        ("tab_hover", "surface.hover", &theme.tab_hover),
-        ("tab_inactive", "surface.background", &theme.tab_inactive),
-        ("tab_text", "foreground.secondary", &theme.tab_text),
-        (
-            "tab_text_active",
-            "foreground.inverse",
-            &theme.tab_text_active,
-        ),
-        ("tab_close_hover", "surface.hover", &theme.tab_close_hover),
-        ("tabbar_text", "foreground.primary", &theme.tabbar_text),
-        ("caption_hover", "surface.hover", &theme.caption_hover),
-        (
-            "caption_close_hover",
-            "danger.default",
-            &theme.caption_close_hover,
-        ),
-        ("window_border", "app.background", &theme.window_border),
-        (
-            "bookmark_bar_background",
-            "surface.background",
-            &theme.bookmark_bar_background,
-        ),
-    ];
-    let mut colors = std::collections::HashMap::new();
-    for (legacy_key, role, value) in legacy {
-        if revolc_theme::Color::parse(value).is_some() {
-            colors.insert(role.to_string(), value.clone());
-        }
-        let _ = legacy_key; // keeps the mapping table self-documenting
-    }
-    let file = ThemeFile {
-        id: Some("migrated".into()),
-        name: "迁移的主题".into(),
-        kind: revolc_theme::import::infer_kind(&theme.tabbar_background),
-        inherit: Some("clover-dark".into()),
-        colors,
+    let green = {
+        let c = revolc_theme::Color::parse(&theme.tabbar_background)
+            .unwrap_or(revolc_theme::Color(0, 0, 0));
+        c.1 > c.0.saturating_mul(6) / 5 && c.1 > c.2.saturating_mul(6) / 5
     };
-    save_user_theme("migrated", &file).map_err(|e| e.to_string())?;
-    let updated = set_toml_value(text, "theme", "active", "\"migrated\"");
-    tracing::info!(
-        ?path,
-        "migrated legacy theme colours to themes/migrated.json"
-    );
+    let id = match infer_kind(&theme.tabbar_background) {
+        ThemeKind::Light => "light",
+        _ if green => "clover-dark",
+        _ => "dark",
+    };
+    let updated = set_toml_value(text, "theme", "active", &format!("\"{id}\""));
+    tracing::info!(?path, id, "migrated legacy colours to built-in theme");
     Ok(updated)
 }
 

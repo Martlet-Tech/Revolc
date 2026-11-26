@@ -11,14 +11,13 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject,
     RoundRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS,
-    DT_LEFT, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, HGDIOBJ, NULL_BRUSH, OUT_TT_PRECIS,
+    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, HGDIOBJ,
+    OUT_TT_PRECIS,
     PS_SOLID, TRANSPARENT,
 };
 
 use revolc_common::config::Config;
 use revolc_common::settings::SettingId;
-use revolc_theme::ThemeSet;
-
 use super::gdi::line;
 
 const RAIL_W: i32 = 140;
@@ -47,7 +46,8 @@ fn settings_in_category(category: usize) -> Vec<SettingId> {
 enum Control {
     Toggle,
     Segmented,
-    Swatch,
+    /// Theme picker: a dropdown with readable names, not tiny colour dots.
+    Dropdown,
 }
 
 impl Control {
@@ -55,7 +55,7 @@ impl Control {
         match id {
             SettingId::TakeoverMode | SettingId::Autostart => Control::Toggle,
             SettingId::CloseAction | SettingId::TabRadius => Control::Segmented,
-            SettingId::ThemePreset => Control::Swatch,
+            SettingId::ThemePreset => Control::Dropdown,
         }
     }
 }
@@ -64,7 +64,7 @@ impl Control {
 pub enum SettingsHit {
     Category(usize),
     Setting(SettingId),
-    /// A specific option in a segmented/swatch control.
+    /// A specific option in a segmented control or the theme dropdown.
     Choice(SettingId, usize),
 }
 
@@ -78,21 +78,41 @@ struct RowLayout {
 struct Layout {
     rail: Vec<RECT>,
     rows: Vec<RowLayout>,
+    dropdown: Option<RECT>,
+    dropdown_items: Vec<RECT>,
 }
 
 pub struct SettingsPanel {
     category: usize,
+    dropdown_open: bool,
+    dropdown_hover: Option<usize>,
 }
 
 impl SettingsPanel {
     pub fn new() -> Self {
-        Self { category: 0 }
+        Self {
+            category: 0,
+            dropdown_open: false,
+            dropdown_hover: None,
+        }
     }
 
     pub fn select(&mut self, category: usize) {
         if category < CATEGORY_COUNT {
             self.category = category;
         }
+        self.close_theme_dropdown();
+    }
+
+    /// Clicking the theme card opens/closes the dropdown instead of cycling.
+    pub fn toggle_theme_dropdown(&mut self) {
+        self.dropdown_open = !self.dropdown_open;
+        self.dropdown_hover = None;
+    }
+
+    pub fn close_theme_dropdown(&mut self) {
+        self.dropdown_open = false;
+        self.dropdown_hover = None;
     }
 
     fn pane(rc: RECT) -> (i32, i32) {
@@ -130,11 +150,12 @@ impl SettingsPanel {
             let control = Control::of(id);
             let count = match control {
                 Control::Toggle => 1,
-                Control::Segmented | Control::Swatch => id.choices(cfg).len().max(1),
+                Control::Segmented => id.choices(cfg).len().max(1),
+                Control::Dropdown => 1,
             };
             let cw = match control {
                 Control::Segmented => 64,
-                Control::Swatch => 20,
+                Control::Dropdown => 120,
                 Control::Toggle => 40,
             };
             let total = count as i32 * cw + (count as i32 - 1) * 4;
@@ -156,7 +177,40 @@ impl SettingsPanel {
             });
             y += height + CARD_GAP;
         }
-        Layout { rail, rows }
+        let mut dropdown = None;
+        let mut dropdown_items = Vec::new();
+        if self.dropdown_open {
+            if let Some(row) = rows.iter().find(|r| r.id == SettingId::ThemePreset) {
+                let choices = SettingId::ThemePreset.choices(cfg);
+                let item_h = 28;
+                let top = row.rect.bottom + 4;
+                let left = row.rect.left;
+                let width = 320.min(row.rect.right - left);
+                let bottom = (top + 8 + choices.len() as i32 * item_h).min(rc.bottom - 8);
+                dropdown = Some(RECT {
+                    left,
+                    top,
+                    right: left + width,
+                    bottom,
+                });
+                dropdown_items = choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| RECT {
+                        left: left + 4,
+                        top: top + 4 + i as i32 * item_h,
+                        right: left + width - 4,
+                        bottom: (top + 4 + (i + 1) as i32 * item_h).min(bottom - 4),
+                    })
+                    .collect();
+            }
+        }
+        Layout {
+            rail,
+            rows,
+            dropdown,
+            dropdown_items,
+        }
     }
 
     /// Paint the settings page into `rc` (already the view rect).
@@ -355,48 +409,72 @@ impl SettingsPanel {
                         text(hdc, *cell, label, caption_font, ink, DT_CENTER);
                     }
                 }
-                Control::Swatch => {
-                    let set = ThemeSet::discover();
-                    for (i, cell) in row.choices.iter().enumerate() {
-                        let theme_id = row
-                            .id
-                            .choices(cfg)
-                            .get(i)
-                            .map(|c| c.1.trim_matches('"').to_string());
-                        let color = theme_id
-                            .as_deref()
-                            .and_then(|id| set.resolve(id).ok())
-                            .map(|t| COLORREF(t.accent_default().to_colorref()))
-                            .unwrap_or_else(|| COLORREF(p.accent_default().to_colorref()));
-                        fill_round(hdc, *cell, color, 9);
-                        if Some(i) == selected {
-                            outline_round(
-                                hdc,
-                                RECT {
-                                    left: cell.left - 2,
-                                    top: cell.top - 2,
-                                    right: cell.right + 2,
-                                    bottom: cell.bottom + 2,
-                                },
-                                COLORREF(p.foreground_primary().to_colorref()),
-                                11,
-                            );
-                        }
-                    }
+                Control::Dropdown => {
+                    let cell = row.choices[0];
                     text(
                         hdc,
                         RECT {
-                            left: row.rect.left + 12,
-                            top: row.rect.top + 26,
-                            right,
-                            bottom: row.rect.bottom,
+                            left: cell.left,
+                            top: row.rect.top + 4,
+                            right: cell.right - 24,
+                            bottom: row.rect.top + CARD_H - 4,
                         },
                         &cfg.palette.name,
+                        body_font,
+                        ink,
+                        DT_RIGHT,
+                    );
+                    text(
+                        hdc,
+                        RECT {
+                            left: cell.right - 22,
+                            top: row.rect.top + 4,
+                            right: cell.right,
+                            bottom: row.rect.top + CARD_H - 4,
+                        },
+                        "▾",
                         caption_font,
-                        COLORREF(p.foreground_secondary().to_colorref()),
-                        DT_LEFT,
+                        COLORREF(p.foreground_primary().to_colorref()),
+                        DT_CENTER,
                     );
                 }
+            }
+        }
+
+        if let Some(overlay) = layout.dropdown {
+            card(
+                hdc,
+                overlay,
+                COLORREF(p.surface_raised().to_colorref()),
+                COLORREF(p.border_subtle().to_colorref()),
+            );
+            let choices = SettingId::ThemePreset.choices(cfg);
+            let selected = current_index(SettingId::ThemePreset, cfg);
+            for (i, item) in layout.dropdown_items.iter().enumerate() {
+                if Some(i) == selected || Some(i) == self.dropdown_hover {
+                    fill(hdc, *item, COLORREF(p.surface_hover().to_colorref()));
+                    fill(
+                        hdc,
+                        RECT {
+                            left: item.left,
+                            top: item.top,
+                            right: item.left + 3,
+                            bottom: item.bottom,
+                        },
+                        COLORREF(p.accent_default().to_colorref()),
+                    );
+                }
+                text(
+                    hdc,
+                    RECT {
+                        left: item.left + 10,
+                        ..*item
+                    },
+                    choices.get(i).map(|c| c.0.as_str()).unwrap_or(""),
+                    body_font,
+                    COLORREF(p.foreground_primary().to_colorref()),
+                    DT_LEFT,
+                );
             }
         }
 
@@ -406,8 +484,27 @@ impl SettingsPanel {
         let _ = DeleteObject(HGDIOBJ(caption_font.0));
     }
 
-    pub fn hit(&self, x: i32, y: i32, rc: RECT, cfg: &Config) -> Option<SettingsHit> {
+    pub fn hit(&mut self, x: i32, y: i32, rc: RECT, cfg: &Config) -> Option<SettingsHit> {
         let layout = self.layout(rc, cfg);
+        if self.dropdown_open {
+            for (i, item) in layout.rail.iter().enumerate() {
+                if inside(x, y, *item) {
+                    self.close_theme_dropdown();
+                    return Some(SettingsHit::Category(i));
+                }
+            }
+            for (i, item) in layout.dropdown_items.iter().enumerate() {
+                if inside(x, y, *item) {
+                    self.close_theme_dropdown();
+                    return Some(SettingsHit::Choice(SettingId::ThemePreset, i));
+                }
+            }
+            if layout.dropdown.map(|r| inside(x, y, r)).unwrap_or(false) {
+                return None;
+            }
+            self.close_theme_dropdown();
+            return None;
+        }
         for (i, item) in layout.rail.iter().enumerate() {
             if inside(x, y, *item) {
                 return Some(SettingsHit::Category(i));
@@ -471,16 +568,6 @@ unsafe fn fill_round(hdc: HDC, rc: RECT, color: COLORREF, radius: i32) {
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
-unsafe fn outline_round(hdc: HDC, rc: RECT, color: COLORREF, radius: i32) {
-    let pen = CreatePen(PS_SOLID, 1, color);
-    let old = SelectObject(hdc, HGDIOBJ(pen.0));
-    let old_brush = SelectObject(hdc, HGDIOBJ(GetStockObject(NULL_BRUSH).0));
-    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    let _ = SelectObject(hdc, old_brush);
-    let _ = SelectObject(hdc, old);
-    let _ = DeleteObject(HGDIOBJ(pen.0));
-}
-
 unsafe fn font(px: i32, weight: i32) -> HFONT {
     let handle = CreateFontW(
         -px,
@@ -534,7 +621,7 @@ mod tests {
             right: 900,
             bottom: 500,
         };
-        let panel = SettingsPanel::new();
+        let mut panel = SettingsPanel::new();
         let layout = panel.layout(rc, &cfg);
         assert_eq!(layout.rows.len(), 3);
         let row = &layout.rows[0];
@@ -545,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn swatch_control_exposes_choices() {
+    fn theme_dropdown_lists_every_theme() {
         let cfg = Config::default();
         let rc = RECT {
             left: 0,
@@ -555,17 +642,24 @@ mod tests {
         };
         let mut panel = SettingsPanel::new();
         panel.select(1);
+        panel.toggle_theme_dropdown();
         let layout = panel.layout(rc, &cfg);
-        assert_eq!(layout.rows[0].choices.len(), 4);
-        let cell = layout.rows[0].choices[1];
+        assert_eq!(layout.dropdown_items.len(), 4);
+        let item = layout.dropdown_items[1];
         assert_eq!(
             panel.hit(
-                (cell.left + cell.right) / 2,
-                (cell.top + cell.bottom) / 2,
+                (item.left + item.right) / 2,
+                (item.top + item.bottom) / 2,
                 rc,
                 &cfg
             ),
             Some(SettingsHit::Choice(SettingId::ThemePreset, 1))
         );
+        assert!(!panel.dropdown_open);
+        panel.toggle_theme_dropdown();
+        let layout = panel.layout(rc, &cfg);
+        let row = &layout.rows[0];
+        assert_eq!(panel.hit(row.rect.left + 20, row.rect.top + 10, rc, &cfg), None);
+        assert!(!panel.dropdown_open);
     }
 }

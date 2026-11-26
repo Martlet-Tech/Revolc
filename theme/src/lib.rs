@@ -188,6 +188,12 @@ impl ThemeSet {
                         .unwrap_or("unnamed")
                         .to_string()
                 });
+                // The one-off legacy migration theme inherited the user's old
+                // colour keys, which could produce unreadable text. It is a
+                // migration artefact, not a selectable theme.
+                if id == "migrated" {
+                    continue;
+                }
                 file.id = Some(id.clone());
                 files.insert(id, (file, "user")); // user themes shadow builtins
             }
