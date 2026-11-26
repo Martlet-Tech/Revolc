@@ -6,6 +6,7 @@ pub mod folder_icon;
 pub mod gdi;
 pub mod reorder;
 pub mod settings;
+pub mod shadow;
 pub mod tabbar;
 pub mod tooltip;
 pub mod view;
@@ -55,7 +56,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
     WM_NCMOUSELEAVE,     WM_PAINT, WM_RBUTTONUP, WM_COPYDATA,
     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
-    WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
+    WM_SETICON, WM_SIZE, WM_SHOWWINDOW, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL,
+    MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, SW_SHOWNA, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, LWA_ALPHA,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
@@ -381,6 +383,9 @@ pub(crate) struct App {
     /// in one popup). Kept above every Explorer pane so their overhang cannot
     /// cover it.
     tabbar_hwnd: HWND,
+    /// Layered popup that paints our own drop shadow behind the frame. DWM
+    /// draws none for a frameless WS_POPUP window.
+    shadow: Option<shadow::ShadowWindow>,
     main_hwnd: HWND,
     /// TME_LEAVE/TME_NONCLIENT registered: the leave message arrives once per
     /// run, and it is the only way to drop a hover that the cursor walked out
@@ -824,6 +829,7 @@ impl App {
             last_client: (0, 0),
             tabbar,
             tabbar_hwnd: HWND::default(),
+            shadow: None,
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
@@ -3349,7 +3355,32 @@ impl App {
     }
 
     /// Release every absorbed window back to the desktop.
+    /// Keep the self-drawn shadow aligned with the frame. Called on move,
+    /// size and show/hide. Hidden while minimized or maximized (DWM has no
+    /// visible edge to project onto then, and a maximized frame sits flush
+    /// with the work area).
+    fn sync_shadow(&mut self) {
+        if self.shadow.is_none() {
+            return;
+        }
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.main_hwnd, &mut wr);
+        }
+        let iconic = unsafe { IsIconic(self.main_hwnd).as_bool() };
+        let visible = unsafe { IsWindowVisible(self.main_hwnd).as_bool() };
+        let maximized = self.is_maximized();
+        let show = visible && !iconic && !maximized;
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.update(wr, show);
+        }
+    }
+
     fn release_all(&mut self) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.destroy();
+        }
+        self.shadow = None;
         for slot in self.views.iter_mut() {
             if let View::Hosted(v) = std::mem::replace(slot, View::Pending) {
                 // Park it process-wide: this window is on its way out, and the
@@ -3495,9 +3526,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = App::build(hwnd, args);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
+            // Create the shadow first so it sits at the bottom of the owner's
+            // popup Z-order (above the frame, below the chrome popups).
+            app.shadow = shadow::ShadowWindow::create(hwnd);
             app.create_tabbar_window();
             app.create_float_window();
             app.create_tooltip_window();
+            // Establish the shadow's size/position up front. WM_SIZE/WM_MOVE
+            // normally follow, but a window created at (0,0) with its default
+            // rect can miss them initially — without this the popup stays at
+            // its 1x1 creation size.
+            app.sync_shadow();
             // Safe now: GWLP_USERDATA is installed, so the SetFocus a Painted
             // settings tab triggers can re-enter WM_NCACTIVATE without a null
             // App pointer.
@@ -3987,8 +4026,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_SHOWWINDOW => {
+            let app = app_from(hwnd);
+            app.sync_shadow();
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_MOVE => {
-            app_from(hwnd).sync_tabbar_window();
+            let app = app_from(hwnd);
+            app.sync_tabbar_window();
+            app.sync_shadow();
             LRESULT(0)
         }
         WM_ENTERSIZEMOVE => {
@@ -4006,6 +4052,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             let app = app_from(hwnd);
             app.sync_tabbar_window();
+            app.sync_shadow();
             app.layout();
             app.dump_layout("WM_SIZE");
             // Maximize state drives the restore glyph in the caption buttons.
