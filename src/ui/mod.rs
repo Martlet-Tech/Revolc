@@ -106,9 +106,10 @@ const SETTINGS_BTN_W: i32 = 28;
 /// to grab. Painted by `paint_frame`, hit-tested by the BORDER arm below.
 /// Maximized windows use `border()` = 0 instead, to stay flush with rcWork.
 const WINDOW_BORDER: i32 = 8;
-/// Top resize strip stays thinner than `TABBAR_HEIGHT`: the tab strip needs its
-/// own top rows for tabs, and `TAB_TOP` starts at 4. Growing this past TAB_TOP
-/// would steal the top edge of every tab for resizing.
+/// Top resize strip stays thinner than `TABBAR_HEIGHT`: it only covers the
+/// bare band, never a tab. Tabs are painted from `TAB_TOP = 4` but are hit
+/// from y=0 (see `TabBar::hit`), so a pointer on the top edge selects a tab
+/// instead of resizing — same as a browser tab.
 const TOP_BORDER: i32 = 4;
 const CLASS_NAME: PCWSTR = w!("RevolcMain");
 /// Owned sibling of every absorbed Explorer pane. Painted and hit-tested by
@@ -1264,28 +1265,35 @@ impl App {
         let want = caption::hit(x, y, width);
         // The tab strip and the toolbar row are mutually exclusive vertical
         // bands. Resolve one hit and feed each painter only its own state.
-        let (over_tab, over_plus, over_bookmark, over_settings) = if y < TABBAR_HEIGHT {
+        // `over_close` stays separate from `over_tab`: the X keeps its own
+        // chip while the parent tab keeps its hover fill, like a browser.
+        let (over_tab, over_close, over_plus, over_bookmark, over_settings) = if y < TABBAR_HEIGHT {
             match self.tabbar.hit(x, y, width) {
-                tabbar::Hit::Tab(i) | tabbar::Hit::Close(i) => (Some(i), false, None, false),
-                tabbar::Hit::Plus => (None, true, None, false),
-                _ => (None, false, None, false),
+                tabbar::Hit::Tab(i) => (Some(i), None, false, None, false),
+                tabbar::Hit::Close(i) => (Some(i), Some(i), false, None, false),
+                tabbar::Hit::Plus => (None, None, true, None, false),
+                _ => (None, None, false, None, false),
             }
         } else if (TABBAR_HEIGHT..CHROME_HEIGHT).contains(&y) {
             let total = self.bookmarks.items().len();
             let settings = chrome::hit_settings(x, y, width);
             (
                 None,
+                None,
                 false,
                 if settings { None } else { chrome::hit_bookmark(x, y, width, total) },
                 settings,
             )
         } else {
-            (None, false, None, false)
+            (None, None, false, None, false)
         };
         let maximized = self.is_maximized();
         let active = self.active;
         let mut dirty = self.tabbar.set_chrome(want, maximized, active);
         if self.tabbar.set_hover_tab(over_tab) {
+            dirty = true;
+        }
+        if self.tabbar.set_hover_close(over_close) {
             dirty = true;
         }
         if self.tabbar.set_hover_plus(over_plus) {
@@ -1347,6 +1355,9 @@ impl App {
         let active = self.active;
         let mut dirty = self.tabbar.set_chrome(None, maximized, active);
         if self.tabbar.set_hover_tab(None) {
+            dirty = true;
+        }
+        if self.tabbar.set_hover_close(None) {
             dirty = true;
         }
         if self.tabbar.set_hover_plus(false) {
@@ -3169,12 +3180,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !app.is_maximized() {
                 // Same inset as the painted/inset frame: the child pane is
                 // pushed in by WINDOW_BORDER, so these pixels are genuinely
-                // ours and the resize code reaches us. TOP_BORDER is thinner
-                // so it stays above the tabs (TAB_TOP = 4).
+                // ours and the resize code reaches us. The top strip only
+                // applies to bare band: tabs are hit from y=0, so a pointer
+                // on a tab's top edge must stay HTCLIENT and reach the click.
                 let border = WINDOW_BORDER;
                 let left = pt.x < border;
                 let right = pt.x >= cr.right - border;
-                let top = pt.y < TOP_BORDER;
+                let top = pt.y < TOP_BORDER && matches!(hit, tabbar::Hit::Band);
                 let bottom = pt.y >= cr.bottom - border;
                 let code = match (left, right, top, bottom) {
                     (true, _, true, _) => Some(HTTOPLEFT),

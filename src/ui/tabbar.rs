@@ -100,6 +100,7 @@ pub struct TabBar {
     inactive_bg: COLORREF,
     text: COLORREF,
     text_active: COLORREF,
+    close_hover: COLORREF,
     radius: i32,
     /// Per-tab width, recomputed from the client width so the tabs fill the
     /// band instead of being stuck at one hard-coded size.
@@ -108,6 +109,9 @@ pub struct TabBar {
     /// Index of the tab under the pointer. Independent of `hover`: a tab lives
     /// in the client area, the caption buttons do not.
     hover_tab: Option<usize>,
+    /// Index whose close X is under the pointer. Separate from `hover_tab` so
+    /// the X gets its own fill while the tab keeps its hover background.
+    hover_close: Option<usize>,
     /// Whether the trailing "+" is under the pointer. Tracked separately from
     /// `hover_tab` so sliding from a tab onto "+" swaps the highlight cleanly.
     hover_plus: bool,
@@ -133,10 +137,12 @@ impl TabBar {
             inactive_bg: COLORREF(0),
             text: COLORREF(0),
             text_active: COLORREF(0),
+            close_hover: COLORREF(0),
             radius: 0,
             tab_w: TAB_MAX_W,
             hover: None,
             hover_tab: None,
+            hover_close: None,
             hover_plus: false,
             drag: None,
             maximized: false,
@@ -164,6 +170,7 @@ impl TabBar {
         self.inactive_bg = c(&|t| &t.tab_inactive);
         self.text = c(&|t| &t.tab_text);
         self.text_active = c(&|t| &t.tab_text_active);
+        self.close_hover = c(&|t| &t.tab_close_hover);
         self.radius = cfg.theme.tab_radius.max(0);
         let symbol = c(&|t| &t.tabbar_text);
         let bg = self.bg;
@@ -201,6 +208,7 @@ impl TabBar {
         // The tab that was under the pointer may be gone (closed, or the list
         // reordered); never carry a stale highlight into the next frame.
         self.hover_tab = self.hover_tab.filter(|i| *i < self.labels.len());
+        self.hover_close = self.hover_close.filter(|i| *i < self.labels.len());
         // Same for a drag over a tab that no longer exists (the dragged tab
         // closed from under the capture, or a sweep reordered the rest).
         if self.drag.map(|d| d.from >= self.labels.len()).unwrap_or(false) {
@@ -242,6 +250,17 @@ impl TabBar {
         true
     }
 
+    /// Highlight the close X of one tab. Returns true on change so the caller
+    /// repaints exactly once.
+    pub fn set_hover_close(&mut self, index: Option<usize>) -> bool {
+        let index = index.filter(|i| *i < self.labels.len());
+        if self.hover_close == index {
+            return false;
+        }
+        self.hover_close = index;
+        true
+    }
+
     /// Highlight the trailing "+" when the pointer is over it. Returns true
     /// on change so the caller repaints exactly once.
     pub fn set_hover_plus(&mut self, hovered: bool) -> bool {
@@ -263,6 +282,7 @@ impl TabBar {
         let left = self.tab_x(i);
         self.drag = Some(Drag::new(i, x, left));
         self.hover_tab = None;
+        self.hover_close = None;
         self.hover_plus = false;
     }
 
@@ -378,8 +398,12 @@ impl TabBar {
             return Hit::Plus;
         }
         // Left of the first tab (the icon gutter) is always bare band, i.e. a
-        // caption hit; same for the gaps and the strip above the tabs.
-        if x < GUTTER || y < TAB_TOP || n == 0 {
+        // caption hit; same for the gaps. Tabs are *painted* from TAB_TOP so
+        // their rounded corners clear the window edge, but their hit region
+        // starts at y=0: browsers let you click a tab flush with the top edge,
+        // and a maximized window's top edge is the screen edge (measured
+        // 2026-11-26). Only bare band stays a drag/resize strip.
+        if x < GUTTER || n == 0 {
             return Hit::Band;
         }
         let i = (x - GUTTER) / (self.tab_w + TAB_GAP);
@@ -529,6 +553,12 @@ impl TabBar {
             let fg = if dragged || i == self.active { self.text_active } else { self.text };
             let _ = SetTextColor(hdc, fg);
             if let Some(rc) = close_rc.as_ref() {
+                if self.hover_close == Some(i) {
+                    // Own chip behind the X, independent of the tab's hover
+                    // fill — the same "this exact target is live" cue as the
+                    // window buttons. Rounded to read as a small control.
+                    fill_round(hdc, rc, self.close_hover, 3);
+                }
                 let _ = DrawTextW(
                     hdc,
                     &mut to_wide("\u{00D7}"), // ×
