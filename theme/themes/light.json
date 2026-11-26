@@ -1,0 +1,22 @@
+{
+  "$schema": "../schema.json",
+  "id": "light",
+  "name": "普通浅色",
+  "type": "light",
+  "colors": {
+    "app.background": "#F3F3F3",
+    "chrome.background": "#FFFFFF",
+    "surface.background": "#F8F8F8",
+    "surface.raised": "#FFFFFF",
+    "surface.hover": "#E9E9E9",
+    "border.subtle": "#E1E1E1",
+    "foreground.primary": "#1A1A1A",
+    "foreground.secondary": "#616161",
+    "foreground.inverse": "#FFFFFF",
+    "accent.default": "#0F6CBD",
+    "accent.soft": "#DDEBFF",
+    "danger.default": "#C42B1C",
+    "danger.hover": "#A32115",
+    "focus.ring": "#0F6CBD"
+  }
+}

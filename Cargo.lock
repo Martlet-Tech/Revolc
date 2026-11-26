@@ -285,6 +285,7 @@ dependencies = [
  "arc-swap",
  "notify",
  "revolc-common",
+ "revolc-theme",
  "serde",
  "serde_json",
  "toml",
@@ -307,6 +308,7 @@ name = "revolc-common"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "revolc-theme",
  "serde",
  "toml",
  "tracing",
@@ -316,11 +318,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "revolc-theme"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "revolc-tray"
 version = "0.1.0"
 dependencies = [
  "notify",
  "revolc-common",
+ "revolc-theme",
  "tracing",
  "windows",
 ]

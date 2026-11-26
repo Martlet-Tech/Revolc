@@ -15,6 +15,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Kernel",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
+    "Win32_Security",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
@@ -25,3 +26,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 arc-swap = "1"
+revolc-theme = { path = "../theme" }

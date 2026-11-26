@@ -1,0 +1,22 @@
+{
+  "$schema": "../schema.json",
+  "id": "clover-dark",
+  "name": "三叶草深色",
+  "type": "dark",
+  "colors": {
+    "app.background": "#10261A",
+    "chrome.background": "#17392A",
+    "surface.background": "#1E4632",
+    "surface.raised": "#245339",
+    "surface.hover": "#2C6344",
+    "border.subtle": "#356F4D",
+    "foreground.primary": "#F2F7F3",
+    "foreground.secondary": "#B7CDBD",
+    "foreground.inverse": "#10261A",
+    "accent.default": "#8BC98F",
+    "accent.soft": "#A5D6A7",
+    "danger.default": "#D9483B",
+    "danger.hover": "#F06A5C",
+    "focus.ring": "#8BC98F"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "../schema.json",
+  "id": "dark",
+  "name": "普通深色",
+  "type": "dark",
+  "colors": {
+    "app.background": "#1F1F1F",
+    "chrome.background": "#2B2B2B",
+    "surface.background": "#323232",
+    "surface.raised": "#3A3A3A",
+    "surface.hover": "#454545",
+    "border.subtle": "#5A5A5A",
+    "foreground.primary": "#F5F5F5",
+    "foreground.secondary": "#B8B8B8",
+    "foreground.inverse": "#1F1F1F",
+    "accent.default": "#4CC2FF",
+    "accent.soft": "#2B5C74",
+    "danger.default": "#F14C4C",
+    "danger.hover": "#FF6B6B",
+    "focus.ring": "#4CC2FF"
+  }
+}

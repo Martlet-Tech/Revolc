@@ -915,8 +915,7 @@ impl App {
             return;
         }
         let rc = self.client();
-        let (r, g, border_rgb_b) = self.cfg.get().color(|t| &t.window_border);
-        let color = gdi::rgb(r, g, border_rgb_b);
+        let color = COLORREF(self.cfg.get().palette.app_background().to_colorref());
         let strips = [
             RECT { left: 0, top: 0, right: rc.right, bottom: b },
             RECT { left: 0, top: rc.bottom - b, right: rc.right, bottom: rc.bottom },
@@ -2955,6 +2954,24 @@ impl App {
                     self.invalidate_view();
                 }
             }
+            Choice(id, index) => {
+                let path = self.cfg.path().clone();
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "settings: failed to read config");
+                        return;
+                    }
+                };
+                match revolc_common::settings::apply_choice(&self.cfg.get(), &text, id, index) {
+                    Ok(updated) => {
+                        if let Err(e) = std::fs::write(&path, updated) {
+                            tracing::error!(error = %e, "settings: failed to write config");
+                        }
+                    }
+                    Err(label) => tracing::warn!(setting = label, "settings: invalid value rejected"),
+                }
+            }
             Setting(id) => {
                 let path = self.cfg.path().clone();
                 let text = match std::fs::read_to_string(&path) {
@@ -4133,6 +4150,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // The chrome is one popup now (tabs + toolbar). A config change
             // can repaint the toolbar colours; invalidate the whole band.
             app.invalidate_band();
+            app.invalidate_view();
             app.laid_out = None;
             app.layout();
             LRESULT(0)

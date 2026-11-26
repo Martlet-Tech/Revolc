@@ -65,6 +65,15 @@ pub(crate) fn tray_hwnd() -> HWND {
     HWND(raw as _)
 }
 
+/// Semantic palette for the self-drawn menu. The tray reads the same resolved
+/// theme as the main window instead of hard-coding colours.
+pub(crate) fn current_palette() -> revolc_theme::Theme {
+    CONFIG
+        .get()
+        .map(|handle| handle.get().palette.clone())
+        .unwrap_or_else(revolc_theme::fallback)
+}
+
 /// Elevated helper launched from the settings page's 系统注册 row.
 /// Order matters: quit every Revolc process first (otherwise their watchers
 /// would recreate the config), then remove registry, Run entry and APPDATA.

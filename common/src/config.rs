@@ -1,10 +1,12 @@
 //! User-configurable settings, hot-reloaded from TOML.
 //! Spec §4.0: single config file, runtime-writable, changes apply immediately.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use revolc_theme::{save_user_theme, Theme as Palette, ThemeFile, ThemeSet};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -14,6 +16,10 @@ pub struct Config {
     pub takeover: Takeover,
     pub tray: Tray,
     pub bookmarks: Bookmarks,
+    /// Resolved semantic palette. Skipped by serde: it is rebuilt from
+    /// `[theme].active` + overrides on every load.
+    #[serde(skip)]
+    pub palette: Palette,
 }
 
 /// Bookmark bar (phase 2 of feat/tab-context-menu). UI shell only for now —
@@ -63,9 +69,18 @@ pub struct Takeover {
     pub mode: String,
 }
 
+/// Legacy flat colour fields remain only so an existing `revolc.toml` still
+/// deserializes. On first load they are migrated into a user theme JSON and
+/// never used for painting again. New UI code reads `Config.palette`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Theme {
+    /// Id of the active theme (`light`, `dark`, `clover-*`, or a user theme).
+    #[serde(default)]
+    pub active: String,
+    /// Per-role overrides layered on top of the selected theme.
+    #[serde(default)]
+    pub overrides: HashMap<String, String>,
     pub tabbar_background: String,
     pub tab_active: String,
     /// Under the pointer, not active. Sits between `tab_active` and
@@ -95,6 +110,10 @@ pub struct Theme {
     pub tab_radius: i32,
 }
 
+fn default_theme_id() -> String {
+    "clover-dark".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -102,6 +121,7 @@ impl Default for Config {
             takeover: Takeover::default(),
             tray: Tray::default(),
             bookmarks: Bookmarks::default(),
+            palette: revolc_theme::fallback(),
         }
     }
 }
@@ -115,6 +135,8 @@ impl Default for Takeover {
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            active: default_theme_id(),
+            overrides: HashMap::new(),
             tabbar_background: "#2b2b2b".into(),
             tab_active: "#4a6984".into(),
             tab_hover: "#41474d".into(),
@@ -199,7 +221,11 @@ pub fn parse_color(s: &str) -> (u8, u8, u8) {
     let s = s.trim().trim_start_matches('#');
     if s.len() == 6 {
         if let Ok(v) = u32::from_str_radix(s, 16) {
-            return (((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8);
+            return (
+                ((v >> 16) & 0xff) as u8,
+                ((v >> 8) & 0xff) as u8,
+                (v & 0xff) as u8,
+            );
         }
     }
     tracing::warn!(value = s, "invalid color, using fallback");
@@ -226,6 +252,9 @@ pub fn ensure_config_file(path: &PathBuf) {
     let default = r##"# Revolc configuration. Changes apply immediately (hot reload).
 
 [theme]
+# Built-in: light / dark / clover-light / clover-dark. Custom themes live in
+# %APPDATA%\revolc\themes\*.json; set active to the theme's "id".
+active            = "clover-dark"
 tabbar_background = "#2b2b2b"
 tab_active        = "#4a6984"
 tab_hover         = "#41474d"  # under the pointer, not active
@@ -260,19 +289,123 @@ enabled = true           # 标签栏下方的收藏栏（热重载即时生效�
 
 /// Load config, falling back to defaults with a warning on parse errors.
 pub fn load(path: &PathBuf) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::error!(error = %e, "config parse error, using defaults");
-                Config::default()
-            }
-        },
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "config read error, using defaults");
-            Config::default()
+            return Config::default();
+        }
+    };
+    let mut cfg: Config = match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "config parse error, using defaults");
+            return Config::default();
+        }
+    };
+
+    // Old configs have flat colour keys but no `active`. Migrate them once
+    // into a user theme, keeping the annotated TOML bytes intact.
+    if cfg.theme.active.is_empty() {
+        match migrate_legacy_theme(path, &text, &cfg.theme) {
+            Ok(updated) => {
+                let _ = std::fs::write(path, updated);
+                if let Ok(reloaded) = std::fs::read_to_string(path) {
+                    if let Ok(parsed) = toml::from_str::<Config>(&reloaded) {
+                        cfg = parsed;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "theme migration failed, using built-in"),
         }
     }
+    if cfg.theme.active.is_empty() {
+        cfg.theme.active = default_theme_id();
+    }
+
+    cfg.palette = resolve_palette(&cfg.theme);
+    cfg
+}
+
+/// Turn the legacy `[theme]` colour keys into a user theme JSON and set
+/// `[theme].active` in place. Called at most once per config file.
+fn migrate_legacy_theme(path: &PathBuf, text: &str, theme: &Theme) -> Result<String, String> {
+    let legacy = [
+        (
+            "tabbar_background",
+            "chrome.background",
+            &theme.tabbar_background,
+        ),
+        ("tab_active", "accent.soft", &theme.tab_active),
+        ("tab_hover", "surface.hover", &theme.tab_hover),
+        ("tab_inactive", "surface.background", &theme.tab_inactive),
+        ("tab_text", "foreground.secondary", &theme.tab_text),
+        (
+            "tab_text_active",
+            "foreground.inverse",
+            &theme.tab_text_active,
+        ),
+        ("tab_close_hover", "surface.hover", &theme.tab_close_hover),
+        ("tabbar_text", "foreground.primary", &theme.tabbar_text),
+        ("caption_hover", "surface.hover", &theme.caption_hover),
+        (
+            "caption_close_hover",
+            "danger.default",
+            &theme.caption_close_hover,
+        ),
+        ("window_border", "app.background", &theme.window_border),
+        (
+            "bookmark_bar_background",
+            "surface.background",
+            &theme.bookmark_bar_background,
+        ),
+    ];
+    let mut colors = std::collections::HashMap::new();
+    for (legacy_key, role, value) in legacy {
+        if revolc_theme::Color::parse(value).is_some() {
+            colors.insert(role.to_string(), value.clone());
+        }
+        let _ = legacy_key; // keeps the mapping table self-documenting
+    }
+    let file = ThemeFile {
+        id: Some("migrated".into()),
+        name: "迁移的主题".into(),
+        kind: revolc_theme::import::infer_kind(&theme.tabbar_background),
+        inherit: Some("clover-dark".into()),
+        colors,
+    };
+    save_user_theme("migrated", &file).map_err(|e| e.to_string())?;
+    let updated = set_toml_value(text, "theme", "active", "\"migrated\"");
+    tracing::info!(
+        ?path,
+        "migrated legacy theme colours to themes/migrated.json"
+    );
+    Ok(updated)
+}
+
+/// Resolve the active theme and apply per-role overrides from TOML.
+fn resolve_palette(theme: &Theme) -> Palette {
+    let set = ThemeSet::discover();
+    let mut palette = match set.resolve(&theme.active) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, active = %theme.active, "theme resolve failed, using clover-dark");
+            set.resolve("clover-dark")
+                .unwrap_or_else(|_| revolc_theme::fallback())
+        }
+    };
+    for (role, value) in &theme.overrides {
+        if !revolc_theme::ROLE_KEYS.contains(&role.as_str()) {
+            tracing::warn!(role = %role, "unknown theme override ignored");
+            continue;
+        }
+        if let Some(color) = revolc_theme::Color::parse(value) {
+            palette.colors.insert(role.clone(), color);
+        } else {
+            tracing::warn!(role = %role, value = %value, "invalid theme override ignored");
+        }
+    }
+    palette
 }
 
 /// Shared, hot-swappable config handle.
@@ -311,6 +444,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_palette_applies_overrides() {
+        let mut theme = Theme::default();
+        theme.active = "clover-dark".into();
+        theme
+            .overrides
+            .insert("accent.default".into(), "#123456".into());
+        let palette = resolve_palette(&theme);
+        assert_eq!(
+            palette.accent_default(),
+            revolc_theme::Color::parse("#123456").unwrap()
+        );
+        assert_eq!(
+            palette.app_background(),
+            revolc_theme::Color::parse("#10261A").unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_override_is_ignored() {
+        let mut theme = Theme::default();
+        theme.active = "clover-dark".into();
+        theme
+            .overrides
+            .insert("not.a.role".into(), "#123456".into());
+        theme
+            .overrides
+            .insert("accent.default".into(), "bogus".into());
+        let palette = resolve_palette(&theme);
+        assert_eq!(
+            palette.accent_default(),
+            revolc_theme::Color::parse("#8BC98F").unwrap()
+        );
+    }
+
+    #[test]
     fn set_toml_value_preserves_comments() {
         let original = "[theme]\ntab_radius = 6 # 0 = square\nwindow_border = \"#151515\"\n\n[takeover]\nmode = \"off\"\n";
         let updated = set_toml_value(original, "theme", "tab_radius", "12");
@@ -327,7 +495,10 @@ mod tests {
         let original = "[theme]\ntab_radius = 6\n\n[takeover]\nmode = \"off\"\n";
         let updated = set_toml_value(original, "theme", "tab_hover", "\"#c8e6c9\"");
         let theme_section = updated.split("[takeover]").next().unwrap();
-        assert!(theme_section.contains("tab_hover = \"#c8e6c9\""), "{updated}");
+        assert!(
+            theme_section.contains("tab_hover = \"#c8e6c9\""),
+            "{updated}"
+        );
         assert!(updated.contains("mode = \"off\""), "{updated}");
     }
 
@@ -345,7 +516,10 @@ mod tests {
         let original = "[theme]\nbg = \"#green\"\nfg = \"#dark\"\n# keep me\n";
         let updated = set_toml_values(
             original,
-            &[("theme", "bg", "\"#2b2b2b\""), ("theme", "fg", "\"#cccccc\"")],
+            &[
+                ("theme", "bg", "\"#2b2b2b\""),
+                ("theme", "fg", "\"#cccccc\""),
+            ],
         );
         assert!(updated.contains("bg = \"#2b2b2b\""), "{updated}");
         assert!(updated.contains("fg = \"#cccccc\""), "{updated}");

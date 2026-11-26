@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Revolc theme",
+  "type": "object",
+  "required": ["name", "type", "colors"],
+  "properties": {
+    "id": { "type": "string", "description": "Stable id used by [theme] active" },
+    "name": { "type": "string", "description": "Display name" },
+    "type": { "enum": ["light", "dark"] },
+    "inherit": { "type": "string", "description": "Parent theme id" },
+    "colors": {
+      "type": "object",
+      "description": "Only semantic roles are allowed. Missing roles are derived.",
+      "patternProperties": {
+        "^(app|chrome|surface|foreground|accent|danger|focus|border)\\.[a-z.]+$": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$"
+        }
+      }
+    }
+  }
+}
