@@ -101,9 +101,23 @@ fn main() {
     } else {
         valid_startup_path(path_arg)
     };
-    tracing::info!(?initial_path, adopt_only, settings_only, "starting");
+    // Geometry inherited from the window a detached tab came from.
+    let geom = args.iter().find_map(|a| a.strip_prefix("--geom=")).and_then(|s| {
+        let mut it = s.split(',').map(str::parse::<i32>);
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(Ok(l)), Some(Ok(t)), Some(Ok(r)), Some(Ok(b))) if r > l && b > t => {
+                Some((l, t, r, b))
+            }
+            _ => None,
+        }
+    });
+    let maximized = args.iter().any(|a| a == "--maximized");
+    tracing::info!(
+        ?initial_path, adopt_only, settings_only, ?geom, maximized,
+        "starting"
+    );
 
-    let exit_code = app::run(initial_path, adopt_only, settings_only);
+    let exit_code = app::run(initial_path, adopt_only, settings_only, geom, maximized);
     tracing::info!(elapsed = ?started.elapsed(), exit_code, "exited");
     std::process::exit(exit_code);
 }

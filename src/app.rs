@@ -39,7 +39,13 @@ unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> windows::Win32::Fou
     BOOL(0)
 }
 
-pub fn run(initial_path: Option<String>, adopt_only: bool, settings_only: bool) -> i32 {
+pub fn run(
+    initial_path: Option<String>,
+    adopt_only: bool,
+    settings_only: bool,
+    geom: Option<(i32, i32, i32, i32)>,
+    maximized: bool,
+) -> i32 {
     if let Err(e) = shell::init_com() {
         tracing::error!(error = %e, "CoInitializeEx failed");
         return 1;
@@ -50,7 +56,7 @@ pub fn run(initial_path: Option<String>, adopt_only: bool, settings_only: bool) 
     // is marker-only (no UAC, no registry); the tray owns registry install.
     revolc_common::takeover::set_takeover_enabled(cfg.get().takeover.mode == "redirect");
 
-    let window = match MainWindow::new(cfg.clone(), initial_path, adopt_only, settings_only) {
+    let window = match MainWindow::new(cfg.clone(), initial_path, adopt_only, settings_only, geom, maximized) {
         Ok(w) => w,
         Err(e) => {
             tracing::error!(error = %e, "window creation failed");

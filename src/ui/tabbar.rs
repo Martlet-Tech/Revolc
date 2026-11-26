@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
 use crate::config::Config;
 use crate::ui::folder_icon::FolderIcons;
-use crate::ui::reorder::Drag;
+use crate::ui::reorder::{self, Drag};
 use crate::ui::{caption, icon};
 use super::gdi::rgb;
 
@@ -36,7 +36,7 @@ pub const TAB_MAX_W: i32 = 190;
 pub const TAB_MIN_W: i32 = 24;
 /// Tabs stop this far above the band's bottom edge; the strip above keeps the
 /// rounded top corners off the window's own rounding and is the drag area.
-const TAB_TOP: i32 = 4;
+pub const TAB_TOP: i32 = 4;
 const TAB_BOTTOM: i32 = caption::HEIGHT;
 const TAB_GAP: i32 = 4;
 /// Leading app-icon gutter. Tabs start to its right, so this strip is bare band
@@ -118,6 +118,13 @@ pub struct TabBar {
     /// Set while a tab is being dragged inside the band (reorder only; pulling
     /// a tab out into a new window is a later stage).
     drag: Option<Drag>,
+    /// Set while the held tab is floating outside the band: the tab is still
+    /// in the model (a reorder can resume on re-entry) but must not paint in
+    /// its slot — it lives in the floating popup now.
+    float_hidden: bool,
+    /// A tab being dragged in from another Revolc window. `usize` is the
+    /// insertion slot; the ghost is painted there until drop or cancel.
+    incoming: Option<(usize, String, String)>,
     maximized: bool,
     window_active: bool,
     caption_colors: caption::Colors,
@@ -145,6 +152,8 @@ impl TabBar {
             hover_close: None,
             hover_plus: false,
             drag: None,
+            float_hidden: false,
+            incoming: None,
             maximized: false,
             window_active: true,
             caption_colors: caption::Colors::new(
@@ -290,6 +299,11 @@ impl TabBar {
         self.drag
     }
 
+    /// Per-tab width, for sizing the floating popup.
+    pub fn tab_width(&self) -> i32 {
+        self.tab_w
+    }
+
     /// Follow the pointer. The raw edge is kept unclamped so hit-testing stays
     /// symmetric at both ends; `Drag::left` pins it back to the band for
     /// painting.
@@ -308,6 +322,76 @@ impl TabBar {
 
     pub fn end_drag(&mut self) {
         self.drag = None;
+        self.float_hidden = false;
+    }
+
+    /// Hide the held tab in its own slot while it floats outside the band.
+    pub fn set_float_hidden(&mut self, hidden: bool) -> bool {
+        if self.float_hidden == hidden {
+            return false;
+        }
+        self.float_hidden = hidden;
+        true
+    }
+
+    /// landing slot for a tab arriving from another window. `center` is in
+    /// this bar's client coords; the incoming tab is treated as one more slot
+    /// (`from = n`) so the normal centre-line rule decides the insertion point.
+    pub fn incoming_landing(&self, center: i32) -> usize {
+        let n = self.labels.len();
+        reorder::landing(center, self.tab_w, TAB_GAP, GUTTER, n, n).unwrap_or(n)
+    }
+
+    /// Landing slot of the current incoming ghost, if any.
+    pub fn incoming_slot(&self) -> Option<usize> {
+        self.incoming.as_ref().map(|(slot, _, _)| *slot)
+    }
+
+    /// Ghost tab from another window. `Some((slot, label, path))`, `None` clears.
+    pub fn set_incoming(&mut self, incoming: Option<(usize, String, String)>) -> bool {
+        if self.incoming == incoming {
+            return false;
+        }
+        self.incoming = incoming;
+        true
+    }
+
+    /// Paint a single tab as a floating/ghost card at `rc`. Uses the same
+    /// geometry and colours as a real tab; `ghost` dims both fill and ink.
+    pub fn paint_float(&self, hdc: HDC, rc: RECT, label: &str, path: &str, ghost: bool) {
+        let bg = if ghost { dim(self.active_bg, self.bg) } else { self.active_bg };
+        let h = rc.bottom - rc.top;
+        unsafe {
+            fill_tab(hdc, &rc, bg, self.radius);
+            let font: HFONT = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let ink = if ghost { dim(self.text_active, self.bg) } else { self.text_active };
+            let _ = SetTextColor(hdc, ink);
+            let icon = self.icons.get(path).unwrap_or_else(|| icon::small());
+            if !icon.0.is_null() {
+                let _ = DrawIconEx(
+                    hdc,
+                    rc.left + TAB_ICON_PAD,
+                    rc.top + (h - ICON_SIZE) / 2,
+                    icon,
+                    ICON_SIZE,
+                    ICON_SIZE,
+                    0,
+                    None,
+                    DI_NORMAL,
+                );
+            }
+            let mut wide = to_wide(label);
+            let mut text_rc = RECT {
+                left: rc.left + TAB_ICON_PAD + ICON_SIZE + TAB_ICON_GAP,
+                top: rc.top,
+                right: rc.right - TAB_ICON_PAD,
+                bottom: rc.bottom,
+            };
+            let _ = DrawTextW(hdc, &mut wide, &mut text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, HGDIOBJ(old_font.0));
+        }
     }
 
     /// Where the dragged tab would land, decided by **centre lines** (the way
@@ -358,7 +442,7 @@ impl TabBar {
             || self.drag.map(|d| d.from == i).unwrap_or(false)
     }
 
-    fn tab_x(&self, i: usize) -> i32 {
+    pub fn tab_x(&self, i: usize) -> i32 {
         GUTTER + i as i32 * (self.tab_w + TAB_GAP)
     }
 
@@ -466,17 +550,31 @@ impl TabBar {
             for (i, label) in self.labels.iter().enumerate() {
                 // The dragged tab is painted last, on top: it overlaps its
                 // neighbours while it follows the cursor and must not be cut
-                // by whichever slot happens to come later in the loop.
+                // by whichever slot happens to come later in the loop. While
+                // floating it lives in its own popup, so it paints nowhere.
                 if self.drag.map(|d| d.from == i).unwrap_or(false) {
                     continue;
                 }
                 self.paint_tab(hdc, i, self.tab_x(i), label, false);
             }
             if let Some(d) = self.drag {
-                if let Some(label) = self.labels.get(d.from) {
-                    let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
-                    self.paint_tab(hdc, d.from, d.left(GUTTER, max_left), label, true);
+                if !self.float_hidden {
+                    if let Some(label) = self.labels.get(d.from) {
+                        let max_left = (self.plus_x() - self.tab_w).max(GUTTER);
+                        self.paint_tab(hdc, d.from, d.left(GUTTER, max_left), label, true);
+                    }
                 }
+            }
+            // A tab arriving from another window: ghost at its landing slot.
+            if let Some((slot, label, path)) = &self.incoming {
+                let x = self.tab_x((*slot).min(self.labels.len()));
+                self.paint_float(
+                    hdc,
+                    RECT { left: x, top: TAB_TOP, right: x + self.tab_w, bottom: TAB_BOTTOM },
+                    label,
+                    path,
+                    true,
+                );
             }
 
             let _ = RestoreDC(hdc, saved);
