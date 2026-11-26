@@ -10,4 +10,3 @@ pub mod messages;
 pub mod settings;
 pub mod tab_mru;
 pub mod takeover;
-pub mod theme_presets;

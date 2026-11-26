@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 revolc-common = { path = "../common" }
+revolc-theme = { path = "../theme" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

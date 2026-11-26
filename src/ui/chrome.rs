@@ -16,7 +16,7 @@ use crate::bookmarks::Bookmark;
 use crate::config::Config;
 
 use super::caption;
-use super::gdi::{self, line, rgb};
+use super::gdi::{self, line};
 
 /// Geometry of one bookmark chip. Fixed width keeps paint and hit-test
 /// perfectly in sync (no GDI text measurement needed), at the cost of a
@@ -173,10 +173,15 @@ pub unsafe fn paint(
     state: PaintState,
 ) {
     let height = super::BOOKMARK_HEIGHT;
-    let (r, g, b) = cfg.color(|t| &t.bookmark_bar_background);
-    let bg = rgb(r, g, b);
+    let palette = &cfg.palette;
+    let bg = COLORREF(palette.surface_background().to_colorref());
     let brush = CreateSolidBrush(bg);
-    let row = RECT { left: 0, top, right: width, bottom: top + height };
+    let row = RECT {
+        left: 0,
+        top,
+        right: width,
+        bottom: top + height,
+    };
     let _ = FillRect(hdc, &row, brush);
     let _ = DeleteObject(HGDIOBJ(brush.0));
 
@@ -184,27 +189,33 @@ pub unsafe fn paint(
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
 
-    let (cr, cg, cb) = cfg.color(|t| &t.tab_active);
-    let chip = rgb(cr, cg, cb);
-    let (ir, ig, ib) = cfg.color(|t| &t.tab_text_active);
-    let ink = rgb(ir, ig, ib);
-    let (hr, hg, hb) = cfg.color(|t| &t.tab_hover);
-    let hover = rgb(hr, hg, hb);
+    let chip = COLORREF(palette.surface_raised().to_colorref());
+    let border = COLORREF(palette.border_subtle().to_colorref());
+    let ink = COLORREF(palette.foreground_secondary().to_colorref());
+    let hover = COLORREF(palette.surface_hover().to_colorref());
     // Same contrast rule as the settings gear: a light hover fill needs dark
     // ink regardless of what the theme's tab_text happens to be.
     let hover_ink = gdi::contrast_text(hover);
 
     let n = visible_bookmarks(width, bookmarks.len());
     if n == 0 {
-        // Text colour: lift the background toward light so it reads on both
-        // the default dark grey and a user-supplied green.
-        let tr = (r as i32 / 2 + 0x50).min(0xff) as u8;
-        let tg = (g as i32 / 2 + 0x50).min(0xff) as u8;
-        let tb = (b as i32 / 2 + 0x50).min(0xff) as u8;
-        let _ = SetTextColor(hdc, rgb(tr, tg, tb));
-        let mut text = RECT { left: 10, top, right: settings_button_x(width) - 4, bottom: top + height };
-        let mut label: Vec<u16> = "收藏夹：在标签上点右键即可收藏".encode_utf16().chain(Some(0)).collect();
-        let _ = DrawTextW(hdc, &mut label, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        let _ = SetTextColor(hdc, COLORREF(palette.foreground_secondary().to_colorref()));
+        let mut text = RECT {
+            left: 10,
+            top,
+            right: settings_button_x(width) - 4,
+            bottom: top + height,
+        };
+        let mut label: Vec<u16> = "收藏夹：在标签上点右键即可收藏"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let _ = DrawTextW(
+            hdc,
+            &mut label,
+            &mut text,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
     } else {
         for (i, bm) in bookmarks.iter().take(n).enumerate() {
             if state.drag.map(|d| d.0 == i).unwrap_or(false) {
@@ -212,9 +223,9 @@ pub unsafe fn paint(
             }
             if let Some(rect) = bookmark_rect(i, width) {
                 if state.hover == Some(i) {
-                    paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+                    paint_chip(hdc, &rect, &bm.label, hover, hover_ink, border);
                 } else {
-                    paint_chip(hdc, &rect, &bm.label, chip, ink);
+                    paint_chip(hdc, &rect, &bm.label, chip, ink, border);
                 }
             }
         }
@@ -227,7 +238,7 @@ pub unsafe fn paint(
                     right: left + BM_W,
                     bottom: slot_top() + BM_H,
                 };
-                paint_chip(hdc, &rect, &bm.label, hover, hover_ink);
+                paint_chip(hdc, &rect, &bm.label, hover, hover_ink, border);
             }
         }
     }
@@ -253,8 +264,7 @@ pub unsafe fn paint(
     let glyph_color = if state.settings_hover {
         gdi::contrast_text(hover)
     } else {
-        let (sr, sg, sb) = cfg.color(|t| &t.tabbar_text);
-        rgb(sr, sg, sb)
+        COLORREF(palette.foreground_secondary().to_colorref())
     };
     paint_hexagon(
         hdc,
@@ -268,10 +278,37 @@ pub unsafe fn paint(
 
 /// One bookmark chip: filled rect + ellipsised label. Pure paint helper shared
 /// by the resting and dragged cases.
-unsafe fn paint_chip(hdc: HDC, rect: &RECT, label: &str, fill: COLORREF, ink: COLORREF) {
+unsafe fn paint_chip(
+    hdc: HDC,
+    rect: &RECT,
+    label: &str,
+    fill: COLORREF,
+    ink: COLORREF,
+    border: COLORREF,
+) {
     let brush = CreateSolidBrush(fill);
     let _ = FillRect(hdc, rect, brush);
     let _ = DeleteObject(HGDIOBJ(brush.0));
+    let pen = CreatePen(PS_SOLID, 1, border);
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    line(hdc, rect.left, rect.top, rect.right - 1, rect.top);
+    line(
+        hdc,
+        rect.left,
+        rect.bottom - 1,
+        rect.right - 1,
+        rect.bottom - 1,
+    );
+    line(hdc, rect.left, rect.top, rect.left, rect.bottom - 1);
+    line(
+        hdc,
+        rect.right - 1,
+        rect.top,
+        rect.right - 1,
+        rect.bottom - 1,
+    );
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
     let mut text = RECT {
         left: rect.left + 6,
         top: rect.top,
@@ -321,9 +358,9 @@ unsafe fn paint_hexagon(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: COLORRE
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BOOKMARK_HEIGHT, CHROME_HEIGHT};
     use super::*;
     use crate::ui::caption;
-    use super::super::{BOOKMARK_HEIGHT, CHROME_HEIGHT};
 
     #[test]
     fn caption_band_always_routes_to_chrome_even_when_settings_active() {
@@ -381,6 +418,9 @@ mod tests {
         assert_eq!(visible_bookmarks(800, 0), 0);
         // A narrow window leaves room for fewer chips.
         assert!(visible_bookmarks(140, 10) < 10);
-        assert_eq!(hit_bookmark(600, caption::HEIGHT + BOOKMARK_HEIGHT / 2, 140, 10), None);
+        assert_eq!(
+            hit_bookmark(600, caption::HEIGHT + BOOKMARK_HEIGHT / 2, 140, 10),
+            None
+        );
     }
 }

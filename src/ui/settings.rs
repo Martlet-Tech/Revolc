@@ -1,34 +1,35 @@
 //! Settings tab: a painted (no HWND) page inside the main window's view rect.
 //!
-//! The rows come from `revolc_common::settings::SettingId::ALL` — this file
-//! knows how to *draw* a switch row and how to hit-test it, but not what the
-//! settings are, where they live in TOML, or what values are legal. Adding a
-//! setting is one entry in the registry; nothing here changes.
-//!
-//! Everything is drawn from the same `Config` the main window reads, so a
-//! config change repaints both at once via the existing watcher ->
-//! WM_APP_CONFIG_CHANGED path.
+//! Layout is computed once by `layout()` and used by both `paint()` and
+//! `hit()` — the old code duplicated the arithmetic and needed a `y -= 12`
+//! hack to tuck hints under rows. All colours come from the resolved semantic
+//! palette; see docs/UI_SPEC.md.
 
+use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, HGDIOBJ, TRANSPARENT,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, HGDIOBJ,
+    OUT_TT_PRECIS,
+    PS_SOLID, TRANSPARENT,
 };
 
 use revolc_common::config::Config;
 use revolc_common::settings::SettingId;
-
-use super::gdi::{contrast_text, rgb};
+use super::gdi::line;
 
 const RAIL_W: i32 = 140;
-const ROW_H: i32 = 52;
-const ROW_GAP: i32 = 8;
+const RAIL_ITEM_H: i32 = 44;
+const CARD_H: i32 = 64;
+const CARD_HINT_H: i32 = 20;
+const CARD_GAP: i32 = 12;
+const CONTENT_TOP: i32 = 88;
 
 const CATEGORIES: [&str; 3] = ["常规", "主题", "关于"];
 pub const CATEGORY_COUNT: usize = CATEGORIES.len();
 
-/// Which category owns each exposed setting. Kept here (UI concern) so the
-/// registry does not need to know about page layout.
 fn settings_in_category(category: usize) -> Vec<SettingId> {
     match category {
         0 => vec![
@@ -41,206 +42,652 @@ fn settings_in_category(category: usize) -> Vec<SettingId> {
     }
 }
 
-/// What a mouse click on the settings page selected: a category on the rail,
-/// or one of the registry settings (identity carried by `SettingId`, not a
-/// hard-coded variant per row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Toggle,
+    Segmented,
+    /// Theme picker: a dropdown with readable names, not tiny colour dots.
+    Dropdown,
+}
+
+impl Control {
+    fn of(id: SettingId) -> Self {
+        match id {
+            SettingId::TakeoverMode | SettingId::Autostart => Control::Toggle,
+            SettingId::CloseAction | SettingId::TabRadius => Control::Segmented,
+            SettingId::ThemePreset => Control::Dropdown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsHit {
     Category(usize),
     Setting(SettingId),
+    /// A specific option in a segmented control or the theme dropdown.
+    Choice(SettingId, usize),
+}
+
+struct RowLayout {
+    id: SettingId,
+    rect: RECT,
+    choices: Vec<RECT>,
+    control: Control,
+}
+
+struct Layout {
+    rail: Vec<RECT>,
+    rows: Vec<RowLayout>,
+    dropdown: Option<RECT>,
+    dropdown_items: Vec<RECT>,
 }
 
 pub struct SettingsPanel {
     category: usize,
+    dropdown_open: bool,
+    dropdown_hover: Option<usize>,
 }
 
 impl SettingsPanel {
     pub fn new() -> Self {
-        Self { category: 0 }
+        Self {
+            category: 0,
+            dropdown_open: false,
+            dropdown_hover: None,
+        }
     }
 
     pub fn select(&mut self, category: usize) {
         if category < CATEGORY_COUNT {
             self.category = category;
         }
+        self.close_theme_dropdown();
     }
 
-    fn color(cfg: &Config, key: impl FnOnce(&revolc_common::config::Theme) -> &str) -> COLORREF {
-        let (r, g, b) = cfg.color(key);
-        rgb(r, g, b)
+    /// Clicking the theme card opens/closes the dropdown instead of cycling.
+    pub fn toggle_theme_dropdown(&mut self) {
+        self.dropdown_open = !self.dropdown_open;
+        self.dropdown_hover = None;
+    }
+
+    pub fn close_theme_dropdown(&mut self) {
+        self.dropdown_open = false;
+        self.dropdown_hover = None;
+    }
+
+    fn pane(rc: RECT) -> (i32, i32) {
+        let left = rc.left + RAIL_W + 24;
+        let right = (rc.right - 24).min(left + 720);
+        (left, right)
+    }
+
+    /// Single source of truth for every rectangle on the page.
+    fn layout(&self, rc: RECT, cfg: &Config) -> Layout {
+        let rail = (0..CATEGORY_COUNT)
+            .map(|i| RECT {
+                left: rc.left + 8,
+                top: rc.top + CONTENT_TOP + (i as i32) * (RAIL_ITEM_H + 8),
+                right: rc.left + RAIL_W - 8,
+                bottom: rc.top + CONTENT_TOP + (i as i32) * (RAIL_ITEM_H + 8) + RAIL_ITEM_H,
+            })
+            .collect();
+        let (left, right) = Self::pane(rc);
+        let mut rows = Vec::new();
+        let mut y = rc.top + CONTENT_TOP;
+        for id in settings_in_category(self.category) {
+            let hint = if id.is_available(cfg) {
+                id.hint()
+            } else {
+                id.unavailable_hint()
+            };
+            // An open theme dropdown grows its own card instead of floating
+            // over the next setting — no occupied row is ever covered.
+            let dropdown_rows = if id == SettingId::ThemePreset && self.dropdown_open {
+                SettingId::ThemePreset.choices(cfg).len()
+            } else {
+                0
+            };
+            let height = CARD_H
+                + if hint.is_empty() { 0 } else { CARD_HINT_H }
+                + if dropdown_rows == 0 { 0 } else { 8 + dropdown_rows as i32 * 28 };
+            let rect = RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + height,
+            };
+            let control = Control::of(id);
+            let count = match control {
+                Control::Toggle => 1,
+                Control::Segmented => id.choices(cfg).len().max(1),
+                Control::Dropdown => 1,
+            };
+            let cw = match control {
+                Control::Segmented => 64,
+                Control::Dropdown => 120,
+                Control::Toggle => 40,
+            };
+            let total = count as i32 * cw + (count as i32 - 1) * 4;
+            let start = right - 14 - total;
+            let cy = y + (CARD_H - 22) / 2;
+            let choices = (0..count)
+                .map(|i| RECT {
+                    left: start + i as i32 * (cw + 4),
+                    top: cy,
+                    right: start + i as i32 * (cw + 4) + cw,
+                    bottom: cy + 22,
+                })
+                .collect();
+            rows.push(RowLayout {
+                id,
+                rect,
+                choices,
+                control,
+            });
+            y += height + CARD_GAP;
+        }
+        let mut dropdown = None;
+        let mut dropdown_items = Vec::new();
+        if self.dropdown_open {
+            if let Some(row) = rows.iter().find(|r| r.id == SettingId::ThemePreset) {
+                let choices = SettingId::ThemePreset.choices(cfg);
+                let item_h = 28;
+                let top = row.rect.top + CARD_H;
+                let left = row.rect.left + 8;
+                let right = row.rect.right - 8;
+                let bottom = row.rect.bottom - 4;
+                dropdown = Some(RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                });
+                dropdown_items = choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| RECT {
+                        left: left + 4,
+                        top: top + 4 + i as i32 * item_h,
+                        right: right - 4,
+                        bottom: top + 4 + (i + 1) as i32 * item_h,
+                    })
+                    .collect();
+            }
+        }
+        Layout {
+            rail,
+            rows,
+            dropdown,
+            dropdown_items,
+        }
     }
 
     /// Paint the settings page into `rc` (already the view rect).
     pub unsafe fn paint(&self, hdc: HDC, rc: RECT, cfg: &Config) {
-        let bg = Self::color(cfg, |t| &t.tabbar_background);
-        let fill = Self::color(cfg, |t| &t.tab_active);
-        let rail_bg = Self::color(cfg, |t| &t.bookmark_bar_background);
-        let page_ink = contrast_text(bg);
-        let rail_ink = contrast_text(rail_bg);
+        let p = &cfg.palette;
+        fill(hdc, rc, COLORREF(p.app_background().to_colorref()));
+        fill(
+            hdc,
+            RECT {
+                left: rc.left,
+                top: rc.top,
+                right: rc.left + RAIL_W,
+                bottom: rc.bottom,
+            },
+            COLORREF(p.surface_background().to_colorref()),
+        );
+        fill(
+            hdc,
+            RECT {
+                left: rc.left + RAIL_W,
+                top: rc.top,
+                right: rc.left + RAIL_W + 1,
+                bottom: rc.bottom,
+            },
+            COLORREF(p.border_subtle().to_colorref()),
+        );
 
-        // Whole page background + left rail.
-        let brush = CreateSolidBrush(bg);
-        let _ = FillRect(hdc, &rc, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-        let rail = RECT { left: rc.left, top: rc.top, right: rc.left + RAIL_W, bottom: rc.bottom };
-        let brush = CreateSolidBrush(rail_bg);
-        let _ = FillRect(hdc, &rail, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-
+        let title_font = font(16, 500);
+        let body_font = font(13, FW_NORMAL.0 as i32);
+        let caption_font = font(11, FW_NORMAL.0 as i32);
+        let old_font = SelectObject(hdc, HGDIOBJ(body_font.0));
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let font = GetStockObject(DEFAULT_GUI_FONT);
-        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
 
-        // Category rail.
-        let cat_y0 = rc.top + 40;
-        for (i, label) in CATEGORIES.iter().enumerate() {
-            let row = RECT {
-                left: rc.left + 4,
-                top: cat_y0 + (i as i32) * (ROW_H + ROW_GAP),
-                right: rc.left + RAIL_W - 4,
-                bottom: cat_y0 + (i as i32) * (ROW_H + ROW_GAP) + ROW_H,
-            };
+        let layout = self.layout(rc, cfg);
+        for (i, item) in layout.rail.iter().enumerate() {
             if i == self.category {
-                let brush = CreateSolidBrush(fill);
-                let _ = FillRect(hdc, &row, brush);
-                let _ = DeleteObject(HGDIOBJ(brush.0));
-                let _ = SetTextColor(hdc, contrast_text(fill));
+                fill(hdc, *item, COLORREF(p.surface_raised().to_colorref()));
+                fill(
+                    hdc,
+                    RECT {
+                        left: item.left,
+                        top: item.top,
+                        right: item.left + 3,
+                        bottom: item.bottom,
+                    },
+                    COLORREF(p.accent_default().to_colorref()),
+                );
+                text(
+                    hdc,
+                    RECT {
+                        left: item.left + 12,
+                        ..*item
+                    },
+                    CATEGORIES[i],
+                    title_font,
+                    COLORREF(p.foreground_primary().to_colorref()),
+                    DT_LEFT,
+                );
             } else {
-                let _ = SetTextColor(hdc, rail_ink);
-            }
-            let mut text = row;
-            text.left += 12;
-            let mut wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-            let _ = DrawTextW(hdc, &mut wide, &mut text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        }
-
-        // Right pane: heading + one row per registry setting in this category.
-        let pane_left = rc.left + RAIL_W + 24;
-        let pane_right = rc.right - 24;
-        let mut y = rc.top + 40;
-        match self.category {
-            0 => self.text(hdc, pane_left, &mut y, pane_right, "常规", page_ink, true),
-            1 => self.text(hdc, pane_left, &mut y, pane_right, "主题", page_ink, true),
-            _ => {
-                self.text(hdc, pane_left, &mut y, pane_right, "关于 Revolc", page_ink, true);
-                self.note(hdc, pane_left, &mut y, pane_right, "把 Windows 资源管理器改造成多标签浏览器", page_ink);
-                self.note(hdc, pane_left, &mut y, pane_right, "Clover 的原生重制版 · MPL-2.0", page_ink);
+                text(
+                    hdc,
+                    RECT {
+                        left: item.left + 12,
+                        ..*item
+                    },
+                    CATEGORIES[i],
+                    body_font,
+                    COLORREF(p.foreground_secondary().to_colorref()),
+                    DT_LEFT,
+                );
             }
         }
-        for id in settings_in_category(self.category) {
-            let available = id.is_available(cfg);
-            let hint = if available { id.hint() } else { id.unavailable_hint() };
-            self.row(
-                hdc, pane_left, &mut y, pane_right,
-                id.label(), &id.display(cfg), cfg, available,
-            );
-            if !hint.is_empty() {
-                y -= 12; // tuck the hint under the row without a full gap
-                self.note(hdc, pane_left + 12, &mut y, pane_right, hint, page_ink);
-            }
-        }
-        if self.category != 2 {
-            self.note(hdc, pane_left, &mut y, pane_right, "点击行右侧的值可切换", page_ink);
-        }
 
-        let _ = SelectObject(hdc, old_font);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn text(
-        &self,
-        hdc: HDC,
-        x: i32,
-        y: &mut i32,
-        right: i32,
-        s: &str,
-        ink: COLORREF,
-        heading: bool,
-    ) {
-        let _ = SetTextColor(hdc, ink);
-        let mut rc = RECT { left: x, top: *y, right, bottom: *y + (if heading { 30 } else { 24 }) };
-        let mut wide: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
-        let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        *y += if heading { 36 } else { 28 };
-    }
-
-    unsafe fn note(&self, hdc: HDC, x: i32, y: &mut i32, right: i32, s: &str, ink: COLORREF) {
-        let _ = SetTextColor(hdc, ink);
-        let mut rc = RECT { left: x, top: *y, right, bottom: *y + 24 };
-        let mut wide: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
-        let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        *y += 28;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn row(
-        &self, hdc: HDC, x: i32, y: &mut i32, right: i32,
-        label: &str, value: &str, cfg: &Config, available: bool,
-    ) {
-        let rc = RECT { left: x, top: *y, right, bottom: *y + ROW_H };
-        let row_bg = Self::color(cfg, |t| &t.tab_inactive);
-        let brush = CreateSolidBrush(row_bg);
-        let _ = FillRect(hdc, &rc, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-        // Grey text on the same background reads as "disabled" without
-        // introducing a new colour key or a different row shape.
-        let ink = if available {
-            contrast_text(row_bg)
-        } else {
-            // Blend the readable ink halfway into the background: visibly
-            // dimmed but still legible, without a new config colour key.
-            let bg = COLORREF(row_bg.0);
-            let fg = contrast_text(bg);
-            let byte = |c: u32| -> u32 { ((c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff)) / 3 };
-            let mix = |a: u32, b: u32| -> u32 { (byte(a) + byte(b)) / 2 };
-            COLORREF(mix(bg.0, fg.0) * 0x010101)
+        let (left, right) = Self::pane(rc);
+        let heading = match self.category {
+            0 => ("常规", "管理接管方式与窗口行为"),
+            1 => ("主题", "配色、标签形状与界面氛围"),
+            _ => (
+                "关于 Revolc",
+                "把 Windows 资源管理器改造成多标签浏览器 · Clover 的原生重制版",
+            ),
         };
-        let _ = SetTextColor(hdc, ink);
-        let mut lrc = RECT { left: x + 12, top: *y, right: x + 180, bottom: *y + ROW_H };
-        let mut lwide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-        let _ = DrawTextW(hdc, &mut lwide, &mut lrc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        let mut vrc = RECT { left: right - 180, top: *y, right: right - 12, bottom: *y + ROW_H };
-        let mut vwide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
-        let _ = DrawTextW(hdc, &mut vwide, &mut vrc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        *y += ROW_H + ROW_GAP;
+        text(
+            hdc,
+            RECT {
+                left,
+                top: rc.top + 24,
+                right,
+                bottom: rc.top + 52,
+            },
+            heading.0,
+            title_font,
+            COLORREF(p.foreground_primary().to_colorref()),
+            DT_LEFT,
+        );
+        text(
+            hdc,
+            RECT {
+                left,
+                top: rc.top + 52,
+                right,
+                bottom: rc.top + 76,
+            },
+            heading.1,
+            caption_font,
+            COLORREF(p.foreground_secondary().to_colorref()),
+            DT_LEFT,
+        );
+
+        for row in &layout.rows {
+            let available = row.id.is_available(cfg);
+            card(
+                hdc,
+                row.rect,
+                COLORREF(p.surface_raised().to_colorref()),
+                COLORREF(p.border_subtle().to_colorref()),
+            );
+            let ink = if available {
+                COLORREF(p.foreground_primary().to_colorref())
+            } else {
+                COLORREF(p.foreground_secondary().to_colorref())
+            };
+            text(
+                hdc,
+                RECT {
+                    left: row.rect.left + 12,
+                    top: row.rect.top + 4,
+                    right: right - 150,
+                    bottom: row.rect.top + CARD_H - 4,
+                },
+                row.id.label(),
+                body_font,
+                ink,
+                DT_LEFT,
+            );
+            let hint = if available {
+                row.id.hint()
+            } else {
+                row.id.unavailable_hint()
+            };
+            if !hint.is_empty() {
+                text(
+                    hdc,
+                    RECT {
+                        left: row.rect.left + 12,
+                        top: row.rect.top + CARD_H,
+                        right,
+                        bottom: row.rect.bottom,
+                    },
+                    hint,
+                    caption_font,
+                    COLORREF(p.foreground_secondary().to_colorref()),
+                    DT_LEFT,
+                );
+            }
+            let selected = current_index(row.id, cfg);
+            match row.control {
+                Control::Toggle => {
+                    let cell = row.choices[0];
+                    let on = available && selected == Some(0);
+                    let fill = if on {
+                        COLORREF(p.accent_default().to_colorref())
+                    } else {
+                        COLORREF(p.surface_hover().to_colorref())
+                    };
+                    fill_round(hdc, cell, fill, 11);
+                    let knob_x = if on { cell.right - 15 } else { cell.left + 3 };
+                    fill_round(
+                        hdc,
+                        RECT {
+                            left: knob_x,
+                            top: cell.top + 3,
+                            right: knob_x + 16,
+                            bottom: cell.bottom - 3,
+                        },
+                        COLORREF(p.foreground_primary().to_colorref()),
+                        8,
+                    );
+                }
+                Control::Segmented => {
+                    let choices = row.id.choices(cfg);
+                    for (i, cell) in row.choices.iter().enumerate() {
+                        let active = available && Some(i) == selected;
+                        let fill = if active {
+                            COLORREF(p.accent_default().to_colorref())
+                        } else {
+                            COLORREF(p.surface_hover().to_colorref())
+                        };
+                        fill_round(hdc, *cell, fill, 4);
+                        let ink = if active {
+                            COLORREF(p.app_background().to_colorref())
+                        } else {
+                            COLORREF(p.foreground_secondary().to_colorref())
+                        };
+                        let label = choices.get(i).map(|c| c.0.as_str()).unwrap_or("");
+                        text(hdc, *cell, label, caption_font, ink, DT_CENTER);
+                    }
+                }
+                Control::Dropdown => {
+                    let cell = row.choices[0];
+                    text(
+                        hdc,
+                        RECT {
+                            left: cell.left,
+                            top: row.rect.top + 4,
+                            right: cell.right - 24,
+                            bottom: row.rect.top + CARD_H - 4,
+                        },
+                        &cfg.palette.name,
+                        body_font,
+                        ink,
+                        DT_RIGHT,
+                    );
+                    text(
+                        hdc,
+                        RECT {
+                            left: cell.right - 22,
+                            top: row.rect.top + 4,
+                            right: cell.right,
+                            bottom: row.rect.top + CARD_H - 4,
+                        },
+                        "▾",
+                        caption_font,
+                        COLORREF(p.foreground_primary().to_colorref()),
+                        DT_CENTER,
+                    );
+                }
+            }
+        }
+
+        if let Some(overlay) = layout.dropdown {
+            // The expanded area is part of the card itself: one separator,
+            // no floating panel and no covered neighbour.
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(p.border_subtle().to_colorref()));
+            let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+            line(hdc, overlay.left, overlay.top, overlay.right, overlay.top);
+            let _ = SelectObject(hdc, old_pen);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
+            let choices = SettingId::ThemePreset.choices(cfg);
+            let selected = current_index(SettingId::ThemePreset, cfg);
+            for (i, item) in layout.dropdown_items.iter().enumerate() {
+                if Some(i) == selected || Some(i) == self.dropdown_hover {
+                    fill(hdc, *item, COLORREF(p.surface_hover().to_colorref()));
+                    fill(
+                        hdc,
+                        RECT {
+                            left: item.left,
+                            top: item.top,
+                            right: item.left + 3,
+                            bottom: item.bottom,
+                        },
+                        COLORREF(p.accent_default().to_colorref()),
+                    );
+                }
+                text(
+                    hdc,
+                    RECT {
+                        left: item.left + 10,
+                        ..*item
+                    },
+                    choices.get(i).map(|c| c.0.as_str()).unwrap_or(""),
+                    body_font,
+                    COLORREF(p.foreground_primary().to_colorref()),
+                    DT_LEFT,
+                );
+            }
+        }
+
+        SelectObject(hdc, HGDIOBJ(old_font.0));
+        let _ = DeleteObject(HGDIOBJ(title_font.0));
+        let _ = DeleteObject(HGDIOBJ(body_font.0));
+        let _ = DeleteObject(HGDIOBJ(caption_font.0));
     }
 
-    /// Hit-test a point in view-rect client coords. Unavailable settings keep
-    /// their row (and their place in the layout) but do not answer hits.
-    pub fn hit(&self, x: i32, y: i32, rc: RECT, cfg: &Config) -> Option<SettingsHit> {
-        let cat_y0 = rc.top + 40;
-        for i in 0..CATEGORIES.len() {
-            let top = cat_y0 + (i as i32) * (ROW_H + ROW_GAP);
-            if x >= rc.left && x < rc.left + RAIL_W && y >= top && y < top + ROW_H {
+    pub fn hit(&mut self, x: i32, y: i32, rc: RECT, cfg: &Config) -> Option<SettingsHit> {
+        let layout = self.layout(rc, cfg);
+        if self.dropdown_open {
+            for (i, item) in layout.rail.iter().enumerate() {
+                if inside(x, y, *item) {
+                    self.close_theme_dropdown();
+                    return Some(SettingsHit::Category(i));
+                }
+            }
+            for (i, item) in layout.dropdown_items.iter().enumerate() {
+                if inside(x, y, *item) {
+                    self.close_theme_dropdown();
+                    return Some(SettingsHit::Choice(SettingId::ThemePreset, i));
+                }
+            }
+            if layout.dropdown.map(|r| inside(x, y, r)).unwrap_or(false) {
+                return None;
+            }
+            self.close_theme_dropdown();
+            return None;
+        }
+        for (i, item) in layout.rail.iter().enumerate() {
+            if inside(x, y, *item) {
                 return Some(SettingsHit::Category(i));
             }
         }
-        if x < rc.left + RAIL_W + 24 {
-            return None;
-        }
-        // Rows follow the heading; hints shift later rows, so walk them in
-        // the same order paint() laid them out.
-        let mut y_cursor = rc.top + 40 + 36;
-        match self.category {
-            0 | 1 => {
-                for id in settings_in_category(self.category) {
-                    if in_row(y, y_cursor) {
-                        return id.is_available(cfg).then_some(SettingsHit::Setting(id));
-                    }
-                    y_cursor += ROW_H + ROW_GAP;
-                    let hint = if id.is_available(cfg) { id.hint() } else { id.unavailable_hint() };
-                    if !hint.is_empty() {
-                        y_cursor -= 12;
-                        y_cursor += 28; // note() height
-                    }
+        for row in layout.rows {
+            if !inside(x, y, row.rect) || !row.id.is_available(cfg) {
+                continue;
+            }
+            for (i, cell) in row.choices.iter().enumerate() {
+                // Only segmented controls select a value directly. The
+                // dropdown's cell is just the affordance to open the list;
+                // hitting it must return `Setting` so the list can expand.
+                if inside(x, y, *cell) && row.control == Control::Segmented {
+                    return Some(SettingsHit::Choice(row.id, i));
                 }
             }
-            _ => {}
+            // Anywhere else on the card cycles the value; the control cells
+            // above select a specific option.
+            return Some(SettingsHit::Setting(row.id));
         }
         None
     }
 }
 
-fn in_row(y: i32, top: i32) -> bool {
-    y >= top && y < top + ROW_H
+fn current_index(id: SettingId, cfg: &Config) -> Option<usize> {
+    let current = id.display(cfg);
+    id.choices(cfg)
+        .iter()
+        .position(|(label, _)| *label == current)
+}
+
+fn inside(x: i32, y: i32, rc: RECT) -> bool {
+    x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
+}
+
+unsafe fn fill(hdc: HDC, rc: RECT, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    let _ = FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+unsafe fn card(hdc: HDC, rc: RECT, bg: COLORREF, border: COLORREF) {
+    fill(hdc, rc, bg);
+    let pen = CreatePen(PS_SOLID, 1, border);
+    let old = SelectObject(hdc, HGDIOBJ(pen.0));
+    line(hdc, rc.left, rc.top, rc.right - 1, rc.top);
+    line(hdc, rc.left, rc.bottom - 1, rc.right - 1, rc.bottom - 1);
+    line(hdc, rc.left, rc.top, rc.left, rc.bottom - 1);
+    line(hdc, rc.right - 1, rc.top, rc.right - 1, rc.bottom - 1);
+    SelectObject(hdc, old);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+}
+
+unsafe fn fill_round(hdc: HDC, rc: RECT, color: COLORREF, radius: i32) {
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let old = SelectObject(hdc, HGDIOBJ(pen.0));
+    let brush = CreateSolidBrush(color);
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+}
+
+unsafe fn font(px: i32, weight: i32) -> HFONT {
+    let handle = CreateFontW(
+        -px,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_PITCH.0 as u32,
+        w!("Microsoft YaHei UI"),
+    );
+    if handle.is_invalid() {
+        HFONT(GetStockObject(DEFAULT_GUI_FONT).0)
+    } else {
+        handle
+    }
+}
+
+unsafe fn text(
+    hdc: HDC,
+    mut rc: RECT,
+    label: &str,
+    font: HFONT,
+    ink: COLORREF,
+    align: DRAW_TEXT_FORMAT,
+) {
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    let _ = SetTextColor(hdc, ink);
+    let mut wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+    let flags = DRAW_TEXT_FORMAT(DT_SINGLELINE.0 | DT_VCENTER.0 | DT_END_ELLIPSIS.0 | align.0);
+    let _ = DrawTextW(hdc, &mut wide, &mut rc, flags);
+    SelectObject(hdc, HGDIOBJ(old.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_and_hit_share_the_same_rectangles() {
+        let cfg = Config::default();
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 900,
+            bottom: 500,
+        };
+        let mut panel = SettingsPanel::new();
+        let layout = panel.layout(rc, &cfg);
+        assert_eq!(layout.rows.len(), 3);
+        let row = &layout.rows[0];
+        assert_eq!(
+            panel.hit(row.rect.left + 20, row.rect.top + 10, rc, &cfg),
+            Some(SettingsHit::Setting(row.id))
+        );
+    }
+
+    #[test]
+    fn theme_dropdown_lists_every_theme() {
+        let cfg = Config::default();
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 900,
+            bottom: 500,
+        };
+        let mut panel = SettingsPanel::new();
+        panel.select(1);
+        let closed = panel.layout(rc, &cfg);
+        let cell = closed.rows[0].choices[0];
+        assert_eq!(
+            panel.hit(
+                (cell.left + cell.right) / 2,
+                (cell.top + cell.bottom) / 2,
+                rc,
+                &cfg
+            ),
+            Some(SettingsHit::Setting(SettingId::ThemePreset))
+        );
+        panel.toggle_theme_dropdown();
+        let layout = panel.layout(rc, &cfg);
+        assert_eq!(layout.dropdown_items.len(), 4);
+        // Expanded list lives inside its own card; the next row is pushed
+        // down instead of being covered.
+        assert!(layout.rows[0].rect.bottom <= layout.rows[1].rect.top);
+        assert!(layout.dropdown_items[3].bottom < layout.rows[0].rect.bottom);
+        let item = layout.dropdown_items[1];
+        assert_eq!(
+            panel.hit(
+                (item.left + item.right) / 2,
+                (item.top + item.bottom) / 2,
+                rc,
+                &cfg
+            ),
+            Some(SettingsHit::Choice(SettingId::ThemePreset, 1))
+        );
+        assert!(!panel.dropdown_open);
+        panel.toggle_theme_dropdown();
+        let layout = panel.layout(rc, &cfg);
+        let row = &layout.rows[0];
+        assert_eq!(panel.hit(row.rect.left + 20, row.rect.top + 10, rc, &cfg), None);
+        assert!(!panel.dropdown_open);
+    }
 }

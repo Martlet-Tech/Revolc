@@ -102,6 +102,9 @@ pub struct TabBar {
     text: COLORREF,
     text_active: COLORREF,
     close_hover: COLORREF,
+    /// 2px connector under the active tab — the unambiguous "this tab owns
+    /// the view below" cue required by docs/UI_SPEC.md §3.
+    accent: COLORREF,
     radius: i32,
     /// Per-tab width, recomputed from the client width so the tabs fill the
     /// band instead of being stuck at one hard-coded size.
@@ -146,6 +149,7 @@ impl TabBar {
             text: COLORREF(0),
             text_active: COLORREF(0),
             close_hover: COLORREF(0),
+            accent: COLORREF(0),
             radius: 0,
             tab_w: TAB_MAX_W,
             hover: None,
@@ -168,27 +172,32 @@ impl TabBar {
         bar
     }
 
-    /// Re-read every theme value (config hot reload).
+    /// Re-read every theme value (config hot reload). All colours come from
+    /// the resolved semantic palette — see docs/UI_SPEC.md §3.
     pub fn restyle(&mut self, cfg: &Config) {
-        let c = |f: &dyn Fn(&crate::config::Theme) -> &str| {
-            let (r, g, b) = cfg.color(f);
-            rgb(r, g, b)
-        };
-        self.bg = c(&|t| &t.tabbar_background);
-        self.active_bg = c(&|t| &t.tab_active);
-        self.hover_bg = c(&|t| &t.tab_hover);
-        self.inactive_bg = c(&|t| &t.tab_inactive);
-        self.text = c(&|t| &t.tab_text);
-        self.text_active = c(&|t| &t.tab_text_active);
-        self.close_hover = c(&|t| &t.tab_close_hover);
+        use revolc_theme::ThemeKind;
+
+        let p = &cfg.palette;
+        let cr = |c: revolc_theme::Color| rgb(c.0, c.1, c.2);
+        let dark = p.kind == ThemeKind::Dark;
+        self.bg = cr(p.chrome_background());
+        // Light themes use a raised surface (not a pale fill) for the active
+        // tab; dark themes use the soft accent. The 2px accent connector is
+        // the real active indicator, painted in `paint()`.
+        self.active_bg = if dark { cr(p.accent_soft()) } else { cr(p.surface_raised()) };
+        self.hover_bg = cr(p.surface_hover());
+        self.inactive_bg = cr(p.surface_background());
+        self.text = cr(p.foreground_secondary());
+        self.text_active = if dark { cr(p.foreground_inverse()) } else { cr(p.foreground_primary()) };
+        self.close_hover = cr(p.danger_default());
+        self.accent = cr(p.accent_default());
         self.radius = cfg.theme.tab_radius.max(0);
-        let symbol = c(&|t| &t.tabbar_text);
-        let bg = self.bg;
+        let symbol = cr(p.foreground_primary());
         self.caption_colors = caption::Colors::new(
-            c(&|t| &t.caption_hover),
-            c(&|t| &t.caption_close_hover),
+            cr(p.surface_hover()),
+            cr(p.danger_default()),
             symbol,
-            dim(symbol, bg),
+            dim(symbol, self.bg),
         );
     }
 
@@ -642,6 +651,17 @@ impl TabBar {
                 self.inactive_bg
             };
             fill_tab(hdc, &tab_rc, bg, self.radius);
+            if i == self.active && !dragged {
+                let connector = RECT {
+                    left: x,
+                    top: TAB_BOTTOM - 2,
+                    right: x + self.tab_w,
+                    bottom: TAB_BOTTOM,
+                };
+                let brush = CreateSolidBrush(self.accent);
+                let _ = FillRect(hdc, &connector, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
 
             // Close (X) on the tab's right edge — only while it has room.
             let cy = (tab_rc.top + tab_rc.bottom) / 2;

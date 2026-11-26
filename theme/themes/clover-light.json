@@ -1,0 +1,22 @@
+{
+  "$schema": "../schema.json",
+  "id": "clover-light",
+  "name": "三叶草浅色",
+  "type": "light",
+  "colors": {
+    "app.background": "#F2F7F3",
+    "chrome.background": "#E8F2EA",
+    "surface.background": "#F7FBF8",
+    "surface.raised": "#FFFFFF",
+    "surface.hover": "#E3F0E6",
+    "border.subtle": "#CFE4D4",
+    "foreground.primary": "#1A2E21",
+    "foreground.secondary": "#4F6B57",
+    "foreground.inverse": "#FFFFFF",
+    "accent.default": "#2E7D46",
+    "accent.soft": "#A5D6A7",
+    "danger.default": "#C42B1C",
+    "danger.hover": "#A32115",
+    "focus.ring": "#2E7D46"
+  }
+}

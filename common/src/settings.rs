@@ -18,6 +18,7 @@
 //! rest of the app *reads* configuration.
 
 use crate::config::{set_toml_values, Config};
+use revolc_theme::ThemeSet;
 
 /// Every setting exposed in the settings page. Order is display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl SettingId {
         match self {
             SettingId::TakeoverMode => "接管",
             SettingId::TabRadius => "标签圆角",
-            SettingId::ThemePreset => "配色预设",
+            SettingId::ThemePreset => "配色主题",
             SettingId::Autostart => "开机自启",
             SettingId::CloseAction => "关闭按钮",
         }
@@ -104,15 +105,21 @@ impl SettingId {
     /// Human-readable current value.
     pub fn display(self, cfg: &Config) -> String {
         match self {
-            SettingId::TakeoverMode => {
-                if cfg.takeover.mode == "redirect" { "是" } else { "否" }.into()
+            SettingId::TakeoverMode => if cfg.takeover.mode == "redirect" {
+                "是"
+            } else {
+                "否"
             }
+            .into(),
             SettingId::TabRadius => cfg.theme.tab_radius.to_string(),
             SettingId::Autostart => if cfg.tray.autostart { "是" } else { "否" }.into(),
-            SettingId::CloseAction => {
-                if cfg.tray.close_action == "hide" { "隐藏到托盘" } else { "退出" }.into()
+            SettingId::CloseAction => if cfg.tray.close_action == "hide" {
+                "隐藏到托盘"
+            } else {
+                "退出"
             }
-            SettingId::ThemePreset => crate::theme_presets::current_preset_name(cfg).to_string(),
+            .into(),
+            SettingId::ThemePreset => cfg.palette.name.clone(),
         }
     }
 
@@ -122,7 +129,11 @@ impl SettingId {
     pub fn next_edits(self, cfg: &Config) -> Vec<(&'static str, &'static str, String)> {
         match self {
             SettingId::TakeoverMode => {
-                let next = if cfg.takeover.mode == "redirect" { "off" } else { "redirect" };
+                let next = if cfg.takeover.mode == "redirect" {
+                    "off"
+                } else {
+                    "redirect"
+                };
                 vec![("takeover", "mode", format!("\"{next}\""))]
             }
             SettingId::TabRadius => {
@@ -140,14 +151,26 @@ impl SettingId {
             }
             SettingId::CloseAction => {
                 // The tray is permanent now, so hide/exit is a plain toggle.
-                let next = if cfg.tray.close_action == "hide" { "exit" } else { "hide" };
+                let next = if cfg.tray.close_action == "hide" {
+                    "exit"
+                } else {
+                    "hide"
+                };
                 vec![("tray", "close_action", format!("\"{next}\""))]
             }
             SettingId::ThemePreset => {
-                let next = crate::theme_presets::next_preset(cfg);
-                next.iter()
-                    .map(|(s, k, v)| (*s, *k, (*v).to_string()))
-                    .collect()
+                let ids: Vec<String> = ThemeSet::discover()
+                    .list()
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect();
+                let next = ids
+                    .iter()
+                    .position(|id| *id == cfg.theme.active)
+                    .map(|i| ids[(i + 1) % ids.len()].clone())
+                    .or_else(|| ids.first().cloned())
+                    .unwrap_or_else(|| "clover-dark".into());
+                vec![("theme", "active", format!("\"{next}\""))]
             }
         }
     }
@@ -157,12 +180,54 @@ impl SettingId {
     pub fn validate(self, value: &str) -> Result<(), &'static str> {
         let valid = match self {
             SettingId::TakeoverMode => matches!(value, "\"off\"" | "\"redirect\""),
-            SettingId::TabRadius => value.parse::<i32>().map(|n| (0..=20).contains(&n)).unwrap_or(false),
+            SettingId::TabRadius => value
+                .parse::<i32>()
+                .map(|n| (0..=20).contains(&n))
+                .unwrap_or(false),
             SettingId::Autostart => matches!(value, "true" | "false"),
             SettingId::CloseAction => matches!(value, "\"exit\"" | "\"hide\""),
-            SettingId::ThemePreset => true, // a batch of colour keys, checked by serde on reload
+            SettingId::ThemePreset => ThemeSet::discover().contains(value.trim_matches('"')),
         };
-        if valid { Ok(()) } else { Err(self.label()) }
+        if valid {
+            Ok(())
+        } else {
+            Err(self.label())
+        }
+    }
+
+    /// Options shown by a segmented control, with the TOML literal each one
+    /// writes. `(display, literal)`; index is stable enough for hit testing.
+    pub fn choices(self, _cfg: &Config) -> Vec<(String, String)> {
+        let choice = |label: &str, literal: &str| (label.to_string(), literal.to_string());
+        match self {
+            SettingId::TakeoverMode => vec![choice("是", "\"redirect\""), choice("否", "\"off\"")],
+            SettingId::Autostart => vec![choice("是", "true"), choice("否", "false")],
+            SettingId::CloseAction => vec![choice("隐藏到托盘", "\"hide\""), choice("退出", "\"exit\"")],
+            SettingId::TabRadius => [0, 4, 6, 10]
+                .iter()
+                .map(|n| choice(&n.to_string(), &n.to_string()))
+                .collect(),
+            SettingId::ThemePreset => ThemeSet::discover()
+                .list()
+                .into_iter()
+                .map(|t| choice(&t.name, &format!("\"{}\"", t.id)))
+                .collect(),
+        }
+    }
+
+    /// Edit that selects one specific choice (as opposed to cycling).
+    pub fn edits_for_choice(
+        self,
+        index: usize,
+        cfg: &Config,
+    ) -> Option<Vec<(String, String, String)>> {
+        let (_, literal) = self.choices(cfg).get(index)?.clone();
+        let (section, key) = match self.toml_key() {
+            Some(pair) => (pair.0.to_string(), pair.1.to_string()),
+            None if self == SettingId::ThemePreset => ("theme".into(), "active".into()),
+            None => return None,
+        };
+        Some(vec![(section, key, literal)])
     }
 }
 
@@ -178,9 +243,28 @@ pub fn apply(cfg: &Config, text: &str, id: SettingId) -> Result<String, &'static
     if let Some((_, _, value)) = edits.first() {
         id.validate(value)?;
     }
+    let borrowed: Vec<(&str, &str, &str)> =
+        edits.iter().map(|(s, k, v)| (*s, *k, v.as_str())).collect();
+    Ok(set_toml_values(text, &borrowed))
+}
+
+/// Apply a specific option chosen from a segmented/swatch control.
+pub fn apply_choice(
+    cfg: &Config,
+    text: &str,
+    id: SettingId,
+    index: usize,
+) -> Result<String, &'static str> {
+    if !id.is_available(cfg) {
+        return Err("setting unavailable");
+    }
+    let edits = id.edits_for_choice(index, cfg).ok_or("invalid choice")?;
+    for (_, _, value) in &edits {
+        id.validate(value)?;
+    }
     let borrowed: Vec<(&str, &str, &str)> = edits
         .iter()
-        .map(|(s, k, v)| (*s, *k, v.as_str()))
+        .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
         .collect();
     Ok(set_toml_values(text, &borrowed))
 }
@@ -216,6 +300,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_choice_writes_selected_value() {
+        let mut cfg = Config::default();
+        cfg.takeover.mode = "redirect".into();
+        let out = apply_choice(&cfg, "[theme]\ntab_radius = 6\n", SettingId::TabRadius, 1).unwrap();
+        assert!(out.contains("tab_radius = 4"), "{out}");
+        let index = SettingId::ThemePreset
+            .choices(&cfg)
+            .iter()
+            .position(|(_, literal)| literal == "\"clover-dark\"")
+            .unwrap();
+        let theme = apply_choice(
+            &cfg,
+            "[theme]\nactive = \"dark\"\n",
+            SettingId::ThemePreset,
+            index,
+        )
+        .unwrap();
+        assert!(theme.contains("active = \"clover-dark\""), "{theme}");
+    }
+
+    #[test]
     fn apply_preserves_comments() {
         let mut cfg = Config::default();
         cfg.takeover.mode = "redirect".into(); // autostart is gated on takeover
@@ -230,7 +335,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.tray.enabled = false; // stale config from an older build is ignored
         assert!(SettingId::CloseAction.is_available(&cfg));
-        assert!(apply(&cfg, "[tray]\nclose_action = \"exit\"\n", SettingId::CloseAction).is_ok());
+        assert!(apply(
+            &cfg,
+            "[tray]\nclose_action = \"exit\"\n",
+            SettingId::CloseAction
+        )
+        .is_ok());
     }
 
     #[test]
