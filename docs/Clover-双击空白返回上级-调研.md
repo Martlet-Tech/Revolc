@@ -1,8 +1,9 @@
 # Clover「双击文件列表空白 → 返回上一级」实现调研
 
 > 用 REA / Ghidra 12.2 反编译 `clover.dll`（x86, chrome_dll.pdb）与
-> `TabHelper64.dll`（x86-64, Explorer BHO）。**只调研，未改 Revolc 代码。**
-> 日期：2026-11-19。
+> `TabHelper64.dll`（x86-64, Explorer BHO）。日期：2026-11-19。
+> **状态**：调研 + 实现记录（实现见文末，分支 `feat/dblclick-empty-go-parent`，
+> commit `95807cb`，已提交；下面的"对 Revolc 的落地建议"是实施前的原始建议）。
 
 ## 结论先行
 
@@ -88,7 +89,7 @@ memcpy(&g_settings, p, 0x118);   // 与 clover.dll 写的 70 项(0x118B) 数组�
 ```
 `FUN_18000e080` 里 `feature_enabled()` 就是查 `g_settings` 对应位（`DAT_18002f4cc`）。
 
-## 对 Revolc 的落地建议（未实施）
+## 对 Revolc 的落地建议（实施前的原始建议，已落地）
 
 ### 该抄的部分（小）
 - 在 `bho/src/lib.rs` 的 `SetSite` 里，除了报 HWND，额外找到文件列表窗口
@@ -159,4 +160,4 @@ memcpy(&g_settings, p, 0x118);   // 与 clover.dll 写的 70 项(0x118B) 数组�
   重新登录**才会加载新 DLL；这是本功能测试的前置条件。
 - **范围限制**：Win11 的 `DirectUIHWND` 无 `LVM_HITTEST`，本版未覆盖（会直接跳过、
   不触发、也不误触发）。用户机器为 Win10 19045，命中本版路径。
-- 未提交、未推送，等用户手测。
+- 已提交（`95807cb`，分支 `feat/dblclick-empty-go-parent`）；实测通过。

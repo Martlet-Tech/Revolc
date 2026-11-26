@@ -170,8 +170,14 @@ DelegateExecute = {11dbb47c-a525-400b-9e80-a54615a090c0}   ← Explorer delegate
 6. command 值格式 `"...\revolc.exe" "%1"`，不删不动系统 DelegateExecute（该键是
    HKCU 自己的子键，写默认值即可，系统在 HKLM 的 delegate 不受影响）
 
-### 已知不追求的行为
+> **历史快照（2026-11-16）**：本节的"独立外壳 + IExplorerBrowser、不做 re-parent"
+> 是调研初期的路线，**已被废弃**。当前实现正是把真实 Explorer 窗口 `SetParent`
+> 吸收进 tab（见 `docs/Rebuild_Target_Spec.md` §1、`docs/交接文档.md`），
+> 由 BHO 通知 + 后台扫描驱动。此处保留原文作为决策记录，勿按此段理解现状。
+
+### 已知不追求的行为（当时的结论，已部分失效）
 
 - 不拦"此电脑/回收站/控制面板"等非文件夹视图（与 FileExplorerInterceptor 一致）
-- 不做原版 Clover 那种"把 Explorer 视图 re-parent 进 tab"的运行时抓取 —— 我们是
-  独立外壳 + IExplorerBrowser，重定向只需"关旧窗、开新实例"，不需要注入
+- ~~不做原版 Clover 那种"把 Explorer 视图 re-parent 进 tab"的运行时抓取 —— 我们是
+  独立外壳 + IExplorerBrowser，重定向只需"关旧窗、开新实例"，不需要注入~~
+  **（已作废：最终方案就是 re-parent 真实 Explorer 窗口）**

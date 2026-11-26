@@ -156,9 +156,10 @@ PaintedPage（开放枚举）
    - 主题色：`theme.*` 颜色字段（文本输入或色板，Phase 1 可做文本）
    - `tab_radius`
    - `bookmark_bar_background`
-   - `takeover.mode`
-   - `bookmarks.enabled`（注意：一体化后收藏栏不可隐藏，此项要么删掉要么改为只控制"显示书签条目"——阶段 C 再定）
-   - 不暴露：`startup_mode` / `startup_paths` / `hover_switch`（死配置）、`tray.enabled`（需重启）
+   - `takeover.mode`（对用户呈现为「接管：是/否」）
+   - `tray.close_action` / `tray.autostart`（后来在 `bb06392` 加入）
+   - ~~`bookmarks.enabled`~~ 一体化后收藏栏不可隐藏，此项已废弃
+   - 不暴露：`startup_mode` / `startup_paths` / `hover_switch`（死配置）、~~`tray.enabled`（需重启）~~（托盘现为永久显示，该项已废弃）
 5. 写回链路：`SettingsPanel` 改值 → 按行写 TOML → watcher 500ms → `WM_APP_CONFIG_CHANGED` → 主窗口与设置面板同步刷新。
 
 **验收**：点齿轮打开设置 tab；改主题色主窗口实时变绿；切回文件夹 tab 正常；设置 tab 单例；`Ctrl+W` 关掉设置 tab 回上一 tab。
@@ -211,7 +212,7 @@ PaintedPage（开放枚举）
 - 阶段 A：`Option<Absorbed>` → `View { Pending, Hosted, Painted }`，约 18 处遍历逐处按语义改写；`expire_reserved` 只数 Pending、`tab_by_label_tail` 只匹配 Hosted 是关键陷阱，均已处理。
 - 阶段 B：合并两个 owned popup 为一个 62px chrome popup，`view_rect.top` 固定；收藏栏"可隐藏"从此消失，右端齿轮走 `chrome::hit_settings`。
 - 阶段 C：`SettingsPanel` 三类设置，点击值切换；`set_toml_value` 按行写回保留注释；写入后现有 watcher 自动热刷新。设置页文字颜色用亮度自适应（`ink_on`），避免深色字画在深绿底上。
-- 已知限制（本次范围外）：设置页暂无键盘导航；收藏目录仍是占位文字（TODO Phase 3）；主题预设只有绿/深灰蓝两档；设置页关闭走 `Ctrl+W`（keymap 无 Esc 绑定）。
+- 已知限制（本次范围外）：设置页暂无键盘导航；~~收藏目录仍是占位文字（TODO Phase 3）~~ **Phase 3 已落地**真实书签芯片（`src/bookmarks.rs`，见 `Rebuild_Target_Spec.md` §3.3）；主题预设只有绿/深灰蓝两档；设置页关闭走 `Ctrl+W`（keymap 无 Esc 绑定）。
 - `cargo fmt --check` 报告的是仓库原有文件的格式差异，本次未做全局格式化以免污染无关文件。
 
 ### 实测发现的严重 bug（已修复）

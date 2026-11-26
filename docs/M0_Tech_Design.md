@@ -1,4 +1,10 @@
-# Revolc M0 技术方案
+# Revolc M0 技术方案（历史归档）
+
+> **历史快照（2026-11-16）**：M0 早期设计。核心路线后来已变——当时写的"单 crate、
+> 不做 workspace"（现为 4 成员 workspace）、"IExplorerBrowser 每 tab 一个实例"
+> （已废弃，改为 re-parent 真实 Explorer 窗口）、"tab 条自绘子窗口"（已改为
+> 一体化标题栏 + owned popup）均不再适用。保留作为决策记录，现状以
+> `docs/Rebuild_Target_Spec.md` 和 `docs/交接文档.md` 为准。§2.1 的评审决议仍有参考价值。
 
 > M0 = 主窗口 + tab 条 + Shell 视图嵌入 + 配置热重载骨架。
 > 本文档只管架构层；行为细节以 `Rebuild_Target_Spec.md` 为准。方案未覆盖的行为按常识实现，不逐条询问。
