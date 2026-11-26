@@ -15,6 +15,7 @@ pub const GREEN_THEME: &[(&str, &str, &str)] = &[
     ("theme", "tab_active", "\"#e8f5e9\""),
     ("theme", "tab_text", "\"#1b3d28\""),
     ("theme", "tab_text_active", "\"#0f2a1a\""),
+    ("theme", "tab_close_hover", "\"#2b5c3f\""),
     ("theme", "tabbar_text", "\"#d8ecd9\""),
     ("theme", "caption_hover", "\"#2b5c3f\""),
     ("theme", "caption_close_hover", "\"#c42b1c\""),
@@ -29,6 +30,7 @@ pub const DARK_THEME: &[(&str, &str, &str)] = &[
     ("theme", "tab_active", "\"#4a6984\""),
     ("theme", "tab_text", "\"#cccccc\""),
     ("theme", "tab_text_active", "\"#ffffff\""),
+    ("theme", "tab_close_hover", "\"#202020\""),
     ("theme", "tabbar_text", "\"#cccccc\""),
     ("theme", "caption_hover", "\"#3d3d3d\""),
     ("theme", "caption_close_hover", "\"#c42b1c\""),
@@ -45,6 +47,7 @@ fn theme_value(cfg: &Config, key: &str) -> String {
         "tab_active" => t.tab_active.clone(),
         "tab_text" => t.tab_text.clone(),
         "tab_text_active" => t.tab_text_active.clone(),
+        "tab_close_hover" => t.tab_close_hover.clone(),
         "tabbar_text" => t.tabbar_text.clone(),
         "caption_hover" => t.caption_hover.clone(),
         "caption_close_hover" => t.caption_close_hover.clone(),
@@ -87,7 +90,7 @@ mod tests {
         let green: Vec<_> = GREEN_THEME.iter().map(|(_, k, _)| *k).collect();
         let dark: Vec<_> = DARK_THEME.iter().map(|(_, k, _)| *k).collect();
         assert_eq!(green, dark);
-        assert_eq!(green.len(), 11);
+        assert_eq!(green.len(), 12);
     }
 
     #[test]
@@ -102,6 +105,7 @@ mod tests {
                 "tab_active" => cfg.theme.tab_active = value.trim_matches('"').into(),
                 "tab_text" => cfg.theme.tab_text = value.trim_matches('"').into(),
                 "tab_text_active" => cfg.theme.tab_text_active = value.trim_matches('"').into(),
+                "tab_close_hover" => cfg.theme.tab_close_hover = value.trim_matches('"').into(),
                 "tabbar_text" => cfg.theme.tabbar_text = value.trim_matches('"').into(),
                 "caption_hover" => cfg.theme.caption_hover = value.trim_matches('"').into(),
                 "caption_close_hover" => cfg.theme.caption_close_hover = value.trim_matches('"').into(),

@@ -76,6 +76,10 @@ pub struct Theme {
     pub tab_inactive: String,
     pub tab_text: String,
     pub tab_text_active: String,
+    /// Fill behind a tab's close X while the pointer is over it. Dark theme
+    /// uses a near-black chip, green theme a deep green one — both read as a
+    /// distinct "about to close" target against their tab fill.
+    pub tab_close_hover: String,
     pub tabbar_text: String,
     /// Hover fill behind a caption button (min/max), and the red used by the
     /// close button — Chrome-style integrated title bar uses these.
@@ -130,6 +134,7 @@ impl Default for Theme {
             tab_inactive: "#3c3c3c".into(),
             tab_text: "#cccccc".into(),
             tab_text_active: "#ffffff".into(),
+            tab_close_hover: "#202020".into(),
             tabbar_text: "#cccccc".into(),
             caption_hover: "#3d3d3d".into(),
             caption_close_hover: "#c42b1c".into(),
@@ -250,6 +255,7 @@ tab_hover         = "#41474d"  # under the pointer, not active
 tab_inactive      = "#3c3c3c"
 tab_text          = "#cccccc"
 tab_text_active   = "#ffffff"
+tab_close_hover   = "#202020"  # dark chip behind a hovered per-tab X
 tabbar_text       = "#cccccc"
 caption_hover     = "#3d3d3d"  # min/max button hover fill
 caption_close_hover = "#c42b1c" # close button hover (red)
