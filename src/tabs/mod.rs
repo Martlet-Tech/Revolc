@@ -93,6 +93,18 @@ impl TabList {
         id
     }
 
+    /// Insert a new tab at an exact slot and activate it. Used by a tab
+    /// dragged in from another window, where the ghost's landing slot is
+    /// absolute (0 = first) — `insert_after` cannot express that.
+    pub fn insert_at(&mut self, at: usize, path: impl Into<String>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, Tab { id, path: path.into(), label: String::new() });
+        self.active = at;
+        id
+    }
+
     /// Remove a tab; adjust active index. Returns removed tab.
     pub fn remove(&mut self, i: usize) -> Option<Tab> {
         if i >= self.tabs.len() {
@@ -173,6 +185,16 @@ mod tests {
     }
 
     #[test]
+    fn insert_at_accepts_slot_zero() {
+        let mut tabs = TabList::new();
+        tabs.push("a");
+        tabs.push("b");
+        tabs.insert_at(0, "front");
+        assert_eq!(tabs.get(0).unwrap().path, "front");
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(tabs.len(), 3);
+    }
+
     fn insert_after_activates_new_tab() {
         let mut t = TabList::new();
         t.push("a"); // 0

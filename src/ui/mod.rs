@@ -1,5 +1,6 @@
 pub mod caption;
 pub mod chrome;
+pub mod drag_detach;
 pub mod dwm;
 pub mod folder_icon;
 pub mod gdi;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
@@ -37,15 +38,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateAcceleratorTableW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyAcceleratorTable, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows,
     GetAncestor, GetClientRect, GetParent, GetMessageW, GetClassNameW, GetSystemMetrics,
-    GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
+    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, ACCEL, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HACCEL,
     HTCAPTION, HTCLIENT, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_TOP,
     ICON_BIG, ICON_SMALL, IDC_ARROW, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_MINIMIZE, SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, TPM_RETURNCMD,
+    SW_MINIMIZE, SWP_NOACTIVATE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOZORDER, SWP_SHOWWINDOW,
+    TPM_RETURNCMD,
     WM_CAPTURECHANGED,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_MBUTTONUP, WM_NCACTIVATE,
@@ -54,7 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
     WM_SETICON, WM_SIZE, WM_TIMER, IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND,
     MINMAXINFO, SM_CXDRAG, SW_SHOWNA, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, LWA_ALPHA,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WNDCLASSEXW,
 };
 
@@ -120,6 +123,11 @@ const TABBAR_CLASS: PCWSTR = w!("RevolcOwnedTabBar");
 /// card hangs below the toolbar row, past the strip's CHROME_HEIGHT, and must
 /// float above the absorbed Explorer pane like the strip does.
 const TOOLTIP_CLASS: PCWSTR = w!("RevolcTooltip");
+/// Owned, layered popup that paints the tab while it floats outside the band.
+const FLOAT_CLASS: PCWSTR = w!("RevolcFloatTab");
+/// WM_COPYDATA tag for cross-window tab drag ("TDRG"). Payload is UTF-8
+/// `op\tpath\tlabel\tlanding`: op = `enter` | `move` | `leave` | `drop`.
+const DRAG_COPYDATA_TAG: usize = 0x54445247;
 /// Context-menu command IDs. Kept in the WM_USER range so they cannot collide
 /// with accelerators (which use 1..=keymap.len()).
 const CMD_TAB_NEW_WINDOW: usize = 0x8001;
@@ -273,6 +281,9 @@ struct WindowArgs {
     /// with the table of whichever window owns the focused control, so this
     /// cannot be shared.
     accel: HACCEL,
+    /// Geometry inherited from the window a detached tab came from.
+    geom: Option<(i32, i32, i32, i32)>,
+    maximized: bool,
 }
 
 /// A left button pressed on a tab, before the pointer has moved far enough to
@@ -283,6 +294,23 @@ struct TabPress {
     id: u64,
     /// Pointer x when the button went down (client coords).
     x: i32,
+    /// Pointer y when the button went down (client coords). The grab offset
+    /// keeps the floating tab under the same point of the cursor.
+    y: i32,
+}
+
+/// A tab that has left the band and is following the cursor in its own popup.
+#[derive(Clone)]
+struct FloatDrag {
+    id: u64,
+    path: String,
+    label: String,
+    /// Cursor offset inside the tab at press time, in screen coords. No
+    /// special casing: the same anchor is kept inside and outside the band.
+    grab_x: i32,
+    grab_y: i32,
+    /// Window whose band currently holds the pointer (merge target).
+    target: Option<HWND>,
 }
 
 pub(crate) struct App {
@@ -362,6 +390,13 @@ pub(crate) struct App {
     /// system drag threshold. `None` once a click is dispatched or a drag
     /// starts.
     tab_press: Option<TabPress>,
+    /// Some while a tab floats outside the band, following the cursor.
+    float_drag: Option<FloatDrag>,
+    /// Cursor offset inside the tab at drag start, in screen coords. Kept from
+    /// the press point so the floating tab does not jump under the cursor.
+    drag_grab_screen: Option<(i32, i32)>,
+    /// Layered popup that paints the floating tab.
+    float_hwnd: HWND,
     /// State of the painted settings tab (selected category). Only meaningful
     /// while a Painted(Settings) view is active.
     settings_panel: settings::SettingsPanel,
@@ -396,8 +431,10 @@ impl MainWindow {
         initial_path: Option<String>,
         adopt_only: bool,
         settings_only: bool,
+        geom: Option<(i32, i32, i32, i32)>,
+        maximized: bool,
     ) -> windows::core::Result<Self> {
-        Self::create(cfg, initial_path, adopt_only, settings_only)
+        Self::create(cfg, initial_path, adopt_only, settings_only, geom, maximized)
     }
 
     fn create(
@@ -405,6 +442,8 @@ impl MainWindow {
         initial_path: Option<String>,
         adopt_only: bool,
         settings_only: bool,
+        geom: Option<(i32, i32, i32, i32)>,
+        maximized: bool,
     ) -> windows::core::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
@@ -429,6 +468,8 @@ impl MainWindow {
                 adopt_only,
                 settings_only,
                 accel,
+                geom,
+                maximized,
             }));
 
             let hwnd = CreateWindowExW(
@@ -447,10 +488,10 @@ impl MainWindow {
                     | WS_MAXIMIZEBOX
                     | WS_SYSMENU
                     | WS_CLIPCHILDREN,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                1000,
-                700,
+                geom.map(|(l, _, _, _)| l).unwrap_or(CW_USEDEFAULT),
+                geom.map(|(_, t, _, _)| t).unwrap_or(CW_USEDEFAULT),
+                geom.map(|(l, _, r, _)| (r - l).max(1)).unwrap_or(1000),
+                geom.map(|(_, t, _, b)| (b - t).max(1)).unwrap_or(700),
                 HWND::default(),
                 windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
                 hinstance,
@@ -469,7 +510,7 @@ impl MainWindow {
                 hwnd, m, windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW, None,
             );
 
-            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
 
             LIVE_WINDOWS.fetch_add(1, Ordering::SeqCst);
             Ok(Self { hwnd })
@@ -553,6 +594,47 @@ fn ensure_tooltip_class() {
     let err = windows::core::Error::from_win32();
     if (err.code().0 as u32 & 0xffff) != 1410 {
         tracing::warn!(error = %err, "register tooltip class failed");
+    }
+}
+
+/// Class for the floating-tab popup. Same tolerate-already-exists rule.
+fn ensure_float_class() {
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(float_wndproc),
+        hInstance: unsafe { GetModuleHandleW(None) }.unwrap_or_default().into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        lpszClassName: FLOAT_CLASS,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassExW(&wc) } != 0 {
+        return;
+    }
+    let err = windows::core::Error::from_win32();
+    if (err.code().0 as u32 & 0xffff) != 1410 {
+        tracing::warn!(error = %err, "register float class failed");
+    }
+}
+
+/// Layered, click-through popup that paints the tab while it floats. The owner
+/// drives position and visibility; this wndproc only paints.
+unsafe extern "system" fn float_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let parent = GetParent(hwnd).unwrap_or_default();
+            let Some(app) = (if parent.0.is_null() { None } else { app_opt(parent) }) else {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            };
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            app.paint_floating(hdc);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => LRESULT(0),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -718,6 +800,8 @@ impl App {
         let takeover_on = args.cfg.get().takeover.mode == "redirect";
         let adopt_only = args.adopt_only;
         let settings_only = args.settings_only;
+        let _inherited_geom = args.geom;
+        let _inherited_max = args.maximized;
         let tabbar = tabbar::TabBar::new(&args.cfg.get());
         let mut app = Box::new(App {
             cfg: args.cfg,
@@ -743,6 +827,9 @@ impl App {
             main_hwnd: hwnd,
             hover_tracking: false,
             tab_press: None,
+            float_drag: None,
+            drag_grab_screen: None,
+            float_hwnd: HWND::default(),
             settings_panel: settings::SettingsPanel::new(),
             bookmarks: BookmarkStore::open(crate::bookmarks::bookmarks_path()),
             bookmark_press: None,
@@ -1082,6 +1169,45 @@ impl App {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
+    }
+
+    /// Create the layered popup that paints a tab floating outside the band.
+    /// Click-through and non-activating: the mouse stays captured by the frame
+    /// for the whole drag, so the popup must never become a hit target.
+    fn create_float_window(&mut self) {
+        ensure_float_class();
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                FLOAT_CLASS,
+                None,
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                self.main_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .expect("create owned floating tab popup");
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 200, LWA_ALPHA);
+            self.float_hwnd = hwnd;
+        }
+    }
+
+    /// Paint the floating tab card into the layered popup (origin 0,0).
+    fn paint_floating(&self, hdc: HDC) {
+        let Some(f) = &self.float_drag else { return };
+        let w = self.tabbar.tab_width();
+        self.tabbar.paint_float(
+            hdc,
+            RECT { left: 0, top: 0, right: w, bottom: TABBAR_HEIGHT },
+            &f.label,
+            &f.path,
+            false,
+        );
     }
 
     /// Create the owned tooltip popup. Click-through and non-activating: the
@@ -1519,7 +1645,7 @@ impl App {
     /// so a drag always carries the tab you were looking at; the drag itself
     /// only starts once the pointer crosses the system threshold, otherwise
     /// every click on a tab would nudge its neighbours.
-    fn begin_tab_press(&mut self, i: usize, x: i32) {
+    fn begin_tab_press(&mut self, i: usize, x: i32, y: i32) {
         let Some(id) = self.tabbar.ids().get(i).copied() else {
             return;
         };
@@ -1527,12 +1653,12 @@ impl App {
             return;
         };
         self.activate(idx);
-        self.tab_press = Some(TabPress { id, x });
+        self.tab_press = Some(TabPress { id, x, y });
     }
 
-    /// Mouse moved while the left button is down. Returns true when the band
-    /// was repainted (i.e. the caller must not also handle hover).
-    fn tab_drag_track(&mut self, x: i32) -> bool {
+    /// Mouse moved while the left button is down. `x` / `y` are main-window
+    /// client coords. Returns true when the band was repainted.
+    fn tab_drag_track(&mut self, x: i32, y: i32) -> bool {
         if let Some(press) = self.tab_press {
             // SM_CXDRAG is "how far can the pointer move before it is a drag"
             // — the same constant user32 uses for its own drag detection, so
@@ -1548,12 +1674,45 @@ impl App {
             // Grab from the press point, not from here: the tab must not jump
             // under the cursor the moment the drag is recognised.
             self.tabbar.begin_drag(i, press.x);
+            // Screen anchor for the floating popup, from the same press point.
+            let mut anchor = POINT { x: press.x, y: press.y };
+            unsafe {
+                let _ = ClientToScreen(self.main_hwnd, &mut anchor);
+            }
+            let left_screen = {
+                let mut org = POINT { x: 0, y: 0 };
+                unsafe { let _ = ClientToScreen(self.main_hwnd, &mut org); }
+                org.x + self.tabbar.tab_x(i)
+            };
+            self.drag_grab_screen = Some((
+                anchor.x - left_screen,
+                anchor.y - self.window_rect(self.main_hwnd).top - tabbar::TAB_TOP,
+            ));
             unsafe {
                 SetCapture(self.main_hwnd);
             }
         }
         if self.tabbar.drag().is_none() {
             return false;
+        }
+
+        // Screen point and this window's band. Outside the band the tab lives
+        // in the floating popup; inside it the normal reorder runs.
+        let mut sp = POINT { x, y };
+        unsafe {
+            let _ = ClientToScreen(self.main_hwnd, &mut sp);
+        }
+        let in_band = drag_detach::in_band(self.window_rect(self.main_hwnd), sp.x, sp.y);
+        if !in_band {
+            self.enter_float();
+            self.move_float(sp.x, sp.y);
+            self.invalidate_band();
+            return true;
+        }
+
+        // Back inside: drop the floating state, resume in-band reorder.
+        if self.leave_float() {
+            self.invalidate_band();
         }
         self.tabbar.drag_to(x);
         if let Some(to) = self.tabbar.target() {
@@ -1564,13 +1723,171 @@ impl App {
         true
     }
 
-    /// Drop the dragged tab. Reorder inside the band only: pulling a tab out
-    /// into its own window is a later stage, so there is nothing to decide on
-    /// release — the model already holds the final order.
+    /// Cancel an in-flight drag without committing anything.
+    fn cancel_tab_drag(&mut self) {
+        self.leave_float();
+        self.tab_press = None;
+        self.tabbar.end_drag();
+        self.drag_grab_screen = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.invalidate_band();
+    }
+
+    /// Window rect in screen coords for band tests.
+    fn window_rect(&self, hwnd: HWND) -> drag_detach::WinRect {
+        let mut r = RECT::default();
+        unsafe { let _ = GetWindowRect(hwnd, &mut r); }
+        drag_detach::WinRect { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+    }
+
+    /// Enter floating mode: snapshot the tab's path/label and move it out of
+    /// the source strip into the layered popup.
+    fn enter_float(&mut self) {
+        if self.float_drag.is_some() {
+            return;
+        }
+        let Some(d) = self.tabbar.drag() else { return };
+        let Some(id) = self.tabbar.ids().get(d.from).copied() else { return };
+        let Some(i) = self.index_of(id) else { return };
+        let path = self.folder_path_of(i);
+        let label = self
+            .tabs
+            .get(i)
+            .map(|t| if t.label.is_empty() { short_label(&t.path) } else { t.label.clone() })
+            .unwrap_or_default();
+        let (gx, gy) = self.drag_grab_screen.unwrap_or((40, 10));
+        tracing::info!(?path, ?label, "tab drag: left band, floating");
+        self.float_drag = Some(FloatDrag {
+            id,
+            path,
+            label,
+            grab_x: gx,
+            grab_y: gy,
+            target: None,
+        });
+        self.tabbar.set_float_hidden(true);
+        unsafe {
+            let _ = ShowWindow(self.float_hwnd, SW_SHOWNA);
+        }
+    }
+
+    /// Follow the cursor and detect which Revolc window's band it is in. Send
+    /// a preview to that window; cancel the previous one when the target
+    /// changes.
+    fn move_float(&mut self, sx: i32, sy: i32) {
+        let Some(f) = &self.float_drag else { return };
+        let (gx, gy, path, label, old_target) =
+            (f.grab_x, f.grab_y, f.path.clone(), f.label.clone(), f.target);
+        let (x, y) = drag_detach::float_origin(sx, sy, gx, gy);
+        let w = self.tabbar.tab_width();
+        unsafe {
+            let _ = SetWindowPos(
+                self.float_hwnd,
+                HWND_TOP,
+                x,
+                y,
+                w.max(1),
+                TABBAR_HEIGHT,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            );
+        }
+        let windows: Vec<(HWND, drag_detach::WinRect)> = all_main_windows()
+            .into_iter()
+            .filter(|h| unsafe { IsWindowVisible(*h).as_bool() })
+            .map(|h| (h, self.window_rect(h)))
+            .collect();
+        let target = drag_detach::band_owner(windows, self.main_hwnd, sx, sy);
+        // A different target: tell the old one to clear its ghost.
+        if old_target != target {
+            tracing::info!(
+                from = ?old_target.map(|h| h.0 as usize),
+                to = ?target.map(|h| h.0 as usize),
+                "tab drag: merge target changed"
+            );
+            if let Some(old) = old_target {
+                self.send_drag(old, "leave", "", "", 0);
+            }
+            if let Some(t) = self.float_drag.as_mut() {
+                t.target = target;
+            }
+            if let Some(new) = target {
+                self.send_drag(new, "enter", &path, &label, sx);
+            }
+        } else if let Some(t) = target {
+            self.send_drag(t, "move", &path, &label, sx);
+        }
+    }
+
+    /// Send a cross-window tab-drag message. `payload` is UTF-8
+    /// `op\tpath\tlabel\tscreen_x`.
+    fn send_drag(&self, target: HWND, op: &str, path: &str, label: &str, screen_x: i32) {
+        if target == self.main_hwnd || !unsafe { IsWindow(target).as_bool() } {
+            return;
+        }
+        let text = format!("{}\t{}\t{}\t{}", op, path, label, screen_x);
+        let bytes = text.as_bytes();
+        let mut cds = COPYDATASTRUCT {
+            dwData: DRAG_COPYDATA_TAG,
+            cbData: bytes.len() as u32,
+            lpData: bytes.as_ptr() as _,
+        };
+        unsafe {
+            let _ = SendMessageW(
+                target,
+                windows::Win32::UI::WindowsAndMessaging::WM_COPYDATA,
+                WPARAM(self.main_hwnd.0 as usize),
+                LPARAM(&mut cds as *mut COPYDATASTRUCT as isize),
+            );
+        }
+    }
+
+    /// Leave floating mode without committing (pointer came back in-band).
+    fn leave_float(&mut self) -> bool {
+        if self.float_drag.is_none() {
+            return false;
+        }
+        if let Some(f) = self.float_drag.take() {
+            if let Some(t) = f.target {
+                self.send_drag(t, "leave", "", "", 0);
+            }
+        }
+        self.drag_grab_screen = None;
+        unsafe {
+            let _ = ShowWindow(self.float_hwnd, SW_HIDE);
+        }
+        self.tabbar.set_float_hidden(false);
+        tracing::info!("tab drag: back in band, floating cancelled");
+        true
+    }
+
+    /// Drop the dragged tab: commit to the target window or spawn a new one.
     fn end_tab_drag(&mut self) {
         self.tab_press = None;
-        if self.tabbar.drag().is_none() {
-            return;
+        if let Some(f) = self.float_drag.take() {
+            let source_id = f.id;
+            // Only close the source tab once the destination accepted it.
+            let committed = if let Some(target) = f.target {
+                let ok = unsafe { IsWindow(target).as_bool() };
+                if ok {
+                    self.send_drag(target, "drop", &f.path, &f.label, 0);
+                }
+                ok
+            } else {
+                self.detach_to_new_window(&f.path)
+            };
+            unsafe {
+                let _ = ShowWindow(self.float_hwnd, SW_HIDE);
+            }
+            self.drag_grab_screen = None;
+            if committed {
+                if let Some(i) = self.index_of(source_id) {
+                    self.close_tab(i);
+                }
+            } else {
+                tracing::warn!(?f.path, "detach failed, tab kept in source window");
+            }
         }
         self.tabbar.end_drag();
         unsafe {
@@ -1647,6 +1964,29 @@ impl App {
         host::spawn_explorer(&path);
     }
 
+    /// Spawn a new window for a detached tab. Inherits the source window's
+    /// geometry and maximized state (decision: "继承当前窗口"). The caller
+    /// closes the source tab only on success.
+    fn detach_to_new_window(&mut self, path: &str) -> bool {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let r = self.window_rect(self.main_hwnd);
+        let maximized = unsafe { IsZoomed(self.main_hwnd).as_bool() };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg(path)
+            .arg(format!("--geom={},{},{},{}", r.left, r.top, r.right, r.bottom))
+            .arg(if maximized { "--maximized" } else { "--restored" });
+        match cmd.spawn() {
+            Ok(_) => {
+                tracing::info!(?path, "detached tab to new window");
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %e, ?path, "failed to spawn detached window");
+                false
+            }
+        }
+    }
+
     /// Context menu "open in new window": MOVE the tab — close it here, then
     /// launch a fresh revolc.exe with the tab's *live* folder as startup path.
     /// The new process absorbs its own Explorer window. Keep the close after
@@ -1654,16 +1994,56 @@ impl App {
     /// we must have captured the path and started the replacement first.
     fn move_tab_to_new_window(&mut self, i: usize) {
         let path = self.folder_path_of(i);
-        let exe = std::env::current_exe().unwrap_or_default();
-        match std::process::Command::new(exe).arg(&path).spawn() {
-            Ok(_) => {
-                tracing::info!(?path, tab = i, "moved tab to new window");
-                self.close_tab(i);
+        if self.detach_to_new_window(&path) {
+            self.close_tab(i);
+        }
+    }
+
+    /// Handle a tab-drag message from another window. `op` drives the ghost:
+    /// enter/move update it, leave clears it, drop commits a new tab (A:
+    /// close+reopen — we just open a fresh tab for the same path).
+    fn on_tab_drag_message(&mut self, op: &str, path: &str, label: &str, screen_x: i32) {
+        match op {
+            "leave" => {
+                if self.tabbar.set_incoming(None) {
+                    self.invalidate_band();
+                    tracing::info!("tab drag: incoming ghost cleared");
+                }
             }
-            Err(e) => {
-                // Spawn failed: leave the tab where it is — never lose it.
-                tracing::error!(error = %e, ?path, "failed to spawn new window, tab kept");
+            "enter" | "move" => {
+                let mut p = POINT { x: screen_x, y: self.window_rect(self.main_hwnd).top + TABBAR_HEIGHT / 2 };
+                unsafe { let _ = ScreenToClient(self.main_hwnd, &mut p); }
+                let center = p.x;
+                let slot = self.tabbar.incoming_landing(center);
+                let ghost = if path.is_empty() {
+                    label.to_string()
+                } else {
+                    if label.is_empty() { short_label(path) } else { label.to_string() }
+                };
+                if self.tabbar.set_incoming(Some((slot, ghost.clone(), path.to_string()))) {
+                    self.invalidate_band();
+                    tracing::info!(slot, ?ghost, "tab drag: incoming ghost");
+                }
             }
+            "drop" => {
+                // Use the ghost's last landing, not a fresh hit test: the
+                // drop payload carries no pointer (sx = 0) by design.
+                let slot = self
+                    .tabbar
+                    .incoming_slot()
+                    .unwrap_or_else(|| self.tabs.len())
+                    .min(self.tabs.len());
+                // A Painted settings tab has path "设置" — fall back to home,
+                // the same rule new_tab uses. No tab-type branch in the drag.
+                let path = if path.is_empty() || path == "设置" { home_dir() } else { path.to_string() };
+                let at = slot;
+                self.tabs.insert_at(at, path.clone());
+                self.views.insert(at, View::Pending);
+                self.launch_tab_view(at, path.clone());
+                self.tabbar.set_incoming(None);
+                tracing::info!(?path, slot = at, "merged tab from another window");
+            }
+            _ => {}
         }
     }
 
@@ -3045,6 +3425,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as _);
             let app = app_from(hwnd);
             app.create_tabbar_window();
+            app.create_float_window();
             app.create_tooltip_window();
             // Safe now: GWLP_USERDATA is installed, so the SetFocus a Painted
             // settings tab triggers can re-enter WM_NCACTIVATE without a null
@@ -3275,7 +3656,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             match app.tabbar.hit(x, y, width) {
-                tabbar::Hit::Tab(i) => app.begin_tab_press(i, x),
+                tabbar::Hit::Tab(i) => app.begin_tab_press(i, x, y),
                 tabbar::Hit::Close(i) => {
                     if let Some(id) = app.tabbar.ids().get(i).copied() {
                         if let Some(i) = app.index_of(id) {
@@ -3347,9 +3728,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // crossed here, the reorder happens on the spot (the model is the
         // truth; the strip only paints the tab under the cursor).
         WM_MOUSEMOVE => {
-            let (x, _y) = point_from_lparam(lp);
+            let (x, y) = point_from_lparam(lp);
             let app = app_from(hwnd);
-            if !app.tab_drag_track(x) {
+            if !app.tab_drag_track(x, y) {
                 // Both rows share the same gesture; only one can be active.
                 app.bookmark_drag_track(x);
             }
@@ -3378,10 +3759,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         // Capture stolen (Alt+Tab, a modal, another window grabbing the
-        // mouse): drop the drag instead of leaving a tab/chip glued to cursor.
+        // mouse): cancel the drag. A floating tab must NOT detach here — only
+        // an explicit LBUTTONUP commits a new window or a merge.
         WM_CAPTURECHANGED => {
             let app = app_from(hwnd);
-            app.end_tab_drag();
+            app.cancel_tab_drag();
             app.end_bookmark_drag();
             LRESULT(0)
         }
@@ -3759,6 +4141,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                                 }
                             }
                         }
+                    }
+                }
+            } else if !cds.is_null() && (*cds).dwData == DRAG_COPYDATA_TAG {
+                let len = (*cds).cbData as usize;
+                let ptr = (*cds).lpData as *const u8;
+                if !ptr.is_null() && len > 0 && len <= 16 * 1024 {
+                    let payload = std::slice::from_raw_parts(ptr, len);
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        let mut parts = text.splitn(4, '\t');
+                        let op = parts.next().unwrap_or("");
+                        let path = parts.next().unwrap_or("");
+                        let label = parts.next().unwrap_or("");
+                        let sx = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                        app_from(hwnd).on_tab_drag_message(op, path, label, sx);
                     }
                 }
             }
