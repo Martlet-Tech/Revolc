@@ -14,10 +14,11 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    FillRect, FillRgn, GetStockObject, IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode,
-    SetTextColor, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
+    AlphaBlend, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateRectRgn,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, FillRgn,
+    GetStockObject, IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor,
+    BLENDFUNCTION, HDC, HFONT, HGDIOBJ, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    AC_SRC_OVER, DEFAULT_GUI_FONT, RGN_AND, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL};
 
@@ -125,6 +126,9 @@ pub struct TabBar {
     /// A tab being dragged in from another Revolc window. `usize` is the
     /// insertion slot; the ghost is painted there until drop or cancel.
     incoming: Option<(usize, String, String)>,
+    /// True while a tab from another window is inside our separation band:
+    /// the title bar gets a translucent yellow wash, matching the ghost.
+    drop_tint: bool,
     maximized: bool,
     window_active: bool,
     caption_colors: caption::Colors,
@@ -154,6 +158,7 @@ impl TabBar {
             drag: None,
             float_hidden: false,
             incoming: None,
+            drop_tint: false,
             maximized: false,
             window_active: true,
             caption_colors: caption::Colors::new(
@@ -340,6 +345,15 @@ impl TabBar {
     pub fn incoming_landing(&self, center: i32) -> usize {
         let n = self.labels.len();
         reorder::landing(center, self.tab_w, TAB_GAP, GUTTER, n, n).unwrap_or(n)
+    }
+
+    /// Show/hide the drop-ready title-bar wash. Kept in sync with `incoming`.
+    pub fn set_drop_tint(&mut self, on: bool) -> bool {
+        if self.drop_tint == on {
+            return false;
+        }
+        self.drop_tint = on;
+        true
     }
 
     /// Landing slot of the current incoming ghost, if any.
@@ -608,6 +622,12 @@ impl TabBar {
                 self.window_active,
                 &self.caption_colors,
             );
+
+            // Drop-ready wash last: translucent yellow over the title bar.
+            // 25% so tabs / ghost / button glyphs stay legible through it.
+            if self.drop_tint {
+                paint_tint(hdc, width);
+            }
         }
     }
 
@@ -727,6 +747,40 @@ fn dim(fg: COLORREF, bg: COLORREF) -> COLORREF {
     let bg_g = (bg.0 >> 8) & 0xff;
     let bg_b = (bg.0 >> 16) & 0xff;
     COLORREF(mix(fg_r, bg_r) | mix(fg_g, bg_g) << 8 | mix(fg_b, bg_b) << 16)
+}
+
+/// Wash the band with 25%-opaque yellow. Fixed colour, not theme-derived:
+/// "can drop here" must read the same in every preset. A 1x1 source bitmap
+/// stretched over the title bar is enough — AlphaBlend's constant alpha needs
+/// no real alpha channel, and one fill is cheaper than per-pixel work.
+unsafe fn paint_tint(hdc: HDC, width: i32) {
+    let mem = CreateCompatibleDC(hdc);
+    if mem.is_invalid() {
+        return;
+    }
+    let bmp = CreateCompatibleBitmap(hdc, 1, 1);
+    if bmp.is_invalid() {
+        let _ = DeleteDC(mem);
+        return;
+    }
+    let old = SelectObject(mem, HGDIOBJ(bmp.0));
+    let brush = CreateSolidBrush(rgb(0xf1, 0xc4, 0x0f)); // yellow
+    let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+    let _ = FillRect(mem, &one, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let bf = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 64, // 25% of 255
+        AlphaFormat: 0,
+    };
+    let _ = AlphaBlend(
+        hdc, 0, 0, width.max(1), caption::HEIGHT,
+        mem, 0, 0, 1, 1, bf,
+    );
+    SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem);
 }
 
 /// All four corners rounded (the "+" pill).

@@ -1641,18 +1641,21 @@ impl App {
 
     // ---- tab drag: reorder inside the band -------------------------------
 
-    /// Left button went down on tab `i`. A browser activates a tab on press,
-    /// so a drag always carries the tab you were looking at; the drag itself
-    /// only starts once the pointer crosses the system threshold, otherwise
-    /// every click on a tab would nudge its neighbours.
+    /// Left button went down on tab `i`. Only remember the press — do NOT
+    /// activate here. `activate()` does a cross-process focus hand-off
+    /// (`AttachThreadInput` + `SetForegroundWindow` on the Explorer pane),
+    /// which while the button is held breaks mouse capture: a press on a
+    /// non-active tab then "drags but never detaches" and leaves the strip
+    /// stuck in reorder mode until an extra click. Activation happens on
+    /// release instead (see `end_tab_drag`), so a drag carries the pressed
+    /// tab's data without touching focus.
     fn begin_tab_press(&mut self, i: usize, x: i32, y: i32) {
         let Some(id) = self.tabbar.ids().get(i).copied() else {
             return;
         };
-        let Some(idx) = self.index_of(id) else {
+        if self.index_of(id).is_none() {
             return;
-        };
-        self.activate(idx);
+        }
         self.tab_press = Some(TabPress { id, x, y });
     }
 
@@ -1660,11 +1663,11 @@ impl App {
     /// client coords. Returns true when the band was repainted.
     fn tab_drag_track(&mut self, x: i32, y: i32) -> bool {
         if let Some(press) = self.tab_press {
-            // SM_CXDRAG is "how far can the pointer move before it is a drag"
-            // — the same constant user32 uses for its own drag detection, so
-            // the feel matches the rest of the shell.
+            // SM_CXDRAG is the only threshold user32 exposes, but a tab can
+            // detach vertically. Compare both axes or a straight up/down pull
+            // never starts the drag (felt as "can't yank the tab out").
             let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
-            if (x - press.x).abs() < threshold {
+            if !reorder::crossed_2d(press.x, press.y, x, y, threshold) {
                 return false;
             }
             self.tab_press = None;
@@ -1702,7 +1705,15 @@ impl App {
         unsafe {
             let _ = ClientToScreen(self.main_hwnd, &mut sp);
         }
-        let in_band = drag_detach::in_band(self.window_rect(self.main_hwnd), sp.x, sp.y);
+        let rc = self.window_rect(self.main_hwnd);
+        // Hysteresis: leaving uses the outer band, returning requires 8px
+        // deeper. A pointer parked on the boundary must not strobe between
+        // floating and in-band every frame.
+        let in_band = if self.float_drag.is_some() {
+            drag_detach::in_band_reenter(rc, sp.x, sp.y)
+        } else {
+            drag_detach::in_band(rc, sp.x, sp.y)
+        };
         if !in_band {
             self.enter_float();
             self.move_float(sp.x, sp.y);
@@ -1798,7 +1809,13 @@ impl App {
             .filter(|h| unsafe { IsWindowVisible(*h).as_bool() })
             .map(|h| (h, self.window_rect(h)))
             .collect();
-        let target = drag_detach::band_owner(windows, self.main_hwnd, sx, sy);
+        let target = drag_detach::band_owner_sticky(
+            windows.iter().copied(),
+            self.main_hwnd,
+            old_target,
+            sx,
+            sy,
+        );
         // A different target: tell the old one to clear its ghost.
         if old_target != target {
             tracing::info!(
@@ -1818,6 +1835,7 @@ impl App {
         } else if let Some(t) = target {
             self.send_drag(t, "move", &path, &label, sx);
         }
+
     }
 
     /// Send a cross-window tab-drag message. `payload` is UTF-8
@@ -1863,8 +1881,19 @@ impl App {
     }
 
     /// Drop the dragged tab: commit to the target window or spawn a new one.
+    /// A press that never crossed the drag threshold is a click — activate
+    /// the tab here, off the mouse-down path, so the focus hand-off cannot
+    /// swallow capture.
     fn end_tab_drag(&mut self) {
-        self.tab_press = None;
+        // A press that never crossed the threshold is a click; a drag that
+        // committed/merged/reordered also ends with this tab active. Activate
+        // off the mouse-down path so the cross-process focus hand-off cannot
+        // swallow mouse capture.
+        let activate_id = self.tab_press.take().map(|p| p.id).or_else(|| {
+            self.float_drag.as_ref().map(|f| f.id).or_else(|| self.tabbar.drag().map(|d| {
+                self.tabbar.ids().get(d.from).copied().unwrap_or(0)
+            }))
+        });
         if let Some(f) = self.float_drag.take() {
             let source_id = f.id;
             // Only close the source tab once the destination accepted it.
@@ -1886,12 +1915,19 @@ impl App {
                     self.close_tab(i);
                 }
             } else {
-                tracing::warn!(?f.path, "detach failed, tab kept in source window");
+                tracing::warn!(path = ?f.path, "detach failed, tab kept in source window");
             }
         }
         self.tabbar.end_drag();
         unsafe {
             let _ = ReleaseCapture();
+        }
+        // A committed detach/merge already closed this tab in the source
+        // window; activating it would be a no-op (index_of returns None).
+        if let Some(id) = activate_id {
+            if let Some(i) = self.index_of(id) {
+                self.activate(i);
+            }
         }
         self.invalidate_band();
     }
@@ -2005,6 +2041,9 @@ impl App {
     fn on_tab_drag_message(&mut self, op: &str, path: &str, label: &str, screen_x: i32) {
         match op {
             "leave" => {
+                if self.tabbar.set_drop_tint(false) {
+                    self.invalidate_band();
+                }
                 if self.tabbar.set_incoming(None) {
                     self.invalidate_band();
                     tracing::info!("tab drag: incoming ghost cleared");
@@ -2024,6 +2063,9 @@ impl App {
                     self.invalidate_band();
                     tracing::info!(slot, ?ghost, "tab drag: incoming ghost");
                 }
+                if self.tabbar.set_drop_tint(true) {
+                    self.invalidate_band();
+                }
             }
             "drop" => {
                 // Use the ghost's last landing, not a fresh hit test: the
@@ -2041,6 +2083,7 @@ impl App {
                 self.views.insert(at, View::Pending);
                 self.launch_tab_view(at, path.clone());
                 self.tabbar.set_incoming(None);
+                self.tabbar.set_drop_tint(false);
                 tracing::info!(?path, slot = at, "merged tab from another window");
             }
             _ => {}
