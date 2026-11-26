@@ -100,7 +100,16 @@ pub fn landing(
 
 /// Has the pointer crossed the system drag threshold since the press?
 pub fn crossed(press_x: i32, x: i32, threshold: i32) -> bool {
-    (x - press_x).abs() >= threshold.max(1)
+    crossed_2d(press_x, 0, x, 0, threshold)
+}
+
+/// 2D version for drags that can leave the strip vertically (tab detach).
+/// `SM_CXDRAG` is only the horizontal threshold Windows exposes, but a pull
+/// straight up/down must start a drag too — using x alone makes vertical
+/// detach feel dead. Chebyshev distance matches user32's box-like threshold.
+pub fn crossed_2d(press_x: i32, press_y: i32, x: i32, y: i32, threshold: i32) -> bool {
+    let t = threshold.max(1);
+    (x - press_x).abs() >= t || (y - press_y).abs() >= t
 }
 
 #[cfg(test)]
@@ -164,5 +173,13 @@ mod tests {
         assert!(crossed(100, 104, 4));
         assert!(crossed(100, 96, 4));
         assert!(crossed(100, 101, 0), "threshold 0 is clamped to 1");
+    }
+
+    #[test]
+    fn vertical_pull_starts_a_2d_drag() {
+        assert!(!crossed_2d(100, 200, 100, 203, 4));
+        assert!(crossed_2d(100, 200, 100, 204, 4), "pure vertical pull");
+        assert!(crossed_2d(100, 200, 100, 196, 4));
+        assert!(crossed_2d(100, 200, 104, 200, 4), "horizontal still works");
     }
 }
