@@ -31,7 +31,7 @@
 ### 3.1 标签页（已实现，含拖拽分窗/合并）
 - 新建 tab（Ctrl+T）：打开新 Explorer 视图，默认路径 = 当前激活 tab 的路径
 - 关闭 tab（Ctrl+W / 中键）：销毁该视图；最后一个 tab 关闭时询问是否退出
-- 切换：Ctrl+Tab / 点击；悬停自动切换（原版 HoverTabSelector 行为）为可关设置
+- 切换：Ctrl+Tab / 点击（悬停自动切换未实现；曾用 `behavior.hover_switch` 死配置表达，已删除）
 - 标签右键菜单（已实现，分支 `feat/tab-context-menu`）：在新窗口打开 / 关闭 /
   关其他 / 关右侧 / 右侧新建；三期已加"收藏此标签页 / 取消收藏"（分支
   `feat/bookmarks-phase3`，见 §3.3）

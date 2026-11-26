@@ -154,7 +154,9 @@
    - 松手落桌面 → `detach_to_new_window` spawn 新进程，继承几何（`--geom` / `--maximized`）
    - 松手落别的窗口带 → `WM_COPYDATA` 交接，目标画虚化 ghost，close+reopen 接手
    - 设置页标签一视同仁可分离；`WM_CAPTURECHANGED` 取消不误提交
-   剩余体验点：磁吸手感、边界细节（见 `docs/M3.3-Drag-Detach-References.md` 实施对照）。
+   手感后续打磨（`02b9bb9`，已做）：2D 起拖阈值（垂直也能拽）、8px 回带迟滞 +
+   目标粘性（消除边界抖动）、单一黄色覆盖层、激活延迟到 mouse-up（修非当前标签拽不起来）。
+   调研对照见 `docs/M3.3-Drag-Detach-References.md`。剩：多窗口顺序压力测试。
 7. 之后 M4 主题系统（圆角/透明/配色 + 一体化标题栏的主题化）、M5 安装包、
    M6 接管完善（`associate` 模式目前未做）。
 

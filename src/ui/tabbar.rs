@@ -126,9 +126,6 @@ pub struct TabBar {
     /// A tab being dragged in from another Revolc window. `usize` is the
     /// insertion slot; the ghost is painted there until drop or cancel.
     incoming: Option<(usize, String, String)>,
-    /// True while a tab from another window is inside our separation band:
-    /// the title bar gets a translucent yellow wash, matching the ghost.
-    drop_tint: bool,
     maximized: bool,
     window_active: bool,
     caption_colors: caption::Colors,
@@ -158,7 +155,6 @@ impl TabBar {
             drag: None,
             float_hidden: false,
             incoming: None,
-            drop_tint: false,
             maximized: false,
             window_active: true,
             caption_colors: caption::Colors::new(
@@ -345,15 +341,6 @@ impl TabBar {
     pub fn incoming_landing(&self, center: i32) -> usize {
         let n = self.labels.len();
         reorder::landing(center, self.tab_w, TAB_GAP, GUTTER, n, n).unwrap_or(n)
-    }
-
-    /// Show/hide the drop-ready title-bar wash. Kept in sync with `incoming`.
-    pub fn set_drop_tint(&mut self, on: bool) -> bool {
-        if self.drop_tint == on {
-            return false;
-        }
-        self.drop_tint = on;
-        true
     }
 
     /// Landing slot of the current incoming ghost, if any.
@@ -623,9 +610,9 @@ impl TabBar {
                 &self.caption_colors,
             );
 
-            // Drop-ready wash last: translucent yellow over the title bar.
-            // 25% so tabs / ghost / button glyphs stay legible through it.
-            if self.drop_tint {
+            // Drop-ready wash last: the ghost's presence is the only state.
+            // Translucent yellow at 25% keeps tabs / ghost / glyphs legible.
+            if self.incoming.is_some() {
                 paint_tint(hdc, width);
             }
         }
